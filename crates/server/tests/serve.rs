@@ -76,6 +76,7 @@ fn config_with_refresh(cache: Cache, refresh: Option<Refresh>) -> Config {
         )]),
         cache,
         auth: HashMap::new(),
+        cluster: None,
     }
 }
 

@@ -94,6 +94,7 @@ async fn app(mappings: Vec<Mapping>, verifiers: HashMap<String, Verifier>) -> Ar
         )]),
         cache: Cache::default(),
         auth: verifiers,
+        cluster: None,
     };
     let stores = HashMap::from([("assets".to_string(), store as Arc<dyn ObjectStore>)]);
     App::new(&config, stores).await.unwrap()
@@ -406,6 +407,7 @@ async fn invalid_public_keys_fail_at_startup() {
         backends: HashMap::new(),
         cache: Cache::default(),
         auth: verifiers(broken),
+        cluster: None,
     };
     let error = App::new(&config, HashMap::new()).await.err().unwrap();
     assert!(

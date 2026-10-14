@@ -177,3 +177,26 @@ a token's claim and `$$` is a literal `$`, such as `/tenant/${sub}`.
 r[config.validate.auth]
 A mapping's auth naming a verifier that isn't configured, or with a path template that
 doesn't parse, MUST be reported as invalid.
+
+## Cluster
+
+r[config.cluster]
+An optional `cluster` section MUST configure sharing with other nodes: the `listen` address
+of the cluster listener, an optional `advertise` address other nodes reach this one at, a
+`gossip_interval` defaulting to `1s` and a `failure_timeout` defaulting to `10s`.
+
+r[config.cluster.seeds]
+`seeds` MUST list nodes to join through as `host:port`, where the host is an address or a
+DNS name.
+
+r[config.cluster.key]
+`key` MUST be the secret shared by the nodes, so only the secrets file can set it.
+
+r[config.cluster.share]
+`share` MUST turn sharing `metadata` and `preload`s on or off, both defaulting to on.
+
+r[config.validate.cluster]
+A `listen` address of `0.0.0.0` or `[::]` without an `advertise` address, an unspecified
+`advertise` address, a key shorter than 32 characters, seeds that aren't `host:port`, a zero
+gossip interval and a failure timeout not longer than the gossip interval MUST be reported
+as invalid.

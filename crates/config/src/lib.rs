@@ -87,6 +87,46 @@ config_tree! {
         // r[impl config.backends]
         /// Backends by name.
         pub backends: HashMap<String, Backend>,
+        // r[impl config.cluster]
+        /// Other hylla nodes to share revalidations and preloads with. Optional.
+        pub cluster: Option<pub struct Cluster {
+            /// The address of the cluster listener, for gossip and data between nodes. Keep
+            /// it on a private network.
+            pub listen: SocketAddr,
+            /// The address other nodes reach this one at. Defaults to `listen`, which must
+            /// then be a specific address rather than `0.0.0.0` or `[::]`.
+            pub advertise: Option<SocketAddr>,
+            // r[impl config.cluster.seeds]
+            /// Nodes to join through, as `host:port`. Names are resolved again on every
+            /// gossip round, so a DNS name returning every node, such as a Kubernetes
+            /// headless service, works as well as a list of addresses.
+            #[facet(default)]
+            pub seeds: Vec<String>,
+            /// How often membership is gossiped, such as `1s`.
+            #[facet(default = Interval::from_secs(1))]
+            pub gossip_interval: Interval,
+            /// How long a node may go without a heartbeat before it's considered gone.
+            #[facet(default = Interval::from_secs(10))]
+            pub failure_timeout: Interval,
+            // r[impl config.cluster.key]
+            /// The key shared by the nodes, authenticating everything between them. At
+            /// least 32 characters.
+            #[config(secret)]
+            pub key: String,
+            // r[impl config.cluster.share]
+            /// What the nodes share.
+            #[facet(default)]
+            pub share: pub struct ClusterShare {
+                /// Pushes revalidated metadata to the other nodes, so they don't each ask
+                /// the backend.
+                #[facet(default = true)]
+                pub metadata: bool,
+                /// Lets one node run each refresh rule and the others pull what it preloads
+                /// from it, so the backend serves each preload once.
+                #[facet(default = true)]
+                pub preload: bool,
+            },
+        }>,
         // r[impl config.auth.verifiers]
         /// JWT verifiers by name, used by mappings' `auth`.
         #[facet(default)]
@@ -158,6 +198,15 @@ impl Default for Cache {
             write_policy: WritePolicy::default(),
             memory: MemoryCache::default(),
             disk: None,
+        }
+    }
+}
+
+impl Default for ClusterShare {
+    fn default() -> Self {
+        Self {
+            metadata: true,
+            preload: true,
         }
     }
 }

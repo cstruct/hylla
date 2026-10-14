@@ -625,3 +625,80 @@ fn mapping_auth_is_validated() {
     assert!(errors[1].contains("mapping 0") && errors[1].contains("claim names may only contain"));
     assert!(errors[2].contains("mapping 1") && errors[2].contains("unknown verifier `missing`"));
 }
+
+const CLUSTER: &str = "\
+servers: {}
+backends: {}
+cluster:
+  listen: 0.0.0.0:7946
+  advertise: 10.0.0.5:7946
+  seeds: [10.0.0.6:7946, hylla.cache.svc.cluster.local:7946]
+  gossip_interval: 500ms
+";
+
+// r[verify config.cluster]
+// r[verify config.cluster.seeds]
+// r[verify config.cluster.key]
+// r[verify config.cluster.share]
+#[test]
+fn clusters_are_configured_with_a_secret_key() {
+    let secrets = "cluster: {key: a cluster key of at least thirty-two characters}";
+    let files = Files::new("cluster", CLUSTER, secrets);
+    let cluster = files.load(&[]).unwrap().into_config().cluster.unwrap();
+    assert_eq!(cluster.listen, "0.0.0.0:7946".parse().unwrap());
+    assert_eq!(cluster.advertise, Some("10.0.0.5:7946".parse().unwrap()));
+    assert_eq!(
+        cluster.seeds,
+        vec!["10.0.0.6:7946", "hylla.cache.svc.cluster.local:7946"]
+    );
+    assert_eq!(
+        cluster.gossip_interval,
+        Interval(std::time::Duration::from_millis(500))
+    );
+    assert_eq!(cluster.failure_timeout, Interval::from_secs(10));
+    assert_eq!(
+        cluster.key,
+        "a cluster key of at least thirty-two characters"
+    );
+    assert!(cluster.share.metadata && cluster.share.preload);
+
+    // The key is secret: the public file can't set it.
+    let public = format!("{CLUSTER}  key: a cluster key of at least thirty-two characters\n");
+    let files = Files::new("cluster-public-key", &public, secrets);
+    let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) = files.load(&[]) else {
+        panic!("expected violations");
+    };
+    assert_eq!(
+        violations.layer_mismatches()[0].path.to_string(),
+        "cluster.key"
+    );
+}
+
+// r[verify config.validate.cluster]
+#[test]
+fn cluster_settings_are_validated() {
+    let config = "\
+servers: {}
+backends: {}
+cluster:
+  listen: 0.0.0.0:7946
+  seeds: [10.0.0.6, ':7946']
+  gossip_interval: 10s
+";
+    let files = Files::new("cluster-invalid", config, "cluster: {key: short}");
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        vec![
+            "invalid cluster config: `listen` is 0.0.0.0:7946, so set `advertise` to the \
+             address other nodes reach this one at",
+            "invalid cluster config: `key` must be at least 32 characters",
+            "invalid cluster config: seed `10.0.0.6` must be `host:port`",
+            "invalid cluster config: seed `:7946` must be `host:port`",
+            "invalid cluster config: `failure_timeout` must be longer than `gossip_interval`",
+        ]
+    );
+}

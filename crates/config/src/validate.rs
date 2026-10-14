@@ -46,6 +46,8 @@ pub enum ValidationError {
         rule: Option<usize>,
         reason: String,
     },
+    /// The cluster settings are invalid.
+    InvalidCluster { reason: String },
     /// A cache size setting is out of range.
     InvalidCache { reason: String },
     /// Several servers answer to the same host name on the same address.
@@ -127,6 +129,7 @@ impl fmt::Display for ValidationError {
                 rule: None,
                 reason,
             } => write!(f, "refresh of backend `{backend}` is invalid: {reason}"),
+            Self::InvalidCluster { reason } => write!(f, "invalid cluster config: {reason}"),
             Self::InvalidCache { reason } => write!(f, "invalid cache config: {reason}"),
             Self::DuplicateHost {
                 listen,
@@ -231,6 +234,8 @@ impl Config {
         errors.extend(self.validate_cache());
         // r[impl config.validate.refresh]
         errors.extend(self.validate_refresh());
+        // r[impl config.validate.cluster]
+        errors.extend(self.validate_cluster());
 
         for ((listen, server_name), servers) in hosts {
             if servers.len() > 1 {
@@ -334,5 +339,48 @@ impl Config {
             }
         }
         errors
+    }
+}
+
+impl Config {
+    fn validate_cluster(&self) -> Vec<ValidationError> {
+        let Some(cluster) = &self.cluster else {
+            return Vec::new();
+        };
+        let mut reasons = Vec::new();
+        if cluster.advertise.is_none() && cluster.listen.ip().is_unspecified() {
+            reasons.push(format!(
+                "`listen` is {}, so set `advertise` to the address other nodes reach this \
+                 one at",
+                cluster.listen
+            ));
+        }
+        if cluster
+            .advertise
+            .is_some_and(|advertise| advertise.ip().is_unspecified())
+        {
+            reasons.push("`advertise` must be a specific address".to_string());
+        }
+        if cluster.key.len() < 32 {
+            reasons.push("`key` must be at least 32 characters".to_string());
+        }
+        for seed in &cluster.seeds {
+            let valid = seed
+                .rsplit_once(':')
+                .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+            if !valid {
+                reasons.push(format!("seed `{seed}` must be `host:port`"));
+            }
+        }
+        if cluster.gossip_interval.duration().is_zero() {
+            reasons.push("`gossip_interval` must be positive".to_string());
+        }
+        if cluster.failure_timeout.duration() <= cluster.gossip_interval.duration() {
+            reasons.push("`failure_timeout` must be longer than `gossip_interval`".to_string());
+        }
+        reasons
+            .into_iter()
+            .map(|reason| ValidationError::InvalidCluster { reason })
+            .collect()
     }
 }

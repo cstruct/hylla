@@ -28,6 +28,13 @@ servers:
           private: true       # Cache-Control: private (default)
       - path_prefix: /
         backend: assets
+cluster:                      # optional: share with other hylla nodes
+  listen: 0.0.0.0:7946        # private network only: gossip and data between nodes
+  advertise: 10.0.0.5:7946    # how the others reach this node
+  seeds: [hylla-headless.cache.svc.cluster.local:7946]   # addresses or DNS names
+  share:
+    metadata: true            # push revalidated metadata to the other nodes
+    preload: true             # one node runs each refresh rule; the others pull from it
 auth:                         # JWT verifiers, by name
   partners:
     algorithm: ES256          # RS256..512, PS256..512, ES256, ES384 or EdDSA
@@ -71,6 +78,8 @@ cache:                        # optional, every setting has a default
 
 ```yaml
 # secrets.yaml
+cluster:
+  key: replace-with-a-long-random-string  # shared by the nodes, at least 32 characters
 backends:
   assets:
     access_key_id: AKIA...
