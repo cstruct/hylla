@@ -95,6 +95,26 @@ r[config.backends.types]
 A backend MUST be one of `s3`, `swift` or `azure_blob`, selected by its `type` field, with
 the fields of that type.
 
+r[config.refresh]
+A backend MAY have a `refresh` section with `rules` and a `concurrency`, defaulting to 4,
+limiting how many objects are refreshed at the same time.
+
+r[config.refresh.rules]
+A refresh rule MUST cover either a backend key `prefix` (directory-like, empty for the
+whole backend) or a single backend `key`, and run `every` interval.
+
+r[config.refresh.modes]
+A refresh rule's `mode` MUST be `disabled`, `revalidate` (the default), `preload` or
+`both`. Preload rules MAY cap each run with `max_objects` and `max_mib`.
+
+r[config.durations]
+Durations such as `every` MUST be written like `90s`, `15m` or `1h 30m`.
+
+r[config.validate.refresh]
+A refresh with a `concurrency` of zero, and rules setting both or neither of `prefix` and
+`key`, a key or prefix starting with `/`, an empty key, a zero interval, or preloading
+without `max_objects` or `max_mib`, MUST be reported as invalid.
+
 r[config.backends.secrets]
 Backend credentials MUST be secret, so they can only be set by the secrets file.
 

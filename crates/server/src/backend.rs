@@ -30,6 +30,7 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
             endpoint,
             access_key_id,
             secret_access_key,
+            ..
         } => {
             let mut builder = AmazonS3Builder::new()
                 .with_bucket_name(bucket)
@@ -72,6 +73,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".into()),
             access_key_id: "id".into(),
             secret_access_key: "secret".into(),
+            refresh: None,
         });
         let stores = super::stores(&s3).unwrap();
         assert!(stores["b"].to_string().contains("assets"));
@@ -82,6 +84,7 @@ mod tests {
             region: None,
             username: "u".into(),
             password: "p".into(),
+            refresh: None,
         });
         let error = super::stores(&swift).err().unwrap();
         assert_eq!(

@@ -28,6 +28,16 @@ backends:
     bucket: assets
     region: eu-north-1
     endpoint: http://localhost:9000   # optional, for S3 compatible stores
+    refresh:                  # optional background refresh of this backend's objects
+      concurrency: 4          # objects refreshed at the same time
+      rules:
+        - prefix: css/        # backend keys; directory-like, '' for everything
+          every: 15m
+          mode: revalidate    # disabled, revalidate (default), preload or both
+        - key: index.html     # or a single key
+          every: 10m
+          mode: both
+          max_objects: 1      # preloading needs max_objects and/or max_mib
 cache:                        # optional, every setting has a default
   chunk_size_kib: 1024        # objects are cached in chunks of this size
   metadata_ttl_seconds: 30    # how long size, ETag and content type are cached

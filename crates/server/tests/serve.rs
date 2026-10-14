@@ -61,6 +61,7 @@ fn config(cache: Cache) -> Config {
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
+                refresh: None,
             },
         )]),
         cache,

@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use hylla_config::{
-    Backend, ConfigError, ConfigFiles, DiskCache, Mapping, Origin, Rewrite, Route, Router,
-    ValidationError, WritePolicy, load_with_env,
+    Backend, ConfigError, ConfigFiles, DiskCache, Interval, Mapping, Origin, RefreshMode,
+    RefreshRule, Rewrite, Route, Router, ValidationError, WritePolicy, load_with_env,
 };
 use ordna_core::{ConfigLoadError, ConfigPath, ConfigValueSource};
 use source_env::EnvSource;
@@ -165,6 +165,7 @@ fn loads_servers_and_backends() {
             endpoint: None,
             access_key_id: "AKIA123".into(),
             secret_access_key: "s3cr3t".into(),
+            refresh: None,
         }
     );
     assert_eq!(
@@ -175,6 +176,7 @@ fn loads_servers_and_backends() {
             region: None,
             username: "hylla".into(),
             password: "hunter2".into(),
+            refresh: None,
         }
     );
 }
@@ -370,4 +372,128 @@ fn cache_sizes_are_validated() {
     assert_eq!(reasons.len(), 2, "{reasons:#?}");
     assert!(reasons[0].contains("must be smaller than `disk.block_size_mib`"));
     assert!(reasons[1].contains("must hold at least 4 blocks"));
+}
+
+const REFRESH: &str = "\
+servers: {}
+backends:
+  assets:
+    type: s3
+    bucket: assets
+    region: eu-north-1
+    refresh:
+      rules:
+        - prefix: css/
+          every: 15m
+        - key: index.html
+          every: 1h 30m
+          mode: both
+          max_objects: 1
+        - prefix: ''
+          every: 1d
+          mode: disabled
+";
+
+// r[verify config.refresh]
+// r[verify config.refresh.rules]
+// r[verify config.refresh.modes]
+// r[verify config.durations]
+#[test]
+fn backends_configure_refresh_rules() {
+    let files = Files::new(
+        "refresh",
+        REFRESH,
+        "backends: {assets: {access_key_id: a, secret_access_key: b}}",
+    );
+    let config = files
+        .load(&[("HYLLA__BACKENDS__ASSETS__REFRESH__CONCURRENCY", "8")])
+        .unwrap()
+        .into_config();
+    let refresh = config.backends["assets"].refresh().unwrap();
+    assert_eq!(refresh.concurrency, 8);
+    let minutes = |minutes: u64| Interval(std::time::Duration::from_secs(minutes * 60));
+    assert_eq!(
+        refresh.rules,
+        vec![
+            RefreshRule {
+                prefix: Some("css/".into()),
+                key: None,
+                every: minutes(15),
+                mode: RefreshMode::Revalidate,
+                max_objects: None,
+                max_mib: None,
+            },
+            RefreshRule {
+                prefix: None,
+                key: Some("index.html".into()),
+                every: minutes(90),
+                mode: RefreshMode::Both,
+                max_objects: Some(1),
+                max_mib: None,
+            },
+            RefreshRule {
+                prefix: Some(String::new()),
+                key: None,
+                every: minutes(24 * 60),
+                mode: RefreshMode::Disabled,
+                max_objects: None,
+                max_mib: None,
+            },
+        ]
+    );
+    assert!(RefreshMode::Both.revalidates() && RefreshMode::Both.preloads());
+    assert!(!RefreshMode::Disabled.revalidates() && !RefreshMode::Disabled.preloads());
+
+    // Durations must parse.
+    let invalid = REFRESH.replace("every: 15m", "every: soon");
+    let files = Files::new("refresh-duration", &invalid, "{}");
+    let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) = files.load(&[]) else {
+        panic!("expected violations");
+    };
+    assert_eq!(violations.decode_errors().len(), 1);
+}
+
+// r[verify config.validate.refresh]
+#[test]
+fn refresh_rules_are_validated() {
+    let config = "\
+servers: {}
+backends:
+  assets:
+    type: s3
+    bucket: assets
+    region: eu-north-1
+    refresh:
+      concurrency: 0
+      rules:
+        - prefix: css/
+          key: app.css
+          every: 15m
+        - key: /app.css
+          every: 0s
+        - prefix: css/
+          every: 15m
+          mode: preload
+";
+    let files = Files::new(
+        "refresh-invalid",
+        config,
+        "backends: {assets: {access_key_id: a, secret_access_key: b}}",
+    );
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        vec![
+            "refresh of backend `assets` is invalid: `concurrency` must be positive",
+            "refresh rule 0 of backend `assets` is invalid: set exactly one of `prefix` and `key`",
+            "refresh rule 1 of backend `assets` is invalid: keys and prefixes are backend keys, \
+             which don't start with `/`",
+            "refresh rule 1 of backend `assets` is invalid: `every` must be positive",
+            "refresh rule 2 of backend `assets` is invalid: preloading needs `max_objects` or \
+             `max_mib`, so it can't fill the cache with objects nobody reads",
+        ]
+    );
 }

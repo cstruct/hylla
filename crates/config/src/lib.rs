@@ -20,6 +20,7 @@
 //!
 //! Backend credentials are secret: they can only come from the secrets file.
 
+mod interval;
 mod load;
 mod router;
 mod validate;
@@ -28,6 +29,7 @@ use std::{collections::HashMap, net::SocketAddr};
 
 use ordna_core::{config, config_tree};
 
+pub use interval::Interval;
 pub use load::{
     ConfigError, ConfigFiles, ENV_PREFIX, Loaded, Origin, SourceError, load, load_with_env,
 };
@@ -172,6 +174,8 @@ pub enum Backend {
         access_key_id: String,
         #[config(secret)]
         secret_access_key: String,
+        /// Background refresh of cached objects.
+        refresh: Option<Refresh>,
     },
     /// OpenStack Swift.
     Swift {
@@ -181,6 +185,8 @@ pub enum Backend {
         username: String,
         #[config(secret)]
         password: String,
+        /// Background refresh of cached objects.
+        refresh: Option<Refresh>,
     },
     /// Azure Blob Storage.
     AzureBlob {
@@ -190,7 +196,81 @@ pub enum Backend {
         endpoint: Option<String>,
         #[config(secret)]
         account_key: String,
+        /// Background refresh of cached objects.
+        refresh: Option<Refresh>,
     },
+}
+
+// r[impl config.refresh]
+/// Background refresh of a backend's cached objects.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refresh {
+    /// How many objects are refreshed at the same time.
+    #[facet(default = 4)]
+    pub concurrency: u32,
+    /// What to refresh, and how often.
+    pub rules: Vec<RefreshRule>,
+}
+
+// r[impl config.refresh.rules]
+/// Refreshes the objects under a key prefix, or a single key, of a backend.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshRule {
+    /// A backend key prefix, such as `css/`; directory-like, so `css` doesn't match
+    /// `cssx/app.css`. Empty for the whole backend.
+    pub prefix: Option<String>,
+    /// A single backend key, such as `css/app.css`.
+    pub key: Option<String>,
+    /// How often to refresh, such as `15m`. The first refresh runs at startup.
+    pub every: Interval,
+    #[facet(default)]
+    pub mode: RefreshMode,
+    /// The most objects one preload fetches.
+    pub max_objects: Option<u64>,
+    /// The most data one preload fetches, in MiB.
+    pub max_mib: Option<u64>,
+}
+
+// r[impl config.refresh.modes]
+/// What a refresh rule does.
+#[config]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[facet(rename_all = "snake_case")]
+pub enum RefreshMode {
+    /// Nothing, disabling the rule. Spelled `disabled` rather than `none` or `off`, which
+    /// YAML parsers may read as null or false.
+    Disabled,
+    /// Re-checks cached objects, updating their metadata, so changes are picked up without
+    /// requests waiting on the backend.
+    #[default]
+    Revalidate,
+    /// Fetches objects that aren't cached, or changed, into the cache.
+    Preload,
+    /// Both revalidates and preloads.
+    Both,
+}
+
+impl RefreshMode {
+    pub fn revalidates(self) -> bool {
+        matches!(self, Self::Revalidate | Self::Both)
+    }
+
+    pub fn preloads(self) -> bool {
+        matches!(self, Self::Preload | Self::Both)
+    }
+}
+
+impl Backend {
+    /// The backend's background refresh, if any.
+    pub fn refresh(&self) -> Option<&Refresh> {
+        match self {
+            Backend::S3 { refresh, .. }
+            | Backend::Swift { refresh, .. }
+            | Backend::AzureBlob { refresh, .. } => refresh.as_ref(),
+        }
+    }
 }
 
 impl Server {

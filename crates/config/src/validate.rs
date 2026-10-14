@@ -33,6 +33,12 @@ pub enum ValidationError {
         rewrite: usize,
         reference: String,
     },
+    /// A backend's refresh settings are invalid.
+    InvalidRefresh {
+        backend: String,
+        rule: Option<usize>,
+        reason: String,
+    },
     /// A cache size setting is out of range.
     InvalidCache { reason: String },
     /// Several servers answer to the same host name on the same address.
@@ -93,6 +99,19 @@ impl fmt::Display for ValidationError {
                 }
                 Ok(())
             }
+            Self::InvalidRefresh {
+                backend,
+                rule: Some(rule),
+                reason,
+            } => write!(
+                f,
+                "refresh rule {rule} of backend `{backend}` is invalid: {reason}"
+            ),
+            Self::InvalidRefresh {
+                backend,
+                rule: None,
+                reason,
+            } => write!(f, "refresh of backend `{backend}` is invalid: {reason}"),
             Self::InvalidCache { reason } => write!(f, "invalid cache config: {reason}"),
             Self::DuplicateHost {
                 listen,
@@ -177,6 +196,8 @@ impl Config {
         }
         // r[impl config.validate.cache]
         errors.extend(self.validate_cache());
+        // r[impl config.validate.refresh]
+        errors.extend(self.validate_refresh());
 
         for ((listen, server_name), servers) in hosts {
             if servers.len() > 1 {
@@ -227,5 +248,58 @@ impl Config {
             .into_iter()
             .map(|reason| ValidationError::InvalidCache { reason })
             .collect()
+    }
+}
+
+impl Config {
+    fn validate_refresh(&self) -> Vec<ValidationError> {
+        let mut errors = Vec::new();
+        let mut backends = self.backends.iter().collect::<Vec<_>>();
+        backends.sort_by_key(|(name, _)| *name);
+        for (name, backend) in backends {
+            let Some(refresh) = backend.refresh() else {
+                continue;
+            };
+            let mut error = |rule: Option<usize>, reason: &str| {
+                errors.push(ValidationError::InvalidRefresh {
+                    backend: name.clone(),
+                    rule,
+                    reason: reason.to_string(),
+                });
+            };
+            if refresh.concurrency == 0 {
+                error(None, "`concurrency` must be positive");
+            }
+            for (index, rule) in refresh.rules.iter().enumerate() {
+                let rule_error = |reason: &str| (Some(index), reason.to_string());
+                let mut reasons = Vec::new();
+                match (&rule.prefix, &rule.key) {
+                    (Some(_), Some(_)) | (None, None) => {
+                        reasons.push(rule_error("set exactly one of `prefix` and `key`"))
+                    }
+                    (Some(path), None) | (None, Some(path)) if path.starts_with('/') => reasons
+                        .push(rule_error(
+                            "keys and prefixes are backend keys, which don't start with `/`",
+                        )),
+                    (None, Some(key)) if key.is_empty() => {
+                        reasons.push(rule_error("`key` must not be empty"))
+                    }
+                    _ => {}
+                }
+                if rule.every.duration().is_zero() {
+                    reasons.push(rule_error("`every` must be positive"));
+                }
+                if rule.mode.preloads() && rule.max_objects.is_none() && rule.max_mib.is_none() {
+                    reasons.push(rule_error(
+                        "preloading needs `max_objects` or `max_mib`, so it can't fill the cache \
+                         with objects nobody reads",
+                    ));
+                }
+                for (rule, reason) in reasons {
+                    error(rule, &reason);
+                }
+            }
+        }
+        errors
     }
 }
