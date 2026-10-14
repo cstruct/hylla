@@ -139,6 +139,24 @@ config_tree! {
                 #[facet(default = Interval::from_secs(30))]
                 pub interval: Interval,
             },
+            // r[impl config.telemetry.traces]
+            /// Exporting traces.
+            #[facet(default)]
+            pub traces: pub struct TracesExport {
+                #[facet(default)]
+                pub enabled: bool,
+                /// The full URL to export traces to, overriding `otlp.endpoint`, such as
+                /// `http://quickwit:7280/api/v1/otlp/v1/traces`.
+                pub endpoint: Option<String>,
+                /// The share of traces to sample, from 0 to 1. Requests whose caller sampled
+                /// them are traced either way.
+                #[facet(default = 1.0)]
+                pub sample_ratio: f64,
+                /// Whether to record request and object paths in spans. Off by default, since
+                /// paths can tell more than they should, such as who a tenant is.
+                #[facet(default)]
+                pub record_paths: bool,
+            },
         },
         // r[impl config.cluster]
         /// Other hylla nodes to share revalidations and preloads with. Optional.
@@ -262,6 +280,7 @@ impl Default for Telemetry {
             resource: Vec::new(),
             otlp: Otlp::default(),
             metrics: MetricsExport::default(),
+            traces: TracesExport::default(),
         }
     }
 }
@@ -283,6 +302,17 @@ impl Default for MetricsExport {
             enabled: false,
             endpoint: None,
             interval: Interval::from_secs(30),
+        }
+    }
+}
+
+impl Default for TracesExport {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            sample_ratio: 1.0,
+            record_paths: false,
         }
     }
 }

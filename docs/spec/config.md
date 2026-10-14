@@ -215,3 +215,8 @@ r[config.telemetry.otlp]
 r[config.telemetry.metrics]
 `metrics` MUST configure exporting metrics: whether it's `enabled` (off by default), an
 optional `endpoint` overriding the OTLP one, and the export `interval`, defaulting to `30s`.
+
+r[config.telemetry.traces]
+`traces` MUST configure exporting traces: whether it's `enabled` (off by default), an optional
+`endpoint` overriding the OTLP one, the `sample_ratio` from 0 to 1, defaulting to 1, and
+whether to `record_paths` in spans, off by default.

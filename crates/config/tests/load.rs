@@ -713,11 +713,16 @@ telemetry:
     enabled: true
     endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics
     interval: 15s
+  traces:
+    enabled: true
+    endpoint: http://quickwit:7280/api/v1/otlp/v1/traces
+    sample_ratio: 0.25
 ";
 
 // r[verify config.telemetry]
 // r[verify config.telemetry.otlp]
 // r[verify config.telemetry.metrics]
+// r[verify config.telemetry.traces]
 #[test]
 fn telemetry_is_configured_with_secret_headers() {
     let files = Files::new("telemetry-defaults", "servers: {}\nbackends: {}\n", "{}");
@@ -726,6 +731,9 @@ fn telemetry_is_configured_with_secret_headers() {
     assert_eq!(telemetry.service_name, "hylla");
     assert!(!telemetry.metrics.enabled);
     assert_eq!(telemetry.otlp.protocol, OtlpProtocol::HttpProtobuf);
+    assert!(!telemetry.traces.enabled);
+    assert_eq!(telemetry.traces.sample_ratio, 1.0);
+    assert!(!telemetry.traces.record_paths);
 
     let secrets = "telemetry: {otlp: {headers: {authorization: Bearer token}}}";
     let files = Files::new("telemetry", TELEMETRY, secrets);
@@ -754,6 +762,12 @@ fn telemetry_is_configured_with_secret_headers() {
         Some("http://prometheus:9090/api/v1/otlp/v1/metrics")
     );
     assert_eq!(telemetry.metrics.interval, Interval::from_secs(15));
+    assert!(telemetry.traces.enabled);
+    assert_eq!(
+        telemetry.traces.endpoint.as_deref(),
+        Some("http://quickwit:7280/api/v1/otlp/v1/traces")
+    );
+    assert_eq!(telemetry.traces.sample_ratio, 0.25);
 
     // Headers are secret: the public file can't set them.
     let public = format!("{TELEMETRY}  otlp:\n    headers: {{authorization: leaked}}\n")
