@@ -15,6 +15,8 @@ use percent_encoding::percent_decode_str;
 use anyhow::Context;
 use hylla_config::Refresh;
 
+use crate::auth::{self, CompiledAuth, Verifiers};
+
 use crate::{
     RefreshReport,
     backend::Stores,
@@ -37,11 +39,14 @@ pub struct App {
 struct Server {
     names: Vec<String>,
     router: MappingRouter,
+    /// The auth of each mapping, by mapping index.
+    auth: Vec<Option<CompiledAuth>>,
 }
 
 impl App {
     /// Builds the app from a validated config and the backends' object stores.
     pub async fn new(config: &Config, stores: Stores) -> anyhow::Result<Arc<Self>> {
+        let verifiers = Verifiers::new(&config.auth)?;
         let mut listeners = BTreeMap::<SocketAddr, Vec<Arc<Server>>>::new();
         let mut servers = config.servers.iter().collect::<Vec<_>>();
         servers.sort_by_key(|(name, _)| *name);
@@ -49,6 +54,19 @@ impl App {
             let router = MappingRouter::new(server).map_err(|(mapping, rewrite, error)| {
                 anyhow::anyhow!("server `{name}`, mapping {mapping}, rewrite {rewrite}: {error}")
             })?;
+            let auth = server
+                .mappings
+                .iter()
+                .enumerate()
+                .map(|(index, mapping)| {
+                    mapping
+                        .auth
+                        .as_ref()
+                        .map(|auth| verifiers.mapping(auth))
+                        .transpose()
+                        .with_context(|| format!("server `{name}`, mapping {index}"))
+                })
+                .collect::<anyhow::Result<_>>()?;
             listeners
                 .entry(server.listen)
                 .or_default()
@@ -59,6 +77,7 @@ impl App {
                         .map(|name| name.to_lowercase())
                         .collect(),
                     router,
+                    auth,
                 }));
         }
         let refresh = config
@@ -185,24 +204,67 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
     let Some(route) = server.router.route(request.uri().path()) else {
         return (StatusCode::NOT_FOUND, "no mapping\n").into_response();
     };
-    let Some(store) = app.stores.get(route.backend) else {
-        return (StatusCode::BAD_GATEWAY, "backend unavailable\n").into_response();
-    };
     let key = percent_decode_str(route.path.trim_start_matches('/')).decode_utf8_lossy();
-    if key.is_empty() {
-        return StatusCode::NOT_FOUND.into_response();
+
+    // r[impl auth.mappings]
+    let auth = server.auth.get(route.mapping).and_then(Option::as_ref);
+    let private = auth.is_some_and(|auth| auth.private);
+    if let Some(auth) = auth
+        && let Err(refusal) = auth.check(request.headers(), &format!("/{key}"))
+    {
+        if let auth::Refusal::InvalidToken(reason) = &refusal {
+            tracing::debug!(reason, "refused an invalid token");
+        }
+        let (status, headers) = auth::refusal_response(&refusal);
+        return mark_private((status, headers).into_response(), private);
     }
-    let path = ObjectPath::from(key.as_ref());
+
+    let request_headers = request.headers();
+    let response = async {
+        let Some(store) = app.stores.get(route.backend) else {
+            return (StatusCode::BAD_GATEWAY, "backend unavailable\n").into_response();
+        };
+        if key.is_empty() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let path = ObjectPath::from(key.as_ref());
+        serve_object(app, route.backend, store, path, request_headers, head).await
+    }
+    .await;
+    mark_private(response, private)
+}
+
+// r[impl auth.private]
+/// Marks a response of an authenticated mapping as private, so shared caches don't serve it
+/// to others.
+fn mark_private(mut response: Response, private: bool) -> Response {
+    if private {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+    }
+    response
+}
+
+async fn serve_object(
+    app: &Arc<App>,
+    backend: &str,
+    store: &Arc<dyn object_store::ObjectStore>,
+    path: ObjectPath,
+    request_headers: &HeaderMap,
+    head: bool,
+) -> Response {
+    let route_backend = backend;
 
     let meta = match app
         .cache
-        .metadata(route.backend, store.clone(), &path)
+        .metadata(route_backend, store.clone(), &path)
         .await
     {
         Ok(meta) => meta,
         Err(ReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
         Err(ReadError::Backend(error)) => {
-            tracing::warn!(backend = route.backend, %path, "metadata: {error:#}");
+            tracing::warn!(backend = route_backend, %path, "metadata: {error:#}");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
@@ -210,7 +272,7 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
 
     // r[impl server.conditional]
     if let (Some(etag), Some(if_none_match)) =
-        (&meta.etag, request.headers().get(header::IF_NONE_MATCH))
+        (&meta.etag, request_headers.get(header::IF_NONE_MATCH))
         && if_none_match.to_str().is_ok_and(|value| {
             value
                 .split(',')
@@ -221,8 +283,7 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
     }
 
     let range = range::parse(
-        request
-            .headers()
+        request_headers
             .get(header::RANGE)
             .and_then(|value| value.to_str().ok()),
         meta.size,
@@ -260,7 +321,7 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
         store: store.clone(),
         path: path.clone(),
         meta: meta.clone(),
-        backend: route.backend.to_string(),
+        backend: route_backend.to_string(),
         range: range.clone(),
     });
     let read = move |index: u64| {
@@ -273,7 +334,7 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
         Ok(bytes) => bytes,
         Err(ReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
         Err(ReadError::Backend(error)) => {
-            tracing::warn!(backend = route.backend, %path, "chunk {first}: {error:#}");
+            tracing::warn!(backend = route_backend, %path, "chunk {first}: {error:#}");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };

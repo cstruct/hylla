@@ -6,6 +6,7 @@
 //! the cache, which holds objects in fixed-size chunks fetched from the backend on miss.
 
 mod app;
+mod auth;
 pub mod backend;
 mod cache;
 mod range;
