@@ -1,0 +1,14 @@
+[package]
+name = "hylla-config"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+
+[dependencies]
+ordna-core = { package = "core", path = "../../../ordna/crates/core" }
+source-env = { path = "../../../ordna/crates/source-env" }
+source-file = { path = "../../../ordna/crates/source-file" }
+source-yaml = { path = "../../../ordna/crates/source-yaml" }
+regex = "1.13.1"
+# Needed by `#[config(path = ...)]` and `#[facet(tag = ...)]`, see ordna's macros.
+facet = { version = "0.46.5", features = ["net"] }
