@@ -4,7 +4,10 @@ use futures::{StreamExt, TryStreamExt, stream};
 use hylla_config::{Refresh, RefreshRule};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 
-use crate::cache::{CachedState, ObjectCache, ObjectMeta, ReadError};
+use crate::{
+    cache::{CachedState, ObjectCache, ObjectMeta, ReadError},
+    metrics,
+};
 
 /// What a refresh run did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,11 +61,17 @@ pub async fn run(
     let listed = match (&rule.prefix, &rule.key) {
         (Some(prefix), _) => {
             let prefix = (!prefix.is_empty()).then(|| ObjectPath::from(prefix.as_str()));
-            store.list(prefix.as_ref()).try_collect::<Vec<_>>().await?
+            let started = std::time::Instant::now();
+            let listed = store.list(prefix.as_ref()).try_collect::<Vec<_>>().await;
+            metrics::backend_request(backend, "list", started, metrics::outcome(&listed));
+            listed?
         }
         (None, Some(key)) => {
             let path = ObjectPath::from(key.as_str());
-            match store.head(&path).await {
+            let started = std::time::Instant::now();
+            let head = store.head(&path).await;
+            metrics::backend_request(backend, "head", started, metrics::outcome(&head));
+            match head {
                 Ok(meta) => vec![meta],
                 // r[impl refresh.removed]
                 Err(object_store::Error::NotFound { .. }) => {

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use hylla_config::{ConfigFiles, load};
-use hylla_server::{App, backend, serve};
+use hylla_server::{App, backend, serve, telemetry};
 use tracing_subscriber::EnvFilter;
 
 /// A caching layer in front of object storage.
@@ -32,14 +32,17 @@ async fn main() -> anyhow::Result<()> {
         secrets: args.secrets,
     })?;
     let config = loaded.into_config();
+    let telemetry = telemetry::init(&config.telemetry).context("setting up telemetry")?;
     let stores = backend::stores(&config).context("creating backends")?;
     let app = App::new(&config, stores)
         .await
         .context("creating the cache")?;
 
-    serve(app, async {
+    let served = serve(app, async {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutting down");
     })
-    .await
+    .await;
+    telemetry.shutdown();
+    served
 }

@@ -33,9 +33,12 @@ use object_store::path::Path as ObjectPath;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
 
+use opentelemetry::KeyValue;
+
 use crate::{
     App,
     cache::{CacheEvent, ChunkKey, ObjectMeta, SharedMeta},
+    metrics::METRICS,
 };
 
 use self::sign::Signer;
@@ -255,7 +258,10 @@ impl Cluster {
         for (addr, response) in responses {
             match response.and_then(|bytes| Ok(serde_json::from_slice::<Gossip>(&bytes)?)) {
                 Ok(gossip) => self.merge(gossip),
-                Err(error) => tracing::debug!(%addr, "gossip failed: {error:#}"),
+                Err(error) => {
+                    METRICS.cluster_gossip_failures.add(1, &[]);
+                    tracing::debug!(%addr, "gossip failed: {error:#}");
+                }
             }
         }
     }
@@ -343,6 +349,8 @@ impl Cluster {
             }
             let body = serde_json::to_vec(&updates).expect("serializable");
             let peers = self.live_peers();
+            // r[impl telemetry.metrics.cluster]
+            record_updates("sent", &updates, peers.len() as u64);
             join_all(peers.into_iter().map(|(_, addr)| {
                 let body = body.clone();
                 async move {
@@ -352,6 +360,24 @@ impl Cluster {
                 }
             }))
             .await;
+        }
+    }
+}
+
+/// Counts the updates in a batch sent to `peers` nodes, or received.
+fn record_updates(direction: &'static str, updates: &Updates, peers: u64) {
+    for (kind, count) in [
+        ("fetched", updates.fetched.len()),
+        ("preloaded", updates.preloaded.len()),
+    ] {
+        if count > 0 {
+            METRICS.cluster_updates.add(
+                count as u64 * peers,
+                &[
+                    KeyValue::new("hylla.direction", direction),
+                    KeyValue::new("hylla.kind", kind),
+                ],
+            );
         }
     }
 }
@@ -501,6 +527,7 @@ async fn updates(
     let Ok(updates) = serde_json::from_slice::<Updates>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    record_updates("received", &updates, 1);
     if cluster.share.metadata {
         for wire in updates.fetched {
             app.cache.apply_metadata(wire.into()).await;
@@ -538,7 +565,12 @@ async fn pull(app: &App, cluster: &Cluster, origin: SocketAddr, shared: SharedMe
             continue;
         }
         match cluster.fetch_chunk(origin, &key).await {
-            Ok(Some(bytes)) => app.cache.insert_chunk(key, bytes),
+            Ok(Some(bytes)) => {
+                METRICS
+                    .cluster_pulled_chunks
+                    .add(1, &[KeyValue::new("hylla.source", "peer")]);
+                app.cache.insert_chunk(key, bytes);
+            }
             outcome => {
                 if let Err(error) = outcome {
                     tracing::warn!(%origin, key = shared.key, "pulling a chunk failed: {error:#}");
@@ -548,6 +580,9 @@ async fn pull(app: &App, cluster: &Cluster, origin: SocketAddr, shared: SharedMe
                     return;
                 };
                 let path = ObjectPath::from(shared.key.as_str());
+                METRICS
+                    .cluster_pulled_chunks
+                    .add(1, &[KeyValue::new("hylla.source", "backend")]);
                 if let Err(error) = app
                     .cache
                     .preload(&shared.backend, store.clone(), &path, &shared.meta)

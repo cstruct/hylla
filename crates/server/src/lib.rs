@@ -10,8 +10,10 @@ mod auth;
 pub mod backend;
 mod cache;
 mod cluster;
+mod metrics;
 mod range;
 mod refresh;
+pub mod telemetry;
 
 pub use app::App;
 pub use cache::ChunkKey;

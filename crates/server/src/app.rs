@@ -14,6 +14,7 @@ use percent_encoding::percent_decode_str;
 
 use anyhow::Context;
 use hylla_config::Refresh;
+use opentelemetry::KeyValue;
 
 use crate::auth::{self, CompiledAuth, Verifiers};
 
@@ -23,6 +24,7 @@ use crate::{
     cache::CacheEvent,
     cache::{ObjectCache, ObjectMeta, ReadError},
     cluster::{self, Cluster},
+    metrics::{self, METRICS},
     range::{self, RequestedRange},
     refresh,
 };
@@ -35,6 +37,8 @@ pub struct App {
     pub(crate) cluster: Option<Arc<Cluster>>,
     /// The cache's events, until the cluster starts sharing them.
     cluster_events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<CacheEvent>>>,
+    /// Observable instruments, kept alive while the app is.
+    _gauges: Vec<opentelemetry::metrics::ObservableGauge<u64>>,
     /// The refresh settings of the backends that have any, by backend name.
     refresh: BTreeMap<String, Refresh>,
     /// The servers of each listen address.
@@ -43,6 +47,10 @@ pub struct App {
 
 /// A configured server, with its mappings compiled.
 struct Server {
+    /// The server's name in the config, for metrics.
+    name: String,
+    /// The path prefix of each mapping, by mapping index, for metrics.
+    prefixes: Vec<String>,
     names: Vec<String>,
     router: MappingRouter,
     /// The auth of each mapping, by mapping index.
@@ -77,6 +85,12 @@ impl App {
                 .entry(server.listen)
                 .or_default()
                 .push(Arc::new(Server {
+                    name: name.clone(),
+                    prefixes: server
+                        .mappings
+                        .iter()
+                        .map(|mapping| mapping.path_prefix.clone())
+                        .collect(),
                     names: server
                         .server_names
                         .iter()
@@ -100,9 +114,25 @@ impl App {
             }
             None => (None, None),
         };
+        let mut gauges = Vec::new();
+        if let Some(cluster) = &cluster {
+            let cluster = Arc::downgrade(cluster);
+            gauges.push(
+                metrics::meter()
+                    .u64_observable_gauge("hylla.cluster.members")
+                    .with_description("Live nodes of the cluster, this one included")
+                    .with_callback(move |observer| {
+                        if let Some(cluster) = cluster.upgrade() {
+                            observer.observe(cluster.members().len() as u64, &[]);
+                        }
+                    })
+                    .build(),
+            );
+        }
         Ok(Arc::new(Self {
             cache,
             stores,
+            _gauges: gauges,
             cluster,
             cluster_events: std::sync::Mutex::new(cluster_events),
             refresh,
@@ -125,6 +155,7 @@ impl App {
 
     /// Runs refresh rule `rule` of `backend` once.
     pub async fn refresh(&self, backend: &str, rule: usize) -> anyhow::Result<RefreshReport> {
+        let rule_index = rule;
         let refresh = self
             .refresh
             .get(backend)
@@ -137,7 +168,27 @@ impl App {
             .stores
             .get(backend)
             .with_context(|| format!("backend `{backend}` has no store"))?;
-        refresh::run(&self.cache, backend, store.clone(), refresh, rule).await
+        let report = refresh::run(&self.cache, backend, store.clone(), refresh, rule).await?;
+        // r[impl telemetry.metrics.refresh]
+        let counts = [
+            ("unchanged", report.unchanged),
+            ("changed", report.changed),
+            ("removed", report.removed),
+            ("preloaded", report.preloaded),
+            ("skipped", report.skipped),
+            ("failed", report.failed),
+        ];
+        for (result, count) in counts.into_iter().filter(|(_, count)| *count > 0) {
+            METRICS.refresh_objects.add(
+                count,
+                &[
+                    KeyValue::new("hylla.backend", backend.to_string()),
+                    KeyValue::new("hylla.rule", rule_index as i64),
+                    KeyValue::new("hylla.result", result),
+                ],
+            );
+        }
+        Ok(report)
     }
 
     /// Starts sharing with the cluster, if one is configured: its listener, gossip and the
@@ -246,7 +297,39 @@ struct Listener {
     listen: SocketAddr,
 }
 
+/// What served a request, for its metrics.
+#[derive(Default)]
+struct RequestLabels {
+    server: Option<String>,
+    mapping: Option<String>,
+}
+
+// r[impl telemetry.metrics.requests]
 async fn handle(State(listener): State<Listener>, request: Request) -> Response {
+    let started = std::time::Instant::now();
+    let method = request.method().clone();
+    let mut labels = RequestLabels::default();
+    let response = respond(&listener, request, &mut labels).await;
+    let mut attributes = vec![
+        KeyValue::new("http.request.method", method.to_string()),
+        KeyValue::new(
+            "http.response.status_code",
+            i64::from(response.status().as_u16()),
+        ),
+    ];
+    if let Some(server) = labels.server {
+        attributes.push(KeyValue::new("hylla.server", server));
+    }
+    if let Some(mapping) = labels.mapping {
+        attributes.push(KeyValue::new("hylla.mapping", mapping));
+    }
+    METRICS
+        .requests
+        .record(metrics::seconds(started.elapsed()), &attributes);
+    response
+}
+
+async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabels) -> Response {
     // r[impl server.methods]
     let head = match *request.method() {
         Method::GET => false,
@@ -263,10 +346,12 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
     let Some(server) = app.server(listener.listen, request.headers()) else {
         return (StatusCode::NOT_FOUND, "unknown host\n").into_response();
     };
+    labels.server = Some(server.name.clone());
     // r[impl server.routes]
     let Some(route) = server.router.route(request.uri().path()) else {
         return (StatusCode::NOT_FOUND, "no mapping\n").into_response();
     };
+    labels.mapping = server.prefixes.get(route.mapping).cloned();
     let key = percent_decode_str(route.path.trim_start_matches('/')).decode_utf8_lossy();
 
     // r[impl auth.mappings]
@@ -278,6 +363,9 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
         if let auth::Refusal::InvalidToken(reason) = &refusal {
             tracing::debug!(reason, "refused an invalid token");
         }
+        METRICS
+            .auth_refusals
+            .add(1, &[KeyValue::new("hylla.reason", refusal.reason())]);
         let (status, headers) = auth::refusal_response(&refusal);
         return mark_private((status, headers).into_response(), private);
     }
@@ -438,7 +526,12 @@ impl ChunkReader {
         let len = bytes.len() as u64;
         let from = self.range.start.saturating_sub(chunk_start).min(len) as usize;
         let to = (self.range.end - chunk_start).min(len) as usize;
-        Ok(bytes.slice(from..to))
+        let bytes = bytes.slice(from..to);
+        METRICS.served_bytes.add(
+            bytes.len() as u64,
+            &[KeyValue::new("hylla.backend", self.backend.clone())],
+        );
+        Ok(bytes)
     }
 }
 

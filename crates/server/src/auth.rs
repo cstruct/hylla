@@ -161,6 +161,18 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     (scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty()).then(|| token.trim())
 }
 
+impl Refusal {
+    /// A short name for the reason, for metrics.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Refusal::MissingToken => "missing_token",
+            Refusal::InvalidToken(_) => "invalid_token",
+            Refusal::Forbidden => "forbidden",
+            Refusal::DotSegments => "dot_segments",
+        }
+    }
+}
+
 // r[impl auth.responses]
 /// The status and headers to refuse a request with.
 pub fn refusal_response(refusal: &Refusal) -> (StatusCode, HeaderMap) {

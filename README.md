@@ -31,6 +31,17 @@ servers:
           private: true       # Cache-Control: private (default)
       - path_prefix: /
         backend: assets
+telemetry:                    # optional: export over OTLP
+  service_name: hylla
+  resource:
+    - {key: deployment.environment, value: production}
+  otlp:
+    endpoint: http://collector:4318   # or the OTEL_EXPORTER_OTLP_* environment variables
+    protocol: http_protobuf   # or grpc
+  metrics:
+    enabled: true
+    endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics   # optional, per signal
+    interval: 30s
 cluster:                      # optional: share with other hylla nodes
   listen: 0.0.0.0:7946        # private network only: gossip and data between nodes
   advertise: 10.0.0.5:7946    # how the others reach this node

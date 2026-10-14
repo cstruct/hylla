@@ -15,6 +15,9 @@ use foyer::{
 };
 use hylla_config::WritePolicy;
 use object_store::{Attribute, GetOptions, GetRange, ObjectStore, path::Path as ObjectPath};
+use opentelemetry::KeyValue;
+
+use crate::metrics::{self, METRICS};
 
 /// Identifies a chunk of an object.
 ///
@@ -229,8 +232,14 @@ impl ObjectCache {
             WritePolicy::OnEviction => HybridCachePolicy::WriteOnEviction,
             WritePolicy::OnInsertion => HybridCachePolicy::WriteOnInsertion,
         };
+        // r[impl telemetry.metrics.foyer]
         let mut builder = HybridCacheBuilder::new()
             .with_name("hylla")
+            .with_metrics_registry(Box::new(
+                mixtrics::registry::opentelemetry_0_33::OpenTelemetryMetricsRegistry::new(
+                    metrics::meter(),
+                ),
+            ))
             .with_policy(policy)
             .memory(memory)
             .with_weighter(|key: &CacheKey, value: &Bytes| key.estimated_size() + value.len())
@@ -276,13 +285,25 @@ impl ObjectCache {
         store: Arc<dyn ObjectStore>,
         path: &ObjectPath,
     ) -> Result<ObjectMeta, ReadError> {
+        // r[impl telemetry.metrics.cache]
+        let record = |result: &'static str| {
+            METRICS.metadata.add(
+                1,
+                &[
+                    KeyValue::new("hylla.backend", backend.to_string()),
+                    KeyValue::new("hylla.result", result),
+                ],
+            );
+        };
         let cached = self.cached_metadata(backend, path).await;
         if let Some(cached) = &cached {
             if cached.age() < self.metadata_ttl {
+                record("fresh");
                 return Ok(cached.meta.clone());
             }
             // r[impl cache.stale-while-revalidate]
             if cached.age() < self.metadata_ttl + self.stale_while_revalidate {
+                record("stale_while_revalidate");
                 self.revalidate_in_background(backend, store, path);
                 return Ok(cached.meta.clone());
             }
@@ -296,11 +317,22 @@ impl ObjectCache {
                         age = ?cached.age(),
                         "serving stale metadata, the backend failed: {error:#}"
                     );
+                    record("stale_if_error");
                     Ok(cached.meta)
                 }
-                _ => Err(ReadError::Backend(error)),
+                _ => {
+                    record("error");
+                    Err(ReadError::Backend(error))
+                }
             },
-            result => result,
+            Err(ReadError::NotFound) => {
+                record("not_found");
+                Err(ReadError::NotFound)
+            }
+            result => {
+                record("fetched");
+                result
+            }
         }
     }
 
@@ -444,7 +476,10 @@ impl ObjectCache {
             head: true,
             ..Default::default()
         };
-        match store.get_opts(path, options).await {
+        let started = std::time::Instant::now();
+        let result = store.get_opts(path, options).await;
+        metrics::backend_request(backend, "head", started, metrics::outcome(&result));
+        match result {
             Ok(result) => {
                 let meta = ObjectMeta {
                     size: result.meta.size,
@@ -568,11 +603,15 @@ impl ObjectCache {
         let fetched = Arc::new(AtomicBool::new(false));
         let (fetch_changed, fetch_fetched) = (changed.clone(), fetched.clone());
         let fetch_path = path.clone();
+        let fetch_backend = backend.to_string();
         let entry = self
             .entries
             .get_or_fetch(&key, move || async move {
                 fetch_fetched.store(true, Ordering::Relaxed);
-                let result = match store.get_opts(&fetch_path, options).await {
+                let started = std::time::Instant::now();
+                let result = store.get_opts(&fetch_path, options).await;
+                metrics::backend_request(&fetch_backend, "get", started, metrics::outcome(&result));
+                let result = match result {
                     Ok(result) => result,
                     Err(error) => {
                         let gone = matches!(
@@ -584,12 +623,31 @@ impl ObjectCache {
                         return Err(error);
                     }
                 };
-                Ok::<_, object_store::Error>(result.bytes().await?)
+                let bytes = result.bytes().await?;
+                METRICS.backend_bytes.add(
+                    bytes.len() as u64,
+                    &[KeyValue::new("hylla.backend", fetch_backend.clone())],
+                );
+                Ok::<_, object_store::Error>(bytes)
             })
             .await;
+        let record = |result: &'static str| {
+            METRICS.chunks.add(
+                1,
+                &[
+                    KeyValue::new("hylla.backend", backend.to_string()),
+                    KeyValue::new("hylla.result", result),
+                ],
+            );
+        };
         match entry {
-            Ok(entry) => Ok((entry.value().clone(), fetched.load(Ordering::Relaxed))),
+            Ok(entry) => {
+                let fetched = fetched.load(Ordering::Relaxed);
+                record(if fetched { "miss" } else { "hit" });
+                Ok((entry.value().clone(), fetched))
+            }
             Err(error) => {
+                record("error");
                 // r[impl cache.changed]
                 // Only an object that changed or went away invalidates its metadata; other
                 // failures, such as an outage, keep it so cached chunks stay servable.
