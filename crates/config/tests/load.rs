@@ -308,6 +308,7 @@ fn unknown_group_errors_suggest_braces() {
 // r[verify config.cache.chunks]
 // r[verify config.cache.metadata-ttl]
 // r[verify config.cache.stale-if-error]
+// r[verify config.cache.stale-while-revalidate]
 // r[verify config.cache.write-policy]
 // r[verify config.cache.memory]
 // r[verify config.cache.disk]
@@ -318,6 +319,7 @@ fn cache_settings_default_when_left_out() {
     assert_eq!(cache, hylla_config::Cache::default());
     assert_eq!(cache.chunk_size(), 1024 * 1024);
     assert_eq!(cache.metadata_ttl, Interval::from_secs(30));
+    assert_eq!(cache.stale_while_revalidate, Interval::from_secs(0));
     assert_eq!(cache.stale_if_error, Interval::from_secs(24 * 60 * 60));
     assert_eq!(cache.write_policy, WritePolicy::OnEviction);
     assert_eq!(cache.memory.capacity_mib, 256);
@@ -326,6 +328,7 @@ fn cache_settings_default_when_left_out() {
     let config = format!(
         "{CONFIG}cache:
   metadata_ttl: 5m
+  stale_while_revalidate: 1m
   stale_if_error: 0s
   write_policy: on_insertion
   memory:
@@ -343,6 +346,7 @@ fn cache_settings_default_when_left_out() {
         .cache;
     assert_eq!(cache.chunk_size_kib, 512);
     assert_eq!(cache.metadata_ttl, Interval::from_secs(5 * 60));
+    assert_eq!(cache.stale_while_revalidate, Interval::from_secs(60));
     assert_eq!(cache.stale_if_error, Interval::from_secs(0));
     assert_eq!(cache.write_policy, WritePolicy::OnInsertion);
     assert_eq!(cache.memory.capacity_mib, 64);

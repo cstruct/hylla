@@ -132,6 +132,10 @@ r[config.cache.chunks]
 r[config.cache.metadata-ttl]
 `metadata_ttl` MUST set how long object metadata is cached, defaulting to `30s`.
 
+r[config.cache.stale-while-revalidate]
+`stale_while_revalidate` MUST set how long past its TTL cached metadata is still served
+while it is revalidated in the background, defaulting to `0s`, which disables it.
+
 r[config.cache.stale-if-error]
 `stale_if_error` MUST set how long past its TTL cached metadata may still be used when the
 backend fails, defaulting to `1d`. `0s` MUST disable it.

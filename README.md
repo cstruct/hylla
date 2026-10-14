@@ -41,6 +41,8 @@ backends:
 cache:                        # optional, every setting has a default
   chunk_size_kib: 1024        # objects are cached in chunks of this size
   metadata_ttl: 30s           # how long size, ETag and content type are cached
+  stale_while_revalidate: 0s  # past the TTL, keep serving this long while revalidating in
+                              # the background, so requests don't wait; 0s disables
   stale_if_error: 1d          # keep serving cached objects this long past their TTL
                               # while the backend fails; 0s disables
   write_policy: on_eviction   # or on_insertion: when chunks are written to disk

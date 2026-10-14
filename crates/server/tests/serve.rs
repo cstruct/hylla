@@ -318,6 +318,7 @@ async fn serves_through_a_disk_tier() {
     let cache = Cache {
         chunk_size_kib: 1,
         metadata_ttl: Interval::from_secs(60),
+        stale_while_revalidate: Interval::from_secs(0),
         stale_if_error: Interval::from_secs(0),
         write_policy: WritePolicy::OnInsertion,
         memory: MemoryCache { capacity_mib: 1 },
@@ -460,6 +461,7 @@ fn disk_cache(
     Cache {
         chunk_size_kib: 1,
         metadata_ttl: Interval::from_secs(metadata_ttl_seconds),
+        stale_while_revalidate: Interval::from_secs(0),
         stale_if_error: Interval::from_secs(stale_if_error_seconds),
         write_policy: WritePolicy::OnEviction,
         memory: MemoryCache { capacity_mib: 1 },

@@ -82,6 +82,12 @@ config_tree! {
             /// How long object metadata (size, ETag, content type) is cached, such as `30s`.
             #[facet(default = Interval::from_secs(30))]
             pub metadata_ttl: Interval,
+            // r[impl config.cache.stale-while-revalidate]
+            /// How long past its TTL cached metadata is still served while it is revalidated in
+            /// the background, such as `5m`, so requests don't wait on the backend. `0s`
+            /// disables it, revalidating before serving.
+            #[facet(default = Interval::from_secs(0))]
+            pub stale_while_revalidate: Interval,
             // r[impl config.cache.stale-if-error]
             /// How long past its TTL cached metadata may still be used when the backend fails,
             /// such as `1d`, so cached objects stay available during backend outages. `0s`
@@ -126,6 +132,7 @@ impl Default for Cache {
         Self {
             chunk_size_kib: 1024,
             metadata_ttl: Interval::from_secs(30),
+            stale_while_revalidate: Interval::from_secs(0),
             stale_if_error: Interval::from_secs(24 * 60 * 60),
             write_policy: WritePolicy::default(),
             memory: MemoryCache::default(),
