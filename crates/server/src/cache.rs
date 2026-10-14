@@ -173,6 +173,28 @@ pub struct ObjectCache {
     stale_if_error: Duration,
     /// The background revalidations of objects, by backend and key.
     revalidations: Mutex<HashMap<(String, String), Revalidation>>,
+    /// Where metadata fetched from backends, and preloaded objects, are reported, when
+    /// they're shared with a cluster.
+    events: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<CacheEvent>>,
+}
+
+/// Something worth telling other nodes about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheEvent {
+    /// Metadata was fetched from the backend.
+    Fetched(SharedMeta),
+    /// An object was preloaded into the cache.
+    Preloaded(SharedMeta),
+}
+
+/// An object's metadata, as shared between nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedMeta {
+    pub backend: String,
+    pub key: String,
+    pub meta: ObjectMeta,
+    /// When it was fetched from the backend.
+    pub fetched: SystemTime,
 }
 
 /// The state of an object's background revalidation.
@@ -230,6 +252,7 @@ impl ObjectCache {
             stale_while_revalidate: config.stale_while_revalidate.duration(),
             stale_if_error: config.stale_if_error.duration(),
             revalidations: Mutex::default(),
+            events: std::sync::OnceLock::new(),
         })
     }
 
@@ -347,6 +370,68 @@ impl ObjectCache {
             .insert(Self::meta_key(backend, path), stored.to_bytes());
     }
 
+    /// Reports events to `sender`, for sharing them with a cluster.
+    pub(crate) fn report_to(&self, sender: tokio::sync::mpsc::UnboundedSender<CacheEvent>) {
+        let _ = self.events.set(sender);
+    }
+
+    fn report(&self, event: impl FnOnce() -> CacheEvent) {
+        if let Some(events) = self.events.get() {
+            let _ = events.send(event());
+        }
+    }
+
+    // r[impl cluster.apply-metadata]
+    /// Caches metadata another node fetched, unless the cached metadata is at least as new.
+    /// It keeps its original fetch time, so it expires as if fetched here.
+    pub(crate) async fn apply_metadata(&self, shared: SharedMeta) {
+        let path = ObjectPath::from(shared.key.as_str());
+        if let Some(cached) = self.cached_metadata(&shared.backend, &path).await
+            && cached.fetched >= shared.fetched
+        {
+            return;
+        }
+        let stored = StoredMeta {
+            meta: shared.meta,
+            fetched: shared.fetched,
+        };
+        self.entries
+            .insert(Self::meta_key(&shared.backend, &path), stored.to_bytes());
+    }
+
+    /// Reports that an object was preloaded.
+    pub(crate) fn report_preloaded(&self, backend: &str, path: &ObjectPath, meta: &ObjectMeta) {
+        self.report(|| {
+            CacheEvent::Preloaded(SharedMeta {
+                backend: backend.to_string(),
+                key: path.to_string(),
+                meta: meta.clone(),
+                fetched: SystemTime::now(),
+            })
+        });
+    }
+
+    /// A chunk, if it is cached; never fetched from the backend.
+    pub(crate) async fn cached_chunk(&self, key: &ChunkKey) -> Option<Bytes> {
+        match self.entries.get(&CacheKey::Chunk(key.clone())).await {
+            Ok(entry) => entry.map(|entry| entry.value().clone()),
+            Err(error) => {
+                tracing::warn!(key = key.key, "reading a cached chunk: {error}");
+                None
+            }
+        }
+    }
+
+    /// Caches a chunk another node had.
+    pub(crate) fn insert_chunk(&self, key: ChunkKey, bytes: Bytes) {
+        self.entries.insert(CacheKey::Chunk(key), bytes);
+    }
+
+    /// The number of chunks an object of `size` bytes has.
+    pub(crate) fn chunk_count(&self, size: u64) -> u64 {
+        size.div_ceil(self.chunk_size)
+    }
+
     /// Fetches the metadata of an object from the backend and caches it, forgetting the
     /// object if it is missing.
     pub(crate) async fn fetch_metadata(
@@ -371,6 +456,14 @@ impl ObjectCache {
                         .map(|value| value.to_string()),
                 };
                 self.store_metadata(backend, path, meta.clone());
+                self.report(|| {
+                    CacheEvent::Fetched(SharedMeta {
+                        backend: backend.to_string(),
+                        key: path.to_string(),
+                        meta: meta.clone(),
+                        fetched: SystemTime::now(),
+                    })
+                });
                 Ok(meta)
             }
             Err(object_store::Error::NotFound { .. }) => {

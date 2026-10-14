@@ -1077,6 +1077,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "bytes",
  "clap",
@@ -1088,7 +1089,10 @@ dependencies = [
  "jsonwebtoken",
  "object_store",
  "percent-encoding",
+ "reqwest",
+ "serde",
  "serde_json",
+ "serde_urlencoded",
  "tokio",
  "tower",
  "tracing",

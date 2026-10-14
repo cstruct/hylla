@@ -9,6 +9,7 @@ mod app;
 mod auth;
 pub mod backend;
 mod cache;
+mod cluster;
 mod range;
 mod refresh;
 
@@ -43,10 +44,11 @@ pub async fn serve(
                 .await
         }));
     }
-    let refreshers = app.spawn_refresh();
+    let mut background = app.start_cluster().await?;
+    background.extend(app.spawn_refresh());
     shutdown.await;
-    for refresher in &refreshers {
-        refresher.abort();
+    for task in &background {
+        task.abort();
     }
     let _ = stop.send(());
     for task in tasks {

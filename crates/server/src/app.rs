@@ -20,15 +20,21 @@ use crate::auth::{self, CompiledAuth, Verifiers};
 use crate::{
     RefreshReport,
     backend::Stores,
+    cache::CacheEvent,
     cache::{ObjectCache, ObjectMeta, ReadError},
+    cluster::{self, Cluster},
     range::{self, RequestedRange},
     refresh,
 };
 
 /// The shared state of all listeners.
 pub struct App {
-    cache: Arc<ObjectCache>,
-    stores: Stores,
+    pub(crate) cache: Arc<ObjectCache>,
+    pub(crate) stores: Stores,
+    /// The cluster this node shares with, if any.
+    pub(crate) cluster: Option<Arc<Cluster>>,
+    /// The cache's events, until the cluster starts sharing them.
+    cluster_events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<CacheEvent>>>,
     /// The refresh settings of the backends that have any, by backend name.
     refresh: BTreeMap<String, Refresh>,
     /// The servers of each listen address.
@@ -85,9 +91,20 @@ impl App {
             .iter()
             .filter_map(|(name, backend)| Some((name.clone(), backend.refresh()?.clone())))
             .collect();
+        let cache = Arc::new(ObjectCache::new(&config.cache).await?);
+        let (cluster, cluster_events) = match &config.cluster {
+            Some(cluster) => {
+                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                cache.report_to(sender);
+                (Some(Arc::new(Cluster::new(cluster)?)), Some(receiver))
+            }
+            None => (None, None),
+        };
         Ok(Arc::new(Self {
-            cache: Arc::new(ObjectCache::new(&config.cache).await?),
+            cache,
             stores,
+            cluster,
+            cluster_events: std::sync::Mutex::new(cluster_events),
             refresh,
             listeners,
         }))
@@ -123,6 +140,41 @@ impl App {
         refresh::run(&self.cache, backend, store.clone(), refresh, rule).await
     }
 
+    /// Starts sharing with the cluster, if one is configured: its listener, gossip and the
+    /// sharing of cache events.
+    pub async fn start_cluster(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+        let Some(cluster) = &self.cluster else {
+            return Ok(Vec::new());
+        };
+        let events = self
+            .cluster_events
+            .lock()
+            .expect("not poisoned")
+            .take()
+            .context("the cluster was already started")?;
+        cluster::start(self, cluster, events).await
+    }
+
+    /// The addresses of the live nodes of the cluster, this one included, or none without a
+    /// cluster.
+    pub fn cluster_members(&self) -> Vec<SocketAddr> {
+        self.cluster
+            .as_ref()
+            .map(|cluster| cluster.members())
+            .unwrap_or_default()
+    }
+
+    // r[impl cluster.refresh]
+    /// Whether this node runs refresh rule `rule` of `backend`: always without a cluster,
+    /// and when it owns the rule in one.
+    pub fn owns_refresh_rule(&self, backend: &str, rule: usize) -> bool {
+        self.cluster
+            .as_ref()
+            .is_none_or(|cluster| cluster.owns(&format!("refresh\n{backend}\n{rule}")))
+    }
+
     // r[impl refresh.schedule]
     /// Runs every enabled refresh rule now and then on its interval, until the returned
     /// tasks are aborted.
@@ -136,11 +188,22 @@ impl App {
                 let app = self.clone();
                 let backend = backend.clone();
                 let every = rule.every.duration();
+                // In a cluster, let membership settle first, so nodes don't all run every
+                // rule at startup.
+                let settle = self
+                    .cluster
+                    .as_ref()
+                    .map(|cluster| cluster.settle_time())
+                    .unwrap_or_default();
                 tasks.push(tokio::spawn(async move {
+                    tokio::time::sleep(settle).await;
                     let mut interval = tokio::time::interval(every);
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         interval.tick().await;
+                        if !app.owns_refresh_rule(&backend, index) {
+                            continue;
+                        }
                         match app.refresh(&backend, index).await {
                             Ok(report) => {
                                 tracing::info!(backend, rule = index, ?report, "refreshed")

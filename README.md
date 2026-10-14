@@ -109,6 +109,12 @@ backend, and preload objects before anyone asks for them. The cache is a
 [foyer](https://github.com/foyer-rs/foyer) hybrid cache: objects are stored in chunks keyed
 by their ETag, in memory and, when configured, on disk, where they survive restarts.
 
+With a `cluster`, nodes find each other by gossip through their seeds; a DNS name
+returning every node, such as a Kubernetes headless service, works as a seed. Each refresh
+rule runs on one node, metadata fetched from a backend is pushed to the other nodes, and the
+others pull what a node preloads directly from it, so the backend serves it once per cluster.
+Everything between nodes is signed with the shared key.
+
 The behaviour is specified in [docs/spec](docs/spec) and tracked with
 [tracey](https://github.com/bearcove/tracey).
 

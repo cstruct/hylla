@@ -29,7 +29,11 @@ pub struct RefreshReport {
 
 /// What to do with one object.
 enum Action {
-    Touch(ObjectMeta),
+    /// Marks unchanged metadata fresh, and with `announce`, announces the object to other
+    /// nodes again.
+    Touch(ObjectMeta, bool),
+    /// Announces an unchanged preloaded object to other nodes again.
+    Announce(ObjectMeta),
     Revalidate,
     Preload,
 }
@@ -91,7 +95,11 @@ pub async fn run(
     for (object, state) in states {
         let action = match state {
             // r[impl refresh.revalidate]
-            CachedState::Unchanged(meta) if revalidates => Action::Touch(meta),
+            CachedState::Unchanged(meta) if revalidates => Action::Touch(meta, preloads),
+            // r[impl cluster.reannounce]
+            // Announcing unchanged objects again lets nodes that joined later catch up; they
+            // only pull chunks they don't have.
+            CachedState::Unchanged(meta) if preloads => Action::Announce(meta),
             CachedState::Unchanged(_) => continue,
             CachedState::Changed if revalidates && !preloads => Action::Revalidate,
             // r[impl refresh.preload]
@@ -117,8 +125,15 @@ pub async fn run(
             let store = store.clone();
             async move {
                 match action {
-                    Action::Touch(meta) => {
+                    Action::Touch(meta, announce) => {
+                        if announce {
+                            cache.report_preloaded(backend, &path, &meta);
+                        }
                         cache.touch_metadata(backend, &path, meta);
+                        Outcome::Unchanged
+                    }
+                    Action::Announce(meta) => {
+                        cache.report_preloaded(backend, &path, &meta);
                         Outcome::Unchanged
                     }
                     Action::Revalidate => {
@@ -136,7 +151,10 @@ pub async fn run(
                             Err(ReadError::Backend(error)) => return Outcome::Failed(path, error),
                         };
                         match cache.preload(backend, store, &path, &meta).await {
-                            Ok(bytes) => Outcome::Preloaded(bytes),
+                            Ok(bytes) => {
+                                cache.report_preloaded(backend, &path, &meta);
+                                Outcome::Preloaded(bytes)
+                            }
                             Err(ReadError::NotFound) => Outcome::Removed,
                             Err(ReadError::Backend(error)) => Outcome::Failed(path, error),
                         }
