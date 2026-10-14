@@ -44,5 +44,20 @@ ETag and chunk index, so a changed object misses instead of serving stale data. 
 missing from the cache MUST be fetched with a range request matching the ETag.
 
 r[cache.metadata]
-Object metadata (size, ETag, last modified and content type) MUST be cached in memory for
-the configured TTL, after which it MUST be fetched again.
+Object metadata (size, ETag, last modified and content type) MUST be cached with the
+chunks, in memory and on disk when there is a disk tier, so it survives restarts. Metadata
+older than the configured TTL MUST be fetched again.
+
+r[cache.stale-if-error]
+When metadata past its TTL can't be fetched again because the backend fails, the cached
+metadata MUST still be used if it is younger than the TTL plus the configured
+stale-if-error window, so cached objects stay available during backend outages, also
+after a restart.
+
+r[cache.not-found]
+When the backend reports an object missing, its cached metadata MUST be dropped and the
+request answered with 404, never with stale data.
+
+r[cache.changed]
+Cached metadata MUST only be dropped by a failed chunk fetch when the object changed (its
+ETag no longer matches) or went away, not on other failures such as outages.

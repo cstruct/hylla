@@ -287,6 +287,7 @@ async fn cached_objects_are_served_without_the_backend() {
 
 // r[verify cache.metadata]
 // r[verify cache.chunks]
+// r[verify cache.not-found]
 #[tokio::test]
 async fn changed_objects_are_refetched_once_metadata_expires() {
     let (app, store) = app(small_cache(0)).await;
@@ -330,4 +331,220 @@ async fn serves_through_a_disk_tier() {
         "the disk tier holds files"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store that fails every request while `failing` is set, as during an outage.
+#[derive(Debug)]
+struct Flaky {
+    inner: Arc<InMemory>,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl Flaky {
+    fn new(inner: Arc<InMemory>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            failing: false.into(),
+        })
+    }
+
+    fn fail(&self, failing: bool) {
+        self.failing
+            .store(failing, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn check(&self) -> object_store::Result<()> {
+        if self.failing.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(object_store::Error::Generic {
+                store: "flaky",
+                source: "the backend is down".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Flaky {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Flaky({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Flaky {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.check()?;
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+async fn flaky_app(cache: Cache, store: Arc<Flaky>) -> Arc<App> {
+    let stores = HashMap::from([("assets".to_string(), store as Arc<dyn ObjectStore>)]);
+    App::new(&config(cache), stores).await.unwrap()
+}
+
+fn disk_cache(
+    dir: &std::path::Path,
+    metadata_ttl_seconds: u64,
+    stale_if_error_seconds: u64,
+) -> Cache {
+    Cache {
+        chunk_size_kib: 1,
+        metadata_ttl_seconds,
+        stale_if_error_seconds,
+        write_policy: WritePolicy::OnEviction,
+        memory: MemoryCache { capacity_mib: 1 },
+        disk: Some(DiskCache {
+            path: dir.to_path_buf(),
+            capacity_mib: 16,
+            block_size_mib: 1,
+        }),
+    }
+}
+
+// r[verify cache.stale-if-error]
+// r[verify cache.disk]
+// r[verify config.cache.stale-if-error]
+#[tokio::test]
+async fn serves_cached_objects_after_a_restart_while_the_backend_is_down() {
+    let dir = std::env::temp_dir().join(format!("hylla-server-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let memory = Arc::new(InMemory::new());
+    put(&memory, "app.css", content()).await;
+    let store = Flaky::new(memory);
+
+    // Fill the cache, and flush it to disk on close.
+    let app = flaky_app(disk_cache(&dir, 0, 3600), store.clone()).await;
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    app.close().await.unwrap();
+    drop(app);
+
+    // Restart with the backend down: metadata and chunks come from disk. The metadata is
+    // past its TTL of 0, but within the stale-if-error window.
+    store.fail(true);
+    let app = flaky_app(disk_cache(&dir, 0, 3600), store.clone()).await;
+    let response = get(&app, "/assets/app.css").await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body, content());
+    let response = request(
+        &app,
+        "GET",
+        "cache.example.com",
+        "/assets/app.css",
+        &[("range", "bytes=1000-1099")],
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.body, content()[1000..1100]);
+    app.close().await.unwrap();
+    drop(app);
+
+    // Without a stale-if-error window, an expired object isn't served while the backend fails.
+    let app = flaky_app(disk_cache(&dir, 0, 0), store.clone()).await;
+    assert_eq!(
+        get(&app, "/assets/app.css").await.status,
+        StatusCode::BAD_GATEWAY
+    );
+    app.close().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// r[verify cache.changed]
+// r[verify cache.stale-if-error]
+#[tokio::test]
+async fn outages_keep_cached_chunks_servable() {
+    let memory = Arc::new(InMemory::new());
+    put(&memory, "app.css", content()).await;
+    let store = Flaky::new(memory);
+    let cache = Cache {
+        metadata_ttl_seconds: 0,
+        stale_if_error_seconds: 3600,
+        ..small_cache(0)
+    };
+    let app = flaky_app(cache, store.clone()).await;
+    let range = |range: &'static str| {
+        let app = app.clone();
+        async move {
+            request(
+                &app,
+                "GET",
+                "cache.example.com",
+                "/assets/app.css",
+                &[("range", range)],
+            )
+            .await
+        }
+    };
+
+    // Cache the first chunk only, then take the backend down.
+    assert_eq!(range("bytes=0-99").await.body, content()[..100]);
+    store.fail(true);
+    assert_eq!(
+        range("bytes=0-99").await.status,
+        StatusCode::PARTIAL_CONTENT
+    );
+    // A chunk that isn't cached can't be served...
+    assert_eq!(
+        range("bytes=2000-2099").await.status,
+        StatusCode::BAD_GATEWAY
+    );
+    // ...but failing to fetch it doesn't make the cached ones unservable.
+    let response = range("bytes=0-99").await;
+    assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.body, content()[..100]);
+
+    // Once the backend is back, everything is served again.
+    store.fail(false);
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
 }

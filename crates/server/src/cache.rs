@@ -1,6 +1,9 @@
 use std::{
-    sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -23,28 +26,63 @@ pub struct ChunkKey {
     pub index: u64,
 }
 
-impl Code for ChunkKey {
+/// A key of the cache: an object's chunk or its metadata.
+///
+/// Metadata is cached with the chunks so it is persisted with them on disk, which lets
+/// cached objects be served after a restart without asking the backend.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CacheKey {
+    Chunk(ChunkKey),
+    Meta { backend: String, key: String },
+}
+
+impl Code for CacheKey {
     fn encode(&self, writer: &mut impl std::io::Write) -> foyer::Result<()> {
-        self.backend.encode(writer)?;
-        self.key.encode(writer)?;
-        self.etag.encode(writer)?;
-        self.index.encode(writer)
+        match self {
+            CacheKey::Chunk(chunk) => {
+                0u8.encode(writer)?;
+                chunk.backend.encode(writer)?;
+                chunk.key.encode(writer)?;
+                chunk.etag.encode(writer)?;
+                chunk.index.encode(writer)
+            }
+            CacheKey::Meta { backend, key } => {
+                1u8.encode(writer)?;
+                backend.encode(writer)?;
+                key.encode(writer)
+            }
+        }
     }
 
     fn decode(reader: &mut impl std::io::Read) -> foyer::Result<Self> {
-        Ok(Self {
-            backend: String::decode(reader)?,
-            key: String::decode(reader)?,
-            etag: String::decode(reader)?,
-            index: u64::decode(reader)?,
-        })
+        match u8::decode(reader)? {
+            0 => Ok(CacheKey::Chunk(ChunkKey {
+                backend: String::decode(reader)?,
+                key: String::decode(reader)?,
+                etag: String::decode(reader)?,
+                index: u64::decode(reader)?,
+            })),
+            1 => Ok(CacheKey::Meta {
+                backend: String::decode(reader)?,
+                key: String::decode(reader)?,
+            }),
+            tag => Err(foyer::Error::io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown cache key tag {tag}"),
+            ))),
+        }
     }
 
     fn estimated_size(&self) -> usize {
-        self.backend.estimated_size()
-            + self.key.estimated_size()
-            + self.etag.estimated_size()
-            + self.index.estimated_size()
+        1 + match self {
+            CacheKey::Chunk(chunk) => {
+                chunk.backend.estimated_size()
+                    + chunk.key.estimated_size()
+                    + chunk.etag.estimated_size()
+                    + chunk.index.estimated_size()
+            }
+            CacheKey::Meta { backend, key } => backend.estimated_size() + key.estimated_size(),
+        }
     }
 }
 
@@ -57,12 +95,80 @@ pub struct ObjectMeta {
     pub content_type: Option<String>,
 }
 
-/// The chunk cache, in memory and optionally on disk, and the object metadata cache.
+/// Metadata as cached, with when it was fetched. Wall clock time, since it must survive
+/// restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredMeta {
+    meta: ObjectMeta,
+    fetched: SystemTime,
+}
+
+impl StoredMeta {
+    fn to_bytes(&self) -> Bytes {
+        let mut bytes = Vec::new();
+        let write = |bytes: &mut Vec<u8>| -> foyer::Result<()> {
+            self.meta.size.encode(bytes)?;
+            encode_option(&self.meta.etag, bytes)?;
+            nanos(self.meta.last_modified).encode(bytes)?;
+            encode_option(&self.meta.content_type, bytes)?;
+            nanos(self.fetched).encode(bytes)
+        };
+        write(&mut bytes).expect("writing to a Vec doesn't fail");
+        bytes.into()
+    }
+
+    fn from_bytes(mut bytes: &[u8]) -> foyer::Result<Self> {
+        let reader = &mut bytes;
+        Ok(Self {
+            meta: ObjectMeta {
+                size: u64::decode(reader)?,
+                etag: decode_option(reader)?,
+                last_modified: from_nanos(u128::decode(reader)?),
+                content_type: decode_option(reader)?,
+            },
+            fetched: from_nanos(u128::decode(reader)?),
+        })
+    }
+
+    fn age(&self) -> Duration {
+        SystemTime::now()
+            .duration_since(self.fetched)
+            .unwrap_or_default()
+    }
+}
+
+fn encode_option(value: &Option<String>, writer: &mut impl std::io::Write) -> foyer::Result<()> {
+    value.is_some().encode(writer)?;
+    match value {
+        Some(value) => value.encode(writer),
+        None => Ok(()),
+    }
+}
+
+fn decode_option(reader: &mut impl std::io::Read) -> foyer::Result<Option<String>> {
+    Ok(match bool::decode(reader)? {
+        true => Some(String::decode(reader)?),
+        false => None,
+    })
+}
+
+fn nanos(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn from_nanos(nanos: u128) -> SystemTime {
+    let secs = (nanos / 1_000_000_000) as u64;
+    UNIX_EPOCH + Duration::new(secs, (nanos % 1_000_000_000) as u32)
+}
+
+/// The cache of object chunks and metadata, in memory and optionally on disk.
 pub struct ObjectCache {
-    chunks: HybridCache<ChunkKey, Bytes>,
-    metadata: foyer::Cache<(String, String), Arc<(ObjectMeta, Instant)>>,
+    entries: HybridCache<CacheKey, Bytes>,
     chunk_size: u64,
     metadata_ttl: Duration,
+    stale_if_error: Duration,
 }
 
 /// Failure to read an object.
@@ -85,7 +191,7 @@ impl ObjectCache {
             .with_name("hylla")
             .with_policy(policy)
             .memory(memory)
-            .with_weighter(|key: &ChunkKey, value: &Bytes| key.estimated_size() + value.len())
+            .with_weighter(|key: &CacheKey, value: &Bytes| key.estimated_size() + value.len())
             .storage();
         if let Some(disk) = &config.disk {
             std::fs::create_dir_all(&disk.path)
@@ -98,10 +204,10 @@ impl ObjectCache {
                 .with_engine_config(BlockEngineConfig::new(device).with_block_size(block_size));
         }
         Ok(Self {
-            chunks: builder.build().await?,
-            metadata: foyer::CacheBuilder::new(64 * 1024).build(),
+            entries: builder.build().await?,
             chunk_size: config.chunk_size(),
             metadata_ttl: config.metadata_ttl(),
+            stale_if_error: config.stale_if_error(),
         })
     }
 
@@ -110,43 +216,76 @@ impl ObjectCache {
     }
 
     // r[impl cache.metadata]
-    /// The metadata of an object, cached for the configured TTL.
+    // r[impl cache.stale-if-error]
+    // r[impl cache.not-found]
+    /// The metadata of an object.
+    ///
+    /// Cached metadata younger than the TTL is used as is. Older metadata is refreshed from
+    /// the backend; if the backend fails, metadata within the stale-if-error window is used
+    /// anyway, so cached objects stay available during outages. A missing object is
+    /// forgotten.
     pub async fn metadata(
         &self,
         backend: &str,
         store: &dyn ObjectStore,
         path: &ObjectPath,
     ) -> Result<ObjectMeta, ReadError> {
-        let key = (backend.to_string(), path.to_string());
-        if let Some(entry) = self.metadata.get(&key) {
-            let (meta, fetched) = entry.value().as_ref();
-            if fetched.elapsed() < self.metadata_ttl {
-                return Ok(meta.clone());
+        let key = CacheKey::Meta {
+            backend: backend.to_string(),
+            key: path.to_string(),
+        };
+        let cached = match self.entries.get(&key).await {
+            Ok(entry) => entry.and_then(|entry| StoredMeta::from_bytes(entry.value()).ok()),
+            Err(error) => {
+                tracing::warn!(%path, "reading cached metadata: {error}");
+                None
             }
+        };
+        if let Some(cached) = &cached
+            && cached.age() < self.metadata_ttl
+        {
+            return Ok(cached.meta.clone());
         }
+
         let options = GetOptions {
             head: true,
             ..Default::default()
         };
-        let result = store.get_opts(path, options).await.map_err(read_error)?;
-        let meta = ObjectMeta {
-            size: result.meta.size,
-            etag: result.meta.e_tag.clone(),
-            last_modified: SystemTime::from(result.meta.last_modified),
-            content_type: result
-                .attributes
-                .get(&Attribute::ContentType)
-                .map(|value| value.to_string()),
-        };
-        self.metadata
-            .insert(key, Arc::new((meta.clone(), Instant::now())));
-        Ok(meta)
-    }
-
-    /// Forgets the metadata of an object, such as after it changed under us.
-    pub fn forget(&self, backend: &str, path: &ObjectPath) {
-        self.metadata
-            .remove(&(backend.to_string(), path.to_string()));
+        match store.get_opts(path, options).await {
+            Ok(result) => {
+                let meta = ObjectMeta {
+                    size: result.meta.size,
+                    etag: result.meta.e_tag.clone(),
+                    last_modified: SystemTime::from(result.meta.last_modified),
+                    content_type: result
+                        .attributes
+                        .get(&Attribute::ContentType)
+                        .map(|value| value.to_string()),
+                };
+                let stored = StoredMeta {
+                    meta: meta.clone(),
+                    fetched: SystemTime::now(),
+                };
+                self.entries.insert(key, stored.to_bytes());
+                Ok(meta)
+            }
+            Err(object_store::Error::NotFound { .. }) => {
+                self.entries.remove(&key);
+                Err(ReadError::NotFound)
+            }
+            Err(error) => match cached {
+                Some(cached) if cached.age() < self.metadata_ttl + self.stale_if_error => {
+                    tracing::warn!(
+                        backend,
+                        %path,
+                        age = ?cached.age(),
+                        "serving stale metadata, the backend failed: {error}"
+                    );
+                    Ok(cached.meta)
+                }
+                _ => Err(ReadError::Backend(error.into())),
+            },
+        }
     }
 
     // r[impl cache.chunks]
@@ -161,66 +300,106 @@ impl ObjectCache {
     ) -> Result<Bytes, ReadError> {
         let start = index * self.chunk_size;
         let end = (start + self.chunk_size).min(meta.size);
-        let key = ChunkKey {
+        let key = CacheKey::Chunk(ChunkKey {
             backend: backend.to_string(),
             key: path.to_string(),
             etag: meta.etag.clone().unwrap_or_default(),
             index,
-        };
+        });
         let options = GetOptions {
             range: Some(GetRange::Bounded(start..end)),
             // Only read the version the metadata describes.
             if_match: meta.etag.clone(),
             ..Default::default()
         };
+        let changed = Arc::new(AtomicBool::new(false));
+        let fetch_changed = changed.clone();
         let fetch_path = path.clone();
         let entry = self
-            .chunks
+            .entries
             .get_or_fetch(&key, move || async move {
-                let result = store.get_opts(&fetch_path, options).await?;
+                let result = match store.get_opts(&fetch_path, options).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let gone = matches!(
+                            error,
+                            object_store::Error::Precondition { .. }
+                                | object_store::Error::NotFound { .. }
+                        );
+                        fetch_changed.store(gone, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                };
                 Ok::<_, object_store::Error>(result.bytes().await?)
             })
             .await;
         match entry {
             Ok(entry) => Ok(entry.value().clone()),
             Err(error) => {
-                // The object may have changed or gone; refetch its metadata next time.
-                self.forget(backend, path);
+                // r[impl cache.changed]
+                // Only an object that changed or went away invalidates its metadata; other
+                // failures, such as an outage, keep it so cached chunks stay servable.
+                if changed.load(Ordering::Relaxed) {
+                    self.entries.remove(&CacheKey::Meta {
+                        backend: backend.to_string(),
+                        key: path.to_string(),
+                    });
+                }
                 Err(ReadError::Backend(anyhow::Error::new(error)))
             }
         }
     }
 
-    /// Flushes the disk tier.
+    /// Flushes the memory tier to disk.
     pub async fn close(&self) -> anyhow::Result<()> {
-        Ok(self.chunks.close().await?)
-    }
-}
-
-fn read_error(error: object_store::Error) -> ReadError {
-    match error {
-        object_store::Error::NotFound { .. } => ReadError::NotFound,
-        error => ReadError::Backend(error.into()),
+        Ok(self.entries.close().await?)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
     use foyer::Code;
 
-    use super::ChunkKey;
+    use super::{CacheKey, ChunkKey, ObjectMeta, StoredMeta};
 
     #[test]
-    fn chunk_keys_round_trip() {
-        let key = ChunkKey {
-            backend: "assets".into(),
-            key: "css/app.css".into(),
-            etag: "\"abc\"".into(),
-            index: 7,
-        };
-        let mut encoded = Vec::new();
-        key.encode(&mut encoded).unwrap();
-        assert_eq!(encoded.len(), key.estimated_size());
-        assert_eq!(ChunkKey::decode(&mut encoded.as_slice()).unwrap(), key);
+    fn cache_keys_round_trip() {
+        let keys = [
+            CacheKey::Chunk(ChunkKey {
+                backend: "assets".into(),
+                key: "css/app.css".into(),
+                etag: "\"abc\"".into(),
+                index: 7,
+            }),
+            CacheKey::Meta {
+                backend: "assets".into(),
+                key: "css/app.css".into(),
+            },
+        ];
+        for key in keys {
+            let mut encoded = Vec::new();
+            key.encode(&mut encoded).unwrap();
+            assert_eq!(encoded.len(), key.estimated_size());
+            assert_eq!(CacheKey::decode(&mut encoded.as_slice()).unwrap(), key);
+        }
+    }
+
+    #[test]
+    fn metadata_round_trips() {
+        let at = |secs, nanos| UNIX_EPOCH + Duration::new(secs, nanos);
+        for (etag, content_type) in [(Some("\"abc\""), Some("text/css")), (None, None)] {
+            let stored = StoredMeta {
+                meta: ObjectMeta {
+                    size: 3000,
+                    etag: etag.map(Into::into),
+                    last_modified: at(1_700_000_000, 123),
+                    content_type: content_type.map(Into::into),
+                },
+                fetched: at(1_800_000_000, 456),
+            };
+            assert_eq!(StoredMeta::from_bytes(&stored.to_bytes()).unwrap(), stored);
+        }
     }
 }
