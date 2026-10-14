@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use hylla_config::{
-    Backend, ConfigError, ConfigFiles, Mapping, Origin, Rewrite, Route, Router, ValidationError,
-    load_with_env,
+    Backend, ConfigError, ConfigFiles, DiskCache, Mapping, Origin, Rewrite, Route, Router,
+    ValidationError, WritePolicy, load_with_env,
 };
 use ordna_core::{ConfigLoadError, ConfigPath, ConfigValueSource};
 use source_env::EnvSource;
@@ -300,4 +300,72 @@ fn unknown_group_errors_suggest_braces() {
         "rewrite 1 of mapping 0 of server `a` refers to `$1a`, which its pattern has no \
          capture group for (did you mean `${1}a`?)"
     );
+}
+
+// r[verify config.cache]
+// r[verify config.cache.chunks]
+// r[verify config.cache.metadata-ttl]
+// r[verify config.cache.write-policy]
+// r[verify config.cache.memory]
+// r[verify config.cache.disk]
+#[test]
+fn cache_settings_default_when_left_out() {
+    let files = Files::new("cache-defaults", CONFIG, SECRETS);
+    let cache = files.load(&[]).unwrap().into_config().cache;
+    assert_eq!(cache, hylla_config::Cache::default());
+    assert_eq!(cache.chunk_size(), 1024 * 1024);
+    assert_eq!(cache.metadata_ttl().as_secs(), 30);
+    assert_eq!(cache.write_policy, WritePolicy::OnEviction);
+    assert_eq!(cache.memory.capacity_mib, 256);
+    assert_eq!(cache.disk, None);
+
+    let config = format!(
+        "{CONFIG}cache:
+  write_policy: on_insertion
+  memory:
+    capacity_mib: 64
+  disk:
+    path: /var/cache/hylla
+    capacity_mib: 1024
+"
+    );
+    let files = Files::new("cache-settings", &config, SECRETS);
+    let cache = files
+        .load(&[("HYLLA__CACHE__CHUNK_SIZE_KIB", "512")])
+        .unwrap()
+        .into_config()
+        .cache;
+    assert_eq!(cache.chunk_size_kib, 512);
+    assert_eq!(cache.metadata_ttl_seconds, 30);
+    assert_eq!(cache.write_policy, WritePolicy::OnInsertion);
+    assert_eq!(cache.memory.capacity_mib, 64);
+    assert_eq!(
+        cache.disk,
+        Some(DiskCache {
+            path: "/var/cache/hylla".into(),
+            capacity_mib: 1024,
+            block_size_mib: 16,
+        })
+    );
+}
+
+// r[verify config.validate.cache]
+#[test]
+fn cache_sizes_are_validated() {
+    let config = format!(
+        "{CONFIG}cache:
+  chunk_size_kib: 16384
+  disk:
+    path: /var/cache/hylla
+    capacity_mib: 32
+"
+    );
+    let files = Files::new("cache-invalid", &config, SECRETS);
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let reasons = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(reasons.len(), 2, "{reasons:#?}");
+    assert!(reasons[0].contains("must be smaller than `disk.block_size_mib`"));
+    assert!(reasons[1].contains("must hold at least 4 blocks"));
 }

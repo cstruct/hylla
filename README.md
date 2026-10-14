@@ -21,17 +21,23 @@ servers:
           - pattern: ^/assets/(.*)$
             replace: /$1      # /assets/app.css → /app.css on the backend
       - path_prefix: /
-        backend: archive
+        backend: assets
 backends:
   assets:
     type: s3                  # s3, swift or azure_blob
     bucket: assets
     region: eu-north-1
-  archive:
-    type: swift
-    auth_url: https://swift.example.com/v3
-    container: archive
-    username: hylla
+    endpoint: http://localhost:9000   # optional, for S3 compatible stores
+cache:                        # optional, every setting has a default
+  chunk_size_kib: 1024        # objects are cached in chunks of this size
+  metadata_ttl_seconds: 30    # how long size, ETag and content type are cached
+  write_policy: on_eviction   # or on_insertion: when chunks are written to disk
+  memory:
+    capacity_mib: 256
+  disk:                       # optional; without it only memory is used
+    path: /var/cache/hylla
+    capacity_mib: 10240
+    block_size_mib: 16        # foyer disk blocks; a chunk must fit in one
 ```
 
 ```yaml
@@ -40,8 +46,6 @@ backends:
   assets:
     access_key_id: AKIA...
     secret_access_key: ...
-  archive:
-    password: ...
 ```
 
 Any public value can be overridden with environment variables, such as

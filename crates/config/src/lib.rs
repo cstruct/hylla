@@ -68,6 +68,78 @@ config_tree! {
         // r[impl config.backends]
         /// Backends by name.
         pub backends: HashMap<String, Backend>,
+        // r[impl config.cache]
+        /// The object cache. Optional; defaults to a memory only cache.
+        #[facet(default)]
+        pub cache: pub struct Cache {
+            // r[impl config.cache.chunks]
+            /// Objects are cached in chunks of this size, in KiB.
+            #[facet(default = 1024)]
+            pub chunk_size_kib: u32,
+            // r[impl config.cache.metadata-ttl]
+            /// How long object metadata (size, ETag, content type) is cached, in seconds.
+            #[facet(default = 30)]
+            pub metadata_ttl_seconds: u64,
+            // r[impl config.cache.write-policy]
+            /// When chunks are written to disk.
+            #[facet(default)]
+            pub write_policy: #[derive(Default)] #[facet(rename_all = "snake_case")] pub enum WritePolicy {
+                /// When they are evicted from memory, keeping the disk for colder data.
+                #[default]
+                OnEviction,
+                /// As soon as they are cached, so they survive restarts sooner.
+                OnInsertion,
+            },
+            // r[impl config.cache.memory]
+            /// The memory tier.
+            #[facet(default)]
+            pub memory: pub struct MemoryCache {
+                /// Capacity in MiB.
+                #[facet(default = 256)]
+                pub capacity_mib: u64,
+            },
+            // r[impl config.cache.disk]
+            /// The disk tier. Without it, only memory is used.
+            pub disk: Option<pub struct DiskCache {
+                /// The directory the cache is stored in.
+                pub path: std::path::PathBuf,
+                /// Capacity in MiB.
+                pub capacity_mib: u64,
+                /// Size of foyer's disk blocks in MiB. A chunk must fit in a block.
+                #[facet(default = 16)]
+                pub block_size_mib: u32,
+            }>,
+        },
+    }
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self {
+            chunk_size_kib: 1024,
+            metadata_ttl_seconds: 30,
+            write_policy: WritePolicy::default(),
+            memory: MemoryCache::default(),
+            disk: None,
+        }
+    }
+}
+
+impl Default for MemoryCache {
+    fn default() -> Self {
+        Self { capacity_mib: 256 }
+    }
+}
+
+impl Cache {
+    /// The chunk size in bytes.
+    pub fn chunk_size(&self) -> u64 {
+        u64::from(self.chunk_size_kib) * 1024
+    }
+
+    /// How long object metadata is cached.
+    pub fn metadata_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.metadata_ttl_seconds)
     }
 }
 

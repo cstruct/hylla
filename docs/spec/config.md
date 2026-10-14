@@ -97,3 +97,31 @@ the fields of that type.
 
 r[config.backends.secrets]
 Backend credentials MUST be secret, so they can only be set by the secrets file.
+
+## Cache
+
+r[config.cache]
+The cache MUST be configured in an optional `cache` section, every setting of which has a
+default.
+
+r[config.cache.chunks]
+`chunk_size_kib` MUST set the size of the chunks objects are cached in, defaulting to
+1024.
+
+r[config.cache.metadata-ttl]
+`metadata_ttl_seconds` MUST set how long object metadata is cached, defaulting to 30.
+
+r[config.cache.write-policy]
+`write_policy` MUST select when chunks are written to disk: `on_eviction` from memory, the
+default, or `on_insertion`.
+
+r[config.cache.memory]
+`memory.capacity_mib` MUST set the capacity of the memory tier, defaulting to 256.
+
+r[config.cache.disk]
+An optional `disk` section MUST enable the disk tier, stored in `path` with a capacity of
+`capacity_mib` and blocks of `block_size_mib`, defaulting to 16.
+
+r[config.validate.cache]
+A chunk size or memory capacity of zero, a chunk size not smaller than the disk block
+size, and a disk capacity of fewer than 4 blocks MUST be reported as invalid.

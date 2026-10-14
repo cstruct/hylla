@@ -33,6 +33,8 @@ pub enum ValidationError {
         rewrite: usize,
         reference: String,
     },
+    /// A cache size setting is out of range.
+    InvalidCache { reason: String },
     /// Several servers answer to the same host name on the same address.
     DuplicateHost {
         listen: SocketAddr,
@@ -91,6 +93,7 @@ impl fmt::Display for ValidationError {
                 }
                 Ok(())
             }
+            Self::InvalidCache { reason } => write!(f, "invalid cache config: {reason}"),
             Self::DuplicateHost {
                 listen,
                 server_name,
@@ -172,6 +175,9 @@ impl Config {
                 }
             }
         }
+        // r[impl config.validate.cache]
+        errors.extend(self.validate_cache());
+
         for ((listen, server_name), servers) in hosts {
             if servers.len() > 1 {
                 errors.push(ValidationError::DuplicateHost {
@@ -187,5 +193,39 @@ impl Config {
         } else {
             Err(errors)
         }
+    }
+}
+
+impl Config {
+    fn validate_cache(&self) -> Vec<ValidationError> {
+        let cache = &self.cache;
+        let mut reasons = Vec::new();
+        if cache.chunk_size_kib == 0 {
+            reasons.push("`chunk_size_kib` must be positive".to_string());
+        }
+        if cache.memory.capacity_mib == 0 {
+            reasons.push("`memory.capacity_mib` must be positive".to_string());
+        }
+        if let Some(disk) = &cache.disk {
+            let block_kib = u64::from(disk.block_size_mib) * 1024;
+            // A block also holds an entry's key and header, so the chunk must be smaller.
+            if u64::from(cache.chunk_size_kib) >= block_kib {
+                reasons.push(format!(
+                    "`chunk_size_kib` ({}) must be smaller than `disk.block_size_mib` ({} MiB), \
+                     since a chunk is stored in a single block",
+                    cache.chunk_size_kib, disk.block_size_mib
+                ));
+            }
+            if disk.capacity_mib < u64::from(disk.block_size_mib) * 4 {
+                reasons.push(format!(
+                    "`disk.capacity_mib` ({}) must hold at least 4 blocks of {} MiB",
+                    disk.capacity_mib, disk.block_size_mib
+                ));
+            }
+        }
+        reasons
+            .into_iter()
+            .map(|reason| ValidationError::InvalidCache { reason })
+            .collect()
     }
 }
