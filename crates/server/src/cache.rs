@@ -171,6 +171,15 @@ pub struct ObjectCache {
     stale_if_error: Duration,
 }
 
+/// How an object listed by the backend compares to the cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CachedState {
+    NotCached,
+    /// Cached with the listed ETag and size.
+    Unchanged(ObjectMeta),
+    Changed,
+}
+
 /// Failure to read an object.
 #[derive(Debug)]
 pub enum ReadError {
@@ -230,23 +239,65 @@ impl ObjectCache {
         store: &dyn ObjectStore,
         path: &ObjectPath,
     ) -> Result<ObjectMeta, ReadError> {
-        let key = CacheKey::Meta {
-            backend: backend.to_string(),
-            key: path.to_string(),
-        };
-        let cached = match self.entries.get(&key).await {
-            Ok(entry) => entry.and_then(|entry| StoredMeta::from_bytes(entry.value()).ok()),
-            Err(error) => {
-                tracing::warn!(%path, "reading cached metadata: {error}");
-                None
-            }
-        };
+        let cached = self.cached_metadata(backend, path).await;
         if let Some(cached) = &cached
             && cached.age() < self.metadata_ttl
         {
             return Ok(cached.meta.clone());
         }
+        match self.fetch_metadata(backend, store, path).await {
+            Err(ReadError::Backend(error)) => match cached {
+                Some(cached) if cached.age() < self.metadata_ttl + self.stale_if_error => {
+                    tracing::warn!(
+                        backend,
+                        %path,
+                        age = ?cached.age(),
+                        "serving stale metadata, the backend failed: {error:#}"
+                    );
+                    Ok(cached.meta)
+                }
+                _ => Err(ReadError::Backend(error)),
+            },
+            result => result,
+        }
+    }
 
+    fn meta_key(backend: &str, path: &ObjectPath) -> CacheKey {
+        CacheKey::Meta {
+            backend: backend.to_string(),
+            key: path.to_string(),
+        }
+    }
+
+    /// The cached metadata of an object, whatever its age.
+    async fn cached_metadata(&self, backend: &str, path: &ObjectPath) -> Option<StoredMeta> {
+        match self.entries.get(&Self::meta_key(backend, path)).await {
+            Ok(entry) => entry.and_then(|entry| StoredMeta::from_bytes(entry.value()).ok()),
+            Err(error) => {
+                tracing::warn!(%path, "reading cached metadata: {error}");
+                None
+            }
+        }
+    }
+
+    /// Caches `meta` as fetched now.
+    fn store_metadata(&self, backend: &str, path: &ObjectPath, meta: ObjectMeta) {
+        let stored = StoredMeta {
+            meta,
+            fetched: SystemTime::now(),
+        };
+        self.entries
+            .insert(Self::meta_key(backend, path), stored.to_bytes());
+    }
+
+    /// Fetches the metadata of an object from the backend and caches it, forgetting the
+    /// object if it is missing.
+    pub(crate) async fn fetch_metadata(
+        &self,
+        backend: &str,
+        store: &dyn ObjectStore,
+        path: &ObjectPath,
+    ) -> Result<ObjectMeta, ReadError> {
         let options = GetOptions {
             head: true,
             ..Default::default()
@@ -262,30 +313,46 @@ impl ObjectCache {
                         .get(&Attribute::ContentType)
                         .map(|value| value.to_string()),
                 };
-                let stored = StoredMeta {
-                    meta: meta.clone(),
-                    fetched: SystemTime::now(),
-                };
-                self.entries.insert(key, stored.to_bytes());
+                self.store_metadata(backend, path, meta.clone());
                 Ok(meta)
             }
             Err(object_store::Error::NotFound { .. }) => {
-                self.entries.remove(&key);
+                self.forget(backend, path);
                 Err(ReadError::NotFound)
             }
-            Err(error) => match cached {
-                Some(cached) if cached.age() < self.metadata_ttl + self.stale_if_error => {
-                    tracing::warn!(
-                        backend,
-                        %path,
-                        age = ?cached.age(),
-                        "serving stale metadata, the backend failed: {error}"
-                    );
-                    Ok(cached.meta)
-                }
-                _ => Err(ReadError::Backend(error.into())),
-            },
+            Err(error) => Err(ReadError::Backend(error.into())),
         }
+    }
+
+    /// Forgets the metadata of an object.
+    pub(crate) fn forget(&self, backend: &str, path: &ObjectPath) {
+        self.entries.remove(&Self::meta_key(backend, path));
+    }
+
+    /// How a listed object compares to the cache.
+    pub(crate) async fn cached_state(
+        &self,
+        backend: &str,
+        path: &ObjectPath,
+        listed: &object_store::ObjectMeta,
+    ) -> CachedState {
+        match self.cached_metadata(backend, path).await {
+            None => CachedState::NotCached,
+            Some(cached) if cached.meta.etag == listed.e_tag && cached.meta.size == listed.size => {
+                CachedState::Unchanged(cached.meta)
+            }
+            Some(_) => CachedState::Changed,
+        }
+    }
+
+    /// Whether the metadata of an object is cached.
+    pub(crate) async fn is_cached(&self, backend: &str, path: &ObjectPath) -> bool {
+        self.cached_metadata(backend, path).await.is_some()
+    }
+
+    /// Marks cached metadata that is still current as fetched now.
+    pub(crate) fn touch_metadata(&self, backend: &str, path: &ObjectPath, meta: ObjectMeta) {
+        self.store_metadata(backend, path, meta);
     }
 
     // r[impl cache.chunks]
@@ -298,6 +365,41 @@ impl ObjectCache {
         meta: &ObjectMeta,
         index: u64,
     ) -> Result<Bytes, ReadError> {
+        self.fetch_chunk(backend, store, path, meta, index)
+            .await
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// Fetches every chunk of an object that isn't cached, returning how many bytes were
+    /// fetched from the backend.
+    pub(crate) async fn preload(
+        &self,
+        backend: &str,
+        store: Arc<dyn ObjectStore>,
+        path: &ObjectPath,
+        meta: &ObjectMeta,
+    ) -> Result<u64, ReadError> {
+        let mut fetched = 0;
+        for index in 0..meta.size.div_ceil(self.chunk_size) {
+            let (bytes, was_fetched) = self
+                .fetch_chunk(backend, store.clone(), path, meta, index)
+                .await?;
+            if was_fetched {
+                fetched += bytes.len() as u64;
+            }
+        }
+        Ok(fetched)
+    }
+
+    /// A chunk, and whether it had to be fetched from the backend.
+    async fn fetch_chunk(
+        &self,
+        backend: &str,
+        store: Arc<dyn ObjectStore>,
+        path: &ObjectPath,
+        meta: &ObjectMeta,
+        index: u64,
+    ) -> Result<(Bytes, bool), ReadError> {
         let start = index * self.chunk_size;
         let end = (start + self.chunk_size).min(meta.size);
         let key = CacheKey::Chunk(ChunkKey {
@@ -313,11 +415,13 @@ impl ObjectCache {
             ..Default::default()
         };
         let changed = Arc::new(AtomicBool::new(false));
-        let fetch_changed = changed.clone();
+        let fetched = Arc::new(AtomicBool::new(false));
+        let (fetch_changed, fetch_fetched) = (changed.clone(), fetched.clone());
         let fetch_path = path.clone();
         let entry = self
             .entries
             .get_or_fetch(&key, move || async move {
+                fetch_fetched.store(true, Ordering::Relaxed);
                 let result = match store.get_opts(&fetch_path, options).await {
                     Ok(result) => result,
                     Err(error) => {
@@ -334,16 +438,13 @@ impl ObjectCache {
             })
             .await;
         match entry {
-            Ok(entry) => Ok(entry.value().clone()),
+            Ok(entry) => Ok((entry.value().clone(), fetched.load(Ordering::Relaxed))),
             Err(error) => {
                 // r[impl cache.changed]
                 // Only an object that changed or went away invalidates its metadata; other
                 // failures, such as an outage, keep it so cached chunks stay servable.
                 if changed.load(Ordering::Relaxed) {
-                    self.entries.remove(&CacheKey::Meta {
-                        backend: backend.to_string(),
-                        key: path.to_string(),
-                    });
+                    self.forget(backend, path);
                 }
                 Err(ReadError::Backend(anyhow::Error::new(error)))
             }

@@ -12,16 +12,23 @@ use hylla_config::{Config, Router as MappingRouter};
 use object_store::path::Path as ObjectPath;
 use percent_encoding::percent_decode_str;
 
+use anyhow::Context;
+use hylla_config::Refresh;
+
 use crate::{
+    RefreshReport,
     backend::Stores,
     cache::{ObjectCache, ObjectMeta, ReadError},
     range::{self, RequestedRange},
+    refresh,
 };
 
 /// The shared state of all listeners.
 pub struct App {
     cache: ObjectCache,
     stores: Stores,
+    /// The refresh settings of the backends that have any, by backend name.
+    refresh: BTreeMap<String, Refresh>,
     /// The servers of each listen address.
     listeners: BTreeMap<SocketAddr, Vec<Arc<Server>>>,
 }
@@ -54,9 +61,15 @@ impl App {
                     router,
                 }));
         }
+        let refresh = config
+            .backends
+            .iter()
+            .filter_map(|(name, backend)| Some((name.clone(), backend.refresh()?.clone())))
+            .collect();
         Ok(Arc::new(Self {
             cache: ObjectCache::new(&config.cache).await?,
             stores,
+            refresh,
             listeners,
         }))
     }
@@ -72,6 +85,56 @@ impl App {
             app: self.clone(),
             listen,
         })
+    }
+
+    /// Runs refresh rule `rule` of `backend` once.
+    pub async fn refresh(&self, backend: &str, rule: usize) -> anyhow::Result<RefreshReport> {
+        let refresh = self
+            .refresh
+            .get(backend)
+            .with_context(|| format!("backend `{backend}` has no refresh"))?;
+        let rule = refresh
+            .rules
+            .get(rule)
+            .with_context(|| format!("backend `{backend}` has no refresh rule {rule}"))?;
+        let store = self
+            .stores
+            .get(backend)
+            .with_context(|| format!("backend `{backend}` has no store"))?;
+        refresh::run(&self.cache, backend, store.clone(), refresh, rule).await
+    }
+
+    // r[impl refresh.schedule]
+    /// Runs every enabled refresh rule now and then on its interval, until the returned
+    /// tasks are aborted.
+    pub fn spawn_refresh(self: &Arc<Self>) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut tasks = Vec::new();
+        for (backend, refresh) in &self.refresh {
+            for (index, rule) in refresh.rules.iter().enumerate() {
+                if !rule.mode.revalidates() && !rule.mode.preloads() {
+                    continue;
+                }
+                let app = self.clone();
+                let backend = backend.clone();
+                let every = rule.every.duration();
+                tasks.push(tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(every);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        interval.tick().await;
+                        match app.refresh(&backend, index).await {
+                            Ok(report) => {
+                                tracing::info!(backend, rule = index, ?report, "refreshed")
+                            }
+                            Err(error) => {
+                                tracing::warn!(backend, rule = index, "refresh failed: {error:#}")
+                            }
+                        }
+                    }
+                }));
+            }
+        }
+        tasks
     }
 
     pub async fn close(&self) -> anyhow::Result<()> {

@@ -3,7 +3,8 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use axum::body::{Body, to_bytes};
 use http::{Request, StatusCode, header};
 use hylla_config::{
-    Backend, Cache, Config, DiskCache, Mapping, MemoryCache, Rewrite, Server, WritePolicy,
+    Backend, Cache, Config, DiskCache, Interval, Mapping, MemoryCache, Refresh, RefreshMode,
+    RefreshRule, Rewrite, Server, WritePolicy,
 };
 use hylla_server::App;
 use object_store::{
@@ -34,6 +35,10 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)]) -> Mapping {
 /// A config with a `public` server mapping `/assets` (rewritten to the bucket root) and an
 /// `internal` server on the same address mapping everything, both to the `assets` backend.
 fn config(cache: Cache) -> Config {
+    config_with_refresh(cache, None)
+}
+
+fn config_with_refresh(cache: Cache, refresh: Option<Refresh>) -> Config {
     let server = |names: &[&str], mappings| Server {
         listen: listen(),
         server_names: names.iter().map(|name| (*name).into()).collect(),
@@ -61,7 +66,7 @@ fn config(cache: Cache) -> Config {
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
-                refresh: None,
+                refresh,
             },
         )]),
         cache,
@@ -339,6 +344,7 @@ async fn serves_through_a_disk_tier() {
 struct Flaky {
     inner: Arc<InMemory>,
     failing: std::sync::atomic::AtomicBool,
+    requests: std::sync::atomic::AtomicUsize,
 }
 
 impl Flaky {
@@ -346,6 +352,7 @@ impl Flaky {
         Arc::new(Self {
             inner,
             failing: false.into(),
+            requests: 0.into(),
         })
     }
 
@@ -354,7 +361,13 @@ impl Flaky {
             .store(failing, std::sync::atomic::Ordering::Relaxed);
     }
 
+    fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn check(&self) -> object_store::Result<()> {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.failing.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(object_store::Error::Generic {
                 store: "flaky",
@@ -410,6 +423,10 @@ impl ObjectStore for Flaky {
         &self,
         prefix: Option<&Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt;
+        if let Err(error) = self.check() {
+            return futures::stream::once(async { Err(error) }).boxed();
+        }
         self.inner.list(prefix)
     }
 
@@ -547,5 +564,209 @@ async fn outages_keep_cached_chunks_servable() {
 
     // Once the backend is back, everything is served again.
     store.fail(false);
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+}
+
+fn rule(prefix: Option<&str>, key: Option<&str>, mode: RefreshMode) -> RefreshRule {
+    RefreshRule {
+        prefix: prefix.map(Into::into),
+        key: key.map(Into::into),
+        every: Interval(std::time::Duration::from_secs(3600)),
+        mode,
+        max_objects: None,
+        max_mib: None,
+    }
+}
+
+async fn refresh_app(cache: Cache, store: Arc<Flaky>, rules: Vec<RefreshRule>) -> Arc<App> {
+    let refresh = Refresh {
+        concurrency: 2,
+        rules,
+    };
+    let stores = HashMap::from([("assets".to_string(), store as Arc<dyn ObjectStore>)]);
+    App::new(&config_with_refresh(cache, Some(refresh)), stores)
+        .await
+        .unwrap()
+}
+
+/// A store with `app.css` holding [`content`].
+async fn flaky_store() -> (Arc<InMemory>, Arc<Flaky>) {
+    let memory = Arc::new(InMemory::new());
+    put(&memory, "app.css", content()).await;
+    let store = Flaky::new(memory.clone());
+    (memory, store)
+}
+
+// r[verify refresh.revalidate]
+// r[verify refresh.list]
+// r[verify refresh.run]
+#[tokio::test]
+async fn revalidation_picks_up_changes_before_the_ttl() {
+    let (memory, store) = flaky_store().await;
+    let app = refresh_app(
+        small_cache(3600),
+        store,
+        vec![rule(Some(""), None, RefreshMode::Revalidate)],
+    )
+    .await;
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+
+    put(&memory, "app.css", b"body { color: red }".to_vec()).await;
+    // Within the TTL, the cached version is still served...
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    // ...until a revalidation notices the change.
+    let report = app.refresh("assets", 0).await.unwrap();
+    assert_eq!((report.listed, report.changed), (1, 1));
+    assert_eq!(
+        get(&app, "/assets/app.css").await.body,
+        b"body { color: red }"
+    );
+}
+
+// r[verify refresh.revalidate]
+// r[verify config.refresh.modes]
+#[tokio::test]
+async fn revalidation_keeps_unchanged_objects_fresh_and_ignores_uncached_ones() {
+    let (memory, store) = flaky_store().await;
+    put(&memory, "other.css", content()).await;
+    let cache = Cache {
+        stale_if_error_seconds: 0,
+        ..small_cache(1)
+    };
+    let app = refresh_app(
+        cache,
+        store.clone(),
+        vec![rule(Some(""), None, RefreshMode::Revalidate)],
+    )
+    .await;
+    assert_eq!(get(&app, "/assets/app.css").await.status, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // The metadata expired, but revalidation finds it unchanged and marks it fresh. The
+    // object that isn't cached is left alone.
+    let requests = store.requests();
+    let report = app.refresh("assets", 0).await.unwrap();
+    assert_eq!(
+        (report.listed, report.unchanged, report.preloaded),
+        (2, 1, 0)
+    );
+    assert_eq!(
+        store.requests(),
+        requests + 1,
+        "an unchanged object needs no requests beyond the listing"
+    );
+
+    store.fail(true);
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    assert_eq!(
+        get(&app, "/assets/other.css").await.status,
+        StatusCode::BAD_GATEWAY
+    );
+}
+
+// r[verify refresh.preload]
+// r[verify refresh.caps]
+#[tokio::test]
+async fn preloading_fills_the_cache_within_its_caps() {
+    let (memory, store) = flaky_store().await;
+    for key in ["b.css", "c.css"] {
+        put(&memory, key, content()).await;
+    }
+    put(&memory, "big/blob", vec![7; 2 * 1024 * 1024]).await;
+    let preload = |prefix, max_objects, max_mib| RefreshRule {
+        max_objects,
+        max_mib,
+        ..rule(Some(prefix), None, RefreshMode::Preload)
+    };
+    let app = refresh_app(
+        small_cache(3600),
+        store.clone(),
+        vec![preload("", Some(2), None), preload("big/", None, Some(1))],
+    )
+    .await;
+
+    // Objects are listed in key order: app.css and b.css fit the cap of 2.
+    let report = app.refresh("assets", 0).await.unwrap();
+    assert_eq!((report.listed, report.preloaded, report.skipped), (4, 2, 2));
+    assert_eq!(report.preloaded_bytes, 6000);
+    // The 2 MiB object doesn't fit 1 MiB.
+    let report = app.refresh("assets", 1).await.unwrap();
+    assert_eq!((report.listed, report.preloaded, report.skipped), (1, 0, 1));
+
+    store.fail(true);
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    assert_eq!(get(&app, "/assets/b.css").await.body, content());
+    assert_eq!(
+        get(&app, "/assets/c.css").await.status,
+        StatusCode::BAD_GATEWAY
+    );
+}
+
+// r[verify refresh.preload]
+// r[verify refresh.revalidate]
+#[tokio::test]
+async fn refreshing_both_preloads_changed_objects() {
+    let (memory, store) = flaky_store().await;
+    let rules = vec![RefreshRule {
+        max_objects: Some(10),
+        ..rule(Some(""), None, RefreshMode::Both)
+    }];
+    let app = refresh_app(small_cache(3600), store.clone(), rules).await;
+    assert_eq!(app.refresh("assets", 0).await.unwrap().preloaded, 1);
+    // Unchanged, so only revalidated the second time.
+    let report = app.refresh("assets", 0).await.unwrap();
+    assert_eq!((report.unchanged, report.preloaded), (1, 0));
+
+    put(&memory, "app.css", b"body { color: red }".to_vec()).await;
+    assert_eq!(app.refresh("assets", 0).await.unwrap().preloaded, 1);
+    store.fail(true);
+    assert_eq!(
+        get(&app, "/assets/app.css").await.body,
+        b"body { color: red }"
+    );
+}
+
+// r[verify refresh.removed]
+#[tokio::test]
+async fn key_rules_drop_deleted_objects() {
+    let (memory, store) = flaky_store().await;
+    let rules = vec![
+        rule(None, Some("app.css"), RefreshMode::Revalidate),
+        rule(None, Some("app.css"), RefreshMode::Disabled),
+    ];
+    let app = refresh_app(small_cache(3600), store, rules).await;
+    assert_eq!(get(&app, "/assets/app.css").await.status, StatusCode::OK);
+    assert_eq!(app.refresh("assets", 1).await.unwrap(), Default::default());
+    assert_eq!(app.refresh("assets", 0).await.unwrap().unchanged, 1);
+
+    memory.delete(&Path::from("app.css")).await.unwrap();
+    assert_eq!(app.refresh("assets", 0).await.unwrap().removed, 1);
+    assert_eq!(
+        get(&app, "/assets/app.css").await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+// r[verify refresh.schedule]
+#[tokio::test]
+async fn scheduled_rules_run_at_startup() {
+    let (_, store) = flaky_store().await;
+    let rules = vec![RefreshRule {
+        max_objects: Some(10),
+        ..rule(Some(""), None, RefreshMode::Preload)
+    }];
+    let app = refresh_app(small_cache(3600), store.clone(), rules).await;
+    let tasks = app.spawn_refresh();
+    // A listing, a metadata request and three chunks.
+    for _ in 0..100 {
+        if store.requests() >= 5 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for task in tasks {
+        task.abort();
+    }
+    store.fail(true);
     assert_eq!(get(&app, "/assets/app.css").await.body, content());
 }

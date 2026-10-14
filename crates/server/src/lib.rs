@@ -9,9 +9,11 @@ mod app;
 pub mod backend;
 mod cache;
 mod range;
+mod refresh;
 
 pub use app::App;
 pub use cache::ChunkKey;
+pub use refresh::RefreshReport;
 
 use std::sync::Arc;
 
@@ -40,7 +42,11 @@ pub async fn serve(
                 .await
         }));
     }
+    let refreshers = app.spawn_refresh();
     shutdown.await;
+    for refresher in &refreshers {
+        refresher.abort();
+    }
     let _ = stop.send(());
     for task in tasks {
         task.await??;

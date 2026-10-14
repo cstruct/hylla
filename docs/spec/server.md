@@ -61,3 +61,34 @@ request answered with 404, never with stale data.
 r[cache.changed]
 Cached metadata MUST only be dropped by a failed chunk fetch when the object changed (its
 ETag no longer matches) or went away, not on other failures such as outages.
+
+## Refresh
+
+Refresh rules keep cached objects fresh, and the cache warm, in the background.
+
+r[refresh.schedule]
+Every enabled refresh rule MUST run at startup and then on its interval.
+
+r[refresh.run]
+A run MUST compare the objects a rule covers to the cache, processing at most the
+backend's `concurrency` objects at the same time, and report what it did.
+
+r[refresh.list]
+A prefix rule MUST list the backend once per run, comparing each listed object's ETag and
+size to its cached metadata, so unchanged objects need no further requests.
+
+r[refresh.revalidate]
+Revalidating MUST mark the metadata of unchanged cached objects as fetched now, and fetch
+the metadata of changed cached objects again. Objects that aren't cached MUST be left
+alone.
+
+r[refresh.preload]
+Preloading MUST fetch objects that aren't cached, or changed, into the cache: their
+metadata and every chunk.
+
+r[refresh.caps]
+Preloading MUST stop at `max_objects` objects and `max_mib` of data per run, taking objects
+in listing order, and report the objects it skipped.
+
+r[refresh.removed]
+A key rule whose object went away MUST drop its cached metadata.

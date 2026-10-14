@@ -75,7 +75,9 @@ Requests are matched to a server by their `Host` header:
 curl -H "Host: cache.example.com" http://localhost:8080/assets/app.css
 ```
 
-GET and HEAD are supported, including single byte ranges and `If-None-Match`. The cache is a
+GET and HEAD are supported, including single byte ranges and `If-None-Match`. Refresh rules
+revalidate cached objects, so changes are picked up without requests waiting on the
+backend, and preload objects before anyone asks for them. The cache is a
 [foyer](https://github.com/foyer-rs/foyer) hybrid cache: objects are stored in chunks keyed
 by their ETag, in memory and, when configured, on disk, where they survive restarts.
 
