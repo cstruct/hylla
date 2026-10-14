@@ -159,7 +159,7 @@ async fn metrics_are_exported_over_otlp() {
             endpoint: None,
             interval: Interval::from_secs(3600),
         },
-        traces: Default::default(),
+        ..Telemetry::default()
     })
     .unwrap();
 

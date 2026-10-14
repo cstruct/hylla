@@ -717,12 +717,17 @@ telemetry:
     enabled: true
     endpoint: http://quickwit:7280/api/v1/otlp/v1/traces
     sample_ratio: 0.25
+  logs:
+    level: info,hylla_server=debug
+    format: json
+    export: true
 ";
 
 // r[verify config.telemetry]
 // r[verify config.telemetry.otlp]
 // r[verify config.telemetry.metrics]
 // r[verify config.telemetry.traces]
+// r[verify config.telemetry.logs]
 #[test]
 fn telemetry_is_configured_with_secret_headers() {
     let files = Files::new("telemetry-defaults", "servers: {}\nbackends: {}\n", "{}");
@@ -734,6 +739,9 @@ fn telemetry_is_configured_with_secret_headers() {
     assert!(!telemetry.traces.enabled);
     assert_eq!(telemetry.traces.sample_ratio, 1.0);
     assert!(!telemetry.traces.record_paths);
+    assert_eq!(telemetry.logs.level, "info");
+    assert_eq!(telemetry.logs.format, hylla_config::LogFormat::Text);
+    assert!(!telemetry.logs.export);
 
     let secrets = "telemetry: {otlp: {headers: {authorization: Bearer token}}}";
     let files = Files::new("telemetry", TELEMETRY, secrets);
@@ -768,6 +776,10 @@ fn telemetry_is_configured_with_secret_headers() {
         Some("http://quickwit:7280/api/v1/otlp/v1/traces")
     );
     assert_eq!(telemetry.traces.sample_ratio, 0.25);
+    assert_eq!(telemetry.logs.level, "info,hylla_server=debug");
+    assert_eq!(telemetry.logs.format, hylla_config::LogFormat::Json);
+    assert!(telemetry.logs.export);
+    assert_eq!(telemetry.logs.endpoint, None);
 
     // Headers are secret: the public file can't set them.
     let public = format!("{TELEMETRY}  otlp:\n    headers: {{authorization: leaked}}\n")

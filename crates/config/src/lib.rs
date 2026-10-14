@@ -157,6 +157,29 @@ config_tree! {
                 #[facet(default)]
                 pub record_paths: bool,
             },
+            // r[impl config.telemetry.logs]
+            /// Logging, to stderr and optionally exported.
+            #[facet(default)]
+            pub logs: pub struct Logs {
+                /// What to log, as `tracing` filter directives such as `info` or
+                /// `info,hylla_server=debug`. `RUST_LOG` overrides it.
+                #[facet(default = String::from("info"))]
+                pub level: String,
+                #[facet(default)]
+                pub format: #[derive(Default)] #[facet(rename_all = "snake_case")] pub enum LogFormat {
+                    /// Human-readable lines.
+                    #[default]
+                    Text,
+                    /// A JSON object per line, with the trace and span IDs of traced requests.
+                    Json,
+                },
+                /// Whether to export logs over OTLP too.
+                #[facet(default)]
+                pub export: bool,
+                /// The full URL to export logs to, overriding `otlp.endpoint`, such as
+                /// `http://quickwit:7280/api/v1/otlp/v1/logs`.
+                pub endpoint: Option<String>,
+            },
         },
         // r[impl config.cluster]
         /// Other hylla nodes to share revalidations and preloads with. Optional.
@@ -281,6 +304,7 @@ impl Default for Telemetry {
             otlp: Otlp::default(),
             metrics: MetricsExport::default(),
             traces: TracesExport::default(),
+            logs: Logs::default(),
         }
     }
 }
@@ -313,6 +337,17 @@ impl Default for TracesExport {
             endpoint: None,
             sample_ratio: 1.0,
             record_paths: false,
+        }
+    }
+}
+
+impl Default for Logs {
+    fn default() -> Self {
+        Self {
+            level: "info".into(),
+            format: LogFormat::default(),
+            export: false,
+            endpoint: None,
         }
     }
 }

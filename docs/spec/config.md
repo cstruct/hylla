@@ -220,3 +220,8 @@ r[config.telemetry.traces]
 `traces` MUST configure exporting traces: whether it's `enabled` (off by default), an optional
 `endpoint` overriding the OTLP one, the `sample_ratio` from 0 to 1, defaulting to 1, and
 whether to `record_paths` in spans, off by default.
+
+r[config.telemetry.logs]
+`logs` MUST configure logging: the `level` as filter directives, defaulting to `info`, the
+`format`, `text` (the default) or `json`, whether to `export` logs over OTLP (off by default),
+and an optional `endpoint` overriding the OTLP one.
