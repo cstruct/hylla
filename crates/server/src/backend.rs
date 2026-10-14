@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, bail};
 use hylla_config::{Backend, Config};
-use object_store::{ObjectStore, aws::AmazonS3Builder};
+use object_store::{ObjectStore, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder};
 
 /// The object stores of the configured backends, by backend name.
 pub type Stores = HashMap<String, Arc<dyn ObjectStore>>;
@@ -10,7 +10,7 @@ pub type Stores = HashMap<String, Arc<dyn ObjectStore>>;
 // r[impl backend.s3]
 /// Creates an object store for every configured backend.
 ///
-/// Only S3 backends are supported so far; other types fail with an error.
+/// S3 and Azure Blob Storage backends are supported; Swift backends fail with an error.
 pub fn stores(config: &Config) -> anyhow::Result<Stores> {
     config
         .backends
@@ -45,8 +45,29 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
             }
             Ok(Arc::new(builder.build()?))
         }
+        // r[impl backend.azure-blob]
+        Backend::AzureBlob {
+            account,
+            container,
+            endpoint,
+            account_key,
+            ..
+        } => {
+            let mut builder = MicrosoftAzureBuilder::new()
+                .with_account(account)
+                .with_container_name(container)
+                .with_access_key(account_key);
+            if let Some(endpoint) = endpoint {
+                // Such as Azurite's `http://127.0.0.1:10000/devstoreaccount1`: the endpoint
+                // is the account's URL, which blobs are addressed under as
+                // `{endpoint}/{container}/{key}`.
+                builder = builder
+                    .with_endpoint(endpoint.clone())
+                    .with_allow_http(endpoint.starts_with("http://"));
+            }
+            Ok(Arc::new(builder.build()?))
+        }
         Backend::Swift { .. } => bail!("swift backends are not supported yet"),
-        Backend::AzureBlob { .. } => bail!("azure_blob backends are not supported yet"),
     }
 }
 
@@ -64,6 +85,27 @@ mod tests {
             auth: HashMap::new(),
             cluster: None,
         }
+    }
+
+    // r[verify backend.azure-blob]
+    #[test]
+    fn creates_azure_blob_stores() {
+        // Azurite's well-known development account key.
+        let key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+        let azure = |endpoint: Option<&str>| {
+            config(Backend::AzureBlob {
+                account: "devstoreaccount1".into(),
+                container: "assets".into(),
+                endpoint: endpoint.map(Into::into),
+                account_key: key.into(),
+                refresh: None,
+            })
+        };
+        let stores = super::stores(&azure(None)).unwrap();
+        assert!(stores["b"].to_string().contains("assets"));
+        let stores =
+            super::stores(&azure(Some("http://127.0.0.1:10000/devstoreaccount1"))).unwrap();
+        assert!(stores["b"].to_string().contains("assets"));
     }
 
     // r[verify backend.s3]

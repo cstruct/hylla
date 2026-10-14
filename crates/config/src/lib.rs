@@ -259,7 +259,9 @@ pub enum Backend {
     AzureBlob {
         account: String,
         container: String,
-        /// Overrides the endpoint, such as for Azurite.
+        /// Overrides the account's URL, which defaults to
+        /// `https://{account}.blob.core.windows.net`, such as
+        /// `http://127.0.0.1:10000/devstoreaccount1` for Azurite.
         endpoint: Option<String>,
         #[config(secret)]
         account_key: String,

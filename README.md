@@ -49,7 +49,7 @@ auth:                         # JWT verifiers, by name
     leeway: 30s               # clock skew allowed for exp and nbf
 backends:
   assets:
-    type: s3                  # s3 (swift and azure_blob are configurable but not served yet)
+    type: s3                  # s3 or azure_blob (swift is configurable but not served yet)
     bucket: assets
     region: eu-north-1
     endpoint: http://localhost:9000   # optional, for S3 compatible stores
