@@ -1,0 +1,12 @@
+# Tools for the end-to-end tests, see `mise run e2e`.
+[tools]
+# An S3 compatible gateway serving a local directory, from its GitHub releases.
+"github:versity/versitygw" = "1.9.0"
+# A local Azure Blob Storage emulator. It publishes no binaries on GitHub, only an npm
+# package, so it's installed with mise's npm backend.
+node = "24"
+"npm:azurite" = "3.37.0"
+
+[tasks.e2e]
+description = "Run the end-to-end tests against VersityGW and Azurite"
+run = "cargo test -p hylla-server --test e2e -- --ignored --test-threads=1"

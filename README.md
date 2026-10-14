@@ -118,6 +118,21 @@ rule runs on one node, metadata fetched from a backend is pushed to the other no
 others pull what a node preloads directly from it, so the backend serves it once per cluster.
 Everything between nodes is signed with the shared key.
 
+## Testing
+
+```bash
+cargo test
+```
+
+The end-to-end tests run the `hylla` binary against [VersityGW](https://github.com/versity/versitygw)
+(S3) and [Azurite](https://github.com/Azure/Azurite) (Azure Blob Storage), and three nodes
+sharing over a cluster. [mise](https://mise.jdx.dev) installs both tools, pinned in
+[mise.toml](mise.toml):
+
+```bash
+mise run e2e
+```
+
 The behaviour is specified in [docs/spec](docs/spec) and tracked with
 [tracey](https://github.com/bearcove/tracey).
 
