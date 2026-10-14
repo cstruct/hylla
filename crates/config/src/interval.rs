@@ -10,6 +10,10 @@ use facet::Facet;
 pub struct Interval(#[facet(opaque)] pub Duration);
 
 impl Interval {
+    pub const fn from_secs(secs: u64) -> Self {
+        Self(Duration::from_secs(secs))
+    }
+
     pub fn duration(&self) -> Duration {
         self.0
     }

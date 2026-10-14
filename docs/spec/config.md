@@ -108,7 +108,8 @@ A refresh rule's `mode` MUST be `disabled`, `revalidate` (the default), `preload
 `both`. Preload rules MAY cap each run with `max_objects` and `max_mib`.
 
 r[config.durations]
-Durations such as `every` MUST be written like `90s`, `15m` or `1h 30m`.
+Durations, such as `every`, `metadata_ttl` and `stale_if_error`, MUST be written like
+`90s`, `15m` or `1h 30m`.
 
 r[config.validate.refresh]
 A refresh with a `concurrency` of zero, and rules setting both or neither of `prefix` and
@@ -129,11 +130,11 @@ r[config.cache.chunks]
 1024.
 
 r[config.cache.metadata-ttl]
-`metadata_ttl_seconds` MUST set how long object metadata is cached, defaulting to 30.
+`metadata_ttl` MUST set how long object metadata is cached, defaulting to `30s`.
 
 r[config.cache.stale-if-error]
-`stale_if_error_seconds` MUST set how long past its TTL cached metadata may still be used
-when the backend fails, defaulting to 86400 (a day). `0` MUST disable it.
+`stale_if_error` MUST set how long past its TTL cached metadata may still be used when the
+backend fails, defaulting to `1d`. `0s` MUST disable it.
 
 r[config.cache.write-policy]
 `write_policy` MUST select when chunks are written to disk: `on_eviction` from memory, the

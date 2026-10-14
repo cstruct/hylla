@@ -40,9 +40,9 @@ backends:
           max_objects: 1      # preloading needs max_objects and/or max_mib
 cache:                        # optional, every setting has a default
   chunk_size_kib: 1024        # objects are cached in chunks of this size
-  metadata_ttl_seconds: 30    # how long size, ETag and content type are cached
-  stale_if_error_seconds: 86400  # keep serving cached objects this long past their TTL
-                                 # while the backend fails; 0 disables
+  metadata_ttl: 30s           # how long size, ETag and content type are cached
+  stale_if_error: 1d          # keep serving cached objects this long past their TTL
+                              # while the backend fails; 0s disables
   write_policy: on_eviction   # or on_insertion: when chunks are written to disk
   memory:
     capacity_mib: 256

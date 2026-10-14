@@ -77,7 +77,7 @@ fn config_with_refresh(cache: Cache, refresh: Option<Refresh>) -> Config {
 fn small_cache(metadata_ttl_seconds: u64) -> Cache {
     Cache {
         chunk_size_kib: 1,
-        metadata_ttl_seconds,
+        metadata_ttl: Interval::from_secs(metadata_ttl_seconds),
         ..Cache::default()
     }
 }
@@ -317,8 +317,8 @@ async fn serves_through_a_disk_tier() {
     let _ = std::fs::remove_dir_all(&dir);
     let cache = Cache {
         chunk_size_kib: 1,
-        metadata_ttl_seconds: 60,
-        stale_if_error_seconds: 0,
+        metadata_ttl: Interval::from_secs(60),
+        stale_if_error: Interval::from_secs(0),
         write_policy: WritePolicy::OnInsertion,
         memory: MemoryCache { capacity_mib: 1 },
         disk: Some(DiskCache {
@@ -459,8 +459,8 @@ fn disk_cache(
 ) -> Cache {
     Cache {
         chunk_size_kib: 1,
-        metadata_ttl_seconds,
-        stale_if_error_seconds,
+        metadata_ttl: Interval::from_secs(metadata_ttl_seconds),
+        stale_if_error: Interval::from_secs(stale_if_error_seconds),
         write_policy: WritePolicy::OnEviction,
         memory: MemoryCache { capacity_mib: 1 },
         disk: Some(DiskCache {
@@ -526,8 +526,8 @@ async fn outages_keep_cached_chunks_servable() {
     put(&memory, "app.css", content()).await;
     let store = Flaky::new(memory);
     let cache = Cache {
-        metadata_ttl_seconds: 0,
-        stale_if_error_seconds: 3600,
+        metadata_ttl: Interval::from_secs(0),
+        stale_if_error: Interval::from_secs(3600),
         ..small_cache(0)
     };
     let app = flaky_app(cache, store.clone()).await;
@@ -571,7 +571,7 @@ fn rule(prefix: Option<&str>, key: Option<&str>, mode: RefreshMode) -> RefreshRu
     RefreshRule {
         prefix: prefix.map(Into::into),
         key: key.map(Into::into),
-        every: Interval(std::time::Duration::from_secs(3600)),
+        every: Interval::from_secs(3600),
         mode,
         max_objects: None,
         max_mib: None,
@@ -630,7 +630,7 @@ async fn revalidation_keeps_unchanged_objects_fresh_and_ignores_uncached_ones() 
     let (memory, store) = flaky_store().await;
     put(&memory, "other.css", content()).await;
     let cache = Cache {
-        stale_if_error_seconds: 0,
+        stale_if_error: Interval::from_secs(0),
         ..small_cache(1)
     };
     let app = refresh_app(

@@ -79,15 +79,15 @@ config_tree! {
             #[facet(default = 1024)]
             pub chunk_size_kib: u32,
             // r[impl config.cache.metadata-ttl]
-            /// How long object metadata (size, ETag, content type) is cached, in seconds.
-            #[facet(default = 30)]
-            pub metadata_ttl_seconds: u64,
+            /// How long object metadata (size, ETag, content type) is cached, such as `30s`.
+            #[facet(default = Interval::from_secs(30))]
+            pub metadata_ttl: Interval,
             // r[impl config.cache.stale-if-error]
             /// How long past its TTL cached metadata may still be used when the backend fails,
-            /// in seconds, so cached objects stay available during backend outages. `0`
+            /// such as `1d`, so cached objects stay available during backend outages. `0s`
             /// disables serving stale objects.
-            #[facet(default = 86400)]
-            pub stale_if_error_seconds: u64,
+            #[facet(default = Interval::from_secs(24 * 60 * 60))]
+            pub stale_if_error: Interval,
             // r[impl config.cache.write-policy]
             /// When chunks are written to disk.
             #[facet(default)]
@@ -125,8 +125,8 @@ impl Default for Cache {
     fn default() -> Self {
         Self {
             chunk_size_kib: 1024,
-            metadata_ttl_seconds: 30,
-            stale_if_error_seconds: 86400,
+            metadata_ttl: Interval::from_secs(30),
+            stale_if_error: Interval::from_secs(24 * 60 * 60),
             write_policy: WritePolicy::default(),
             memory: MemoryCache::default(),
             disk: None,
@@ -144,16 +144,6 @@ impl Cache {
     /// The chunk size in bytes.
     pub fn chunk_size(&self) -> u64 {
         u64::from(self.chunk_size_kib) * 1024
-    }
-
-    /// How long object metadata is cached.
-    pub fn metadata_ttl(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.metadata_ttl_seconds)
-    }
-
-    /// How long past its TTL metadata may be used when the backend fails.
-    pub fn stale_if_error(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.stale_if_error_seconds)
     }
 }
 

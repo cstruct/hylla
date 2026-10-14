@@ -215,8 +215,8 @@ impl ObjectCache {
         Ok(Self {
             entries: builder.build().await?,
             chunk_size: config.chunk_size(),
-            metadata_ttl: config.metadata_ttl(),
-            stale_if_error: config.stale_if_error(),
+            metadata_ttl: config.metadata_ttl.duration(),
+            stale_if_error: config.stale_if_error.duration(),
         })
     }
 
