@@ -24,7 +24,7 @@ servers:
         backend: assets
 backends:
   assets:
-    type: s3                  # s3, swift or azure_blob
+    type: s3                  # s3 (swift and azure_blob are configurable but not served yet)
     bucket: assets
     region: eu-north-1
     endpoint: http://localhost:9000   # optional, for S3 compatible stores
@@ -50,6 +50,22 @@ backends:
 
 Any public value can be overridden with environment variables, such as
 `HYLLA__SERVERS__PUBLIC__LISTEN=0.0.0.0:9090`. See [crates/config](crates/config).
+
+## Running
+
+```bash
+cargo run --release -p hylla-server -- --config config.yaml --secrets secrets.yaml
+```
+
+Requests are matched to a server by their `Host` header:
+
+```bash
+curl -H "Host: cache.example.com" http://localhost:8080/assets/app.css
+```
+
+GET and HEAD are supported, including single byte ranges and `If-None-Match`. The cache is a
+[foyer](https://github.com/foyer-rs/foyer) hybrid cache: objects are stored in chunks keyed
+by their ETag, in memory and, when configured, on disk, where they survive restarts.
 
 The behaviour is specified in [docs/spec](docs/spec) and tracked with
 [tracey](https://github.com/bearcove/tracey).

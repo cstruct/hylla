@@ -1068,9 +1068,12 @@ dependencies = [
  "foyer",
  "futures",
  "http",
+ "httpdate",
  "hylla-config",
  "object_store",
+ "percent-encoding",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
