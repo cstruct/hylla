@@ -23,6 +23,7 @@
 mod interval;
 mod load;
 mod router;
+mod template;
 mod validate;
 
 use std::{collections::HashMap, net::SocketAddr};
@@ -34,6 +35,7 @@ pub use load::{
     ConfigError, ConfigFiles, ENV_PREFIX, Loaded, Origin, SourceError, load, load_with_env,
 };
 pub use router::{Route, Router};
+pub use template::{InvalidTemplate, PathTemplate, RenderError, under_prefix};
 pub use validate::ValidationError;
 
 config_tree! {
@@ -65,11 +67,30 @@ config_tree! {
                     /// `${name}`.
                     pub replace: String,
                 }>,
+                // r[impl config.auth.mappings]
+                /// Requires requests to carry a valid JWT. Without it, the mapping is public.
+                pub auth: Option<pub struct MappingAuth {
+                    /// The name of the verifier in `auth` that checks tokens.
+                    pub verifier: String,
+                    /// Backend path prefixes a token may read, with claims filled in, such as
+                    /// `/tenant/${sub}`. A request must be under one of them. Without any, a
+                    /// valid token may read anything the mapping serves.
+                    #[facet(default)]
+                    pub paths: Vec<String>,
+                    /// Whether responses are marked `Cache-Control: private`, so shared
+                    /// caches in front of hylla don't serve them to others.
+                    #[facet(default = true)]
+                    pub private: bool,
+                }>,
             }>,
         }>,
         // r[impl config.backends]
         /// Backends by name.
         pub backends: HashMap<String, Backend>,
+        // r[impl config.auth.verifiers]
+        /// JWT verifiers by name, used by mappings' `auth`.
+        #[facet(default)]
+        pub auth: HashMap<String, Verifier>,
         // r[impl config.cache]
         /// The object cache. Optional; defaults to a memory only cache.
         #[facet(default)]
@@ -196,6 +217,50 @@ pub enum Backend {
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
+}
+
+/// Checks JWTs: their signature against a public key, and their `exp` and `nbf` claims, and
+/// optionally their `iss` and `aud`.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Verifier {
+    /// The one algorithm tokens must be signed with.
+    pub algorithm: JwtAlgorithm,
+    /// The public key, PEM encoded.
+    pub public_key: String,
+    /// When set, tokens must have this `iss`.
+    pub issuer: Option<String>,
+    /// When set, tokens must have this `aud`.
+    pub audience: Option<String>,
+    /// How much clock skew `exp` and `nbf` allow, such as `30s`.
+    #[facet(default = Interval::from_secs(30))]
+    pub leeway: Interval,
+}
+
+// r[impl config.auth.algorithms]
+/// The asymmetric JWT signature algorithms. Shared secret (`HS*`) and `none` algorithms are
+/// deliberately missing.
+#[config]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JwtAlgorithm {
+    #[facet(rename = "RS256")]
+    Rs256,
+    #[facet(rename = "RS384")]
+    Rs384,
+    #[facet(rename = "RS512")]
+    Rs512,
+    #[facet(rename = "PS256")]
+    Ps256,
+    #[facet(rename = "PS384")]
+    Ps384,
+    #[facet(rename = "PS512")]
+    Ps512,
+    #[facet(rename = "ES256")]
+    Es256,
+    #[facet(rename = "ES384")]
+    Es384,
+    #[facet(rename = "EdDSA")]
+    EdDsa,
 }
 
 // r[impl config.refresh]

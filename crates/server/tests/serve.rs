@@ -29,6 +29,7 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)]) -> Mapping {
                 replace: (*replace).into(),
             })
             .collect(),
+        auth: None,
     }
 }
 
@@ -70,6 +71,7 @@ fn config_with_refresh(cache: Cache, refresh: Option<Refresh>) -> Config {
             },
         )]),
         cache,
+        auth: HashMap::new(),
     }
 }
 

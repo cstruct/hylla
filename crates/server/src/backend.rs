@@ -61,6 +61,7 @@ mod tests {
             servers: HashMap::new(),
             backends: HashMap::from([("b".into(), backend)]),
             cache: Default::default(),
+            auth: HashMap::new(),
         }
     }
 

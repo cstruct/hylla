@@ -9,12 +9,16 @@ pub struct Router {
 }
 
 /// Where to send a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Route<'a> {
     /// The name of the backend.
     pub backend: &'a str,
     /// The path to request from the backend.
     pub path: String,
+    /// The index of the mapping that matched, in the server's mappings.
+    pub mapping: usize,
+    /// The auth the mapping requires, if any.
+    pub auth: Option<&'a crate::MappingAuth>,
 }
 
 impl Router {
@@ -48,10 +52,11 @@ impl Router {
     // r[impl config.mappings.rewrites]
     /// Routes `path` with the first matching mapping, applying its rewrites in order.
     pub fn route(&self, path: &str) -> Option<Route<'_>> {
-        let (mapping, rewrites) = self
+        let (index, (mapping, rewrites)) = self
             .mappings
             .iter()
-            .find(|(mapping, _)| mapping.matches(path))?;
+            .enumerate()
+            .find(|(_, (mapping, _))| mapping.matches(path))?;
         let path = rewrites
             .iter()
             .fold(path.to_string(), |path, (regex, replace)| {
@@ -60,6 +65,8 @@ impl Router {
         Some(Route {
             backend: &mapping.backend,
             path,
+            mapping: index,
+            auth: mapping.auth.as_ref(),
         })
     }
 }
@@ -127,6 +134,7 @@ mod tests {
                     replace: (*replace).into(),
                 })
                 .collect(),
+            auth: None,
         }
     }
 
@@ -142,7 +150,7 @@ mod tests {
     fn route(router: &Router, path: &str) -> Option<(String, String)> {
         router
             .route(path)
-            .map(|Route { backend, path }| (backend.to_string(), path))
+            .map(|Route { backend, path, .. }| (backend.to_string(), path))
     }
 
     // r[verify config.mappings.priority]

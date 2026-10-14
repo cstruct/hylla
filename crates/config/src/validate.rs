@@ -33,6 +33,13 @@ pub enum ValidationError {
         rewrite: usize,
         reference: String,
     },
+    /// A mapping's auth refers to a verifier that isn't configured, or has an invalid path
+    /// template.
+    InvalidAuth {
+        server: String,
+        mapping: usize,
+        reason: String,
+    },
     /// A backend's refresh settings are invalid.
     InvalidRefresh {
         backend: String,
@@ -99,6 +106,14 @@ impl fmt::Display for ValidationError {
                 }
                 Ok(())
             }
+            Self::InvalidAuth {
+                server,
+                mapping,
+                reason,
+            } => write!(
+                f,
+                "auth of mapping {mapping} of server `{server}` is invalid: {reason}"
+            ),
             Self::InvalidRefresh {
                 backend,
                 rule: Some(rule),
@@ -162,6 +177,24 @@ impl Config {
                         mapping: index,
                         backend: mapping.backend.clone(),
                     });
+                }
+                // r[impl config.validate.auth]
+                if let Some(auth) = &mapping.auth {
+                    let mut error = |reason: String| {
+                        errors.push(ValidationError::InvalidAuth {
+                            server: name.clone(),
+                            mapping: index,
+                            reason,
+                        })
+                    };
+                    if !self.auth.contains_key(&auth.verifier) {
+                        error(format!("unknown verifier `{}`", auth.verifier));
+                    }
+                    for template in &auth.paths {
+                        if let Err(invalid) = crate::PathTemplate::parse(template) {
+                            error(invalid.to_string());
+                        }
+                    }
                 }
                 // r[impl config.validate.absolute-paths]
                 if !mapping.path_prefix.starts_with('/') {

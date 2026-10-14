@@ -20,8 +20,23 @@ servers:
         rewrites:             # regex replacements, applied in order
           - pattern: ^/assets/(.*)$
             replace: /$1      # /assets/app.css → /app.css on the backend
+      - path_prefix: /tenant
+        backend: assets
+        auth:                 # optional: require a JWT
+          verifier: partners
+          paths: ['/tenant/${sub}']   # optional: backend prefixes with claims filled in
+          private: true       # Cache-Control: private (default)
       - path_prefix: /
         backend: assets
+auth:                         # JWT verifiers, by name
+  partners:
+    algorithm: ES256          # RS256..512, PS256..512, ES256, ES384 or EdDSA
+    public_key: |
+      -----BEGIN PUBLIC KEY-----
+      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
+      -----END PUBLIC KEY-----
+    audience: hylla           # optional; required in tokens when set (so is issuer)
+    leeway: 30s               # clock skew allowed for exp and nbf
 backends:
   assets:
     type: s3                  # s3 (swift and azure_blob are configurable but not served yet)

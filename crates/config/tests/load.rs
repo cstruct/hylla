@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 
 use hylla_config::{
-    Backend, ConfigError, ConfigFiles, DiskCache, Interval, Mapping, Origin, RefreshMode,
-    RefreshRule, Rewrite, Route, Router, ValidationError, WritePolicy, load_with_env,
+    Backend, ConfigError, ConfigFiles, DiskCache, Interval, JwtAlgorithm, Mapping, MappingAuth,
+    Origin, RefreshMode, RefreshRule, Rewrite, Route, Router, ValidationError, WritePolicy,
+    load_with_env,
 };
 use ordna_core::{ConfigLoadError, ConfigPath, ConfigValueSource};
 use source_env::EnvSource;
@@ -126,11 +127,13 @@ fn loads_servers_and_backends() {
                     pattern: "^/assets/(.*)$".into(),
                     replace: "/$1".into(),
                 }],
+                auth: None,
             },
             Mapping {
                 path_prefix: "/".into(),
                 backend: "archive".into(),
                 rewrites: Vec::new(),
+                auth: None,
             },
         ]
     );
@@ -140,6 +143,8 @@ fn loads_servers_and_backends() {
         Some(Route {
             backend: "assets",
             path: "/app.css".into(),
+            mapping: 0,
+            auth: None,
         })
     );
 
@@ -503,4 +508,120 @@ backends:
              `max_mib`, so it can't fill the cache with objects nobody reads",
         ]
     );
+}
+
+const AUTH: &str = "\
+auth:
+  partners:
+    algorithm: ES256
+    public_key: |
+      -----BEGIN PUBLIC KEY-----
+      key
+      -----END PUBLIC KEY-----
+    audience: hylla
+  internal:
+    algorithm: EdDSA
+    public_key: key
+    leeway: 1m
+servers:
+  public:
+    listen: 0.0.0.0:8080
+    server_names: [cache.example.com]
+    mappings:
+      - path_prefix: /tenant
+        backend: assets
+        auth:
+          verifier: partners
+          paths: ['/tenant/${sub}', /shared]
+      - path_prefix: /reports
+        backend: assets
+        auth:
+          verifier: internal
+          private: false
+      - path_prefix: /
+        backend: assets
+backends:
+  assets:
+    type: s3
+    bucket: assets
+    region: eu-north-1
+";
+
+// r[verify config.auth.verifiers]
+// r[verify config.auth.algorithms]
+// r[verify config.auth.mappings]
+// r[verify config.auth.paths]
+#[test]
+fn mappings_configure_auth() {
+    let files = Files::new(
+        "auth",
+        AUTH,
+        "backends: {assets: {access_key_id: a, secret_access_key: b}}",
+    );
+    let config = files.load(&[]).unwrap().into_config();
+
+    let partners = &config.auth["partners"];
+    assert_eq!(partners.algorithm, JwtAlgorithm::Es256);
+    assert!(
+        partners
+            .public_key
+            .starts_with("-----BEGIN PUBLIC KEY-----\nkey\n")
+    );
+    assert_eq!(partners.audience.as_deref(), Some("hylla"));
+    assert_eq!(partners.issuer, None);
+    assert_eq!(partners.leeway, Interval::from_secs(30));
+    let internal = &config.auth["internal"];
+    assert_eq!(internal.algorithm, JwtAlgorithm::EdDsa);
+    assert_eq!(internal.leeway, Interval::from_secs(60));
+
+    let mappings = &config.servers["public"].mappings;
+    assert_eq!(
+        mappings[0].auth,
+        Some(MappingAuth {
+            verifier: "partners".into(),
+            paths: vec!["/tenant/${sub}".into(), "/shared".into()],
+            private: true,
+        })
+    );
+    assert_eq!(
+        mappings[1].auth,
+        Some(MappingAuth {
+            verifier: "internal".into(),
+            paths: Vec::new(),
+            private: false,
+        })
+    );
+    assert_eq!(mappings[2].auth, None);
+
+    // Algorithms are the asymmetric JWT ones only.
+    let hmac = AUTH.replace("algorithm: ES256", "algorithm: HS256");
+    let files = Files::new("auth-hmac", &hmac, "{}");
+    assert!(matches!(
+        files.load(&[]),
+        Err(ConfigError::Load(ConfigLoadError::Violations(_)))
+    ));
+}
+
+// r[verify config.validate.auth]
+#[test]
+fn mapping_auth_is_validated() {
+    let config = AUTH
+        .replace("verifier: internal", "verifier: missing")
+        .replace(
+            "paths: ['/tenant/${sub}', /shared]",
+            "paths: ['tenant/${sub}', '/${a b}']",
+        );
+    let files = Files::new(
+        "auth-invalid",
+        &config,
+        "backends: {assets: {access_key_id: a, secret_access_key: b}}",
+    );
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(errors.len(), 3, "{errors:#?}");
+    assert!(errors[0].contains("mapping 0") && errors[0].contains("must start with `/`"));
+    assert!(errors[1].contains("mapping 0") && errors[1].contains("claim names may only contain"));
+    assert!(errors[2].contains("mapping 1") && errors[2].contains("unknown verifier `missing`"));
 }

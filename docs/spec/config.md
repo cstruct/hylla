@@ -154,3 +154,26 @@ An optional `disk` section MUST enable the disk tier, stored in `path` with a ca
 r[config.validate.cache]
 A chunk size or memory capacity of zero, a chunk size not smaller than the disk block
 size, and a disk capacity of fewer than 4 blocks MUST be reported as invalid.
+
+## Auth
+
+r[config.auth.verifiers]
+JWT verifiers MUST be configured in an optional top-level `auth` map from names to
+verifiers, each with an `algorithm`, a PEM `public_key`, an optional `issuer` and
+`audience`, and a `leeway` defaulting to `30s`.
+
+r[config.auth.algorithms]
+A verifier's `algorithm` MUST be one of `RS256`, `RS384`, `RS512`, `PS256`, `PS384`,
+`PS512`, `ES256`, `ES384` or `EdDSA`.
+
+r[config.auth.mappings]
+A mapping MAY have an `auth` section naming its `verifier`, with optional `paths` and a
+`private` flag defaulting to true.
+
+r[config.auth.paths]
+`paths` MUST be backend path prefixes starting with `/`, in which `${claim}` is replaced by
+a token's claim and `$$` is a literal `$`, such as `/tenant/${sub}`.
+
+r[config.validate.auth]
+A mapping's auth naming a verifier that isn't configured, or with a path template that
+doesn't parse, MUST be reported as invalid.
