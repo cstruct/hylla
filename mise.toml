@@ -1,5 +1,8 @@
-# Tools for the end-to-end tests, see `mise run e2e`.
 [tools]
+# The Rust toolchain, installed through rustup.
+rust = { version = "1.99.0", components = "rustfmt,clippy" }
+
+# Tools for the end-to-end tests, see `mise run e2e`.
 # An S3 compatible gateway serving a local directory, from its GitHub releases.
 "github:versity/versitygw" = "1.9.0"
 # A local Azure Blob Storage emulator. It publishes no binaries on GitHub, only an npm
