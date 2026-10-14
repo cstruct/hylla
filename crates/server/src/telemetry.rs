@@ -6,13 +6,16 @@ use std::{
 };
 
 use anyhow::{Context, ensure};
-use hylla_config::{Otlp, OtlpProtocol};
+use hylla_config::{LogFormat, Otlp, OtlpProtocol};
 use opentelemetry::{KeyValue, global, trace::TracerProvider};
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{
-    MetricExporter, Protocol, SpanExporter, WithExportConfig, WithHttpConfig, WithTonicConfig,
+    LogExporter, MetricExporter, Protocol, SpanExporter, WithExportConfig, WithHttpConfig,
+    WithTonicConfig,
 };
 use opentelemetry_sdk::{
     Resource,
+    logs::SdkLoggerProvider,
     metrics::{PeriodicReader, SdkMeterProvider},
     propagation::TraceContextPropagator,
     trace::{Sampler, SdkTracerProvider},
@@ -25,6 +28,7 @@ use tracing_subscriber::{
 pub struct Telemetry {
     meter_provider: Option<SdkMeterProvider>,
     tracer_provider: Option<SdkTracerProvider>,
+    logger_provider: Option<SdkLoggerProvider>,
 }
 
 /// Whether spans record request and object paths.
@@ -36,7 +40,7 @@ pub(crate) fn record_paths() -> bool {
 
 // r[impl telemetry.init]
 /// Sets up exporting telemetry as configured, installing the global providers and the
-/// tracing subscriber, which logs to stderr filtered by `RUST_LOG`.
+/// tracing subscriber, which logs to stderr.
 ///
 /// Must run within a Tokio runtime, which gRPC exporters need, and before the app is built,
 /// so its instruments use the installed meter provider.
@@ -78,7 +82,7 @@ pub fn init(config: &hylla_config::Telemetry) -> anyhow::Result<Telemetry> {
         let exporter = span_exporter(&config.otlp, config.traces.endpoint.as_deref())
             .context("creating the OTLP span exporter")?;
         let provider = SdkTracerProvider::builder()
-            .with_resource(resource)
+            .with_resource(resource.clone())
             .with_sampler(sampler(ratio))
             .with_batch_exporter(exporter)
             .build();
@@ -91,8 +95,48 @@ pub fn init(config: &hylla_config::Telemetry) -> anyhow::Result<Telemetry> {
         None
     };
 
-    let logs = tracing_subscriber::fmt::layer()
-        .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")));
+    // r[impl telemetry.logs]
+    let level = std::env::var("RUST_LOG").unwrap_or_else(|_| config.logs.level.clone());
+    let filter = || {
+        EnvFilter::builder()
+            .parse(&level)
+            .with_context(|| format!("invalid log level `{level}`"))
+    };
+    let logs = match config.logs.format {
+        LogFormat::Text => tracing_subscriber::fmt::layer().boxed(),
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .event_format(crate::logs::Json)
+            .boxed(),
+    }
+    .with_filter(filter()?);
+
+    // r[impl telemetry.logs.export]
+    let logger_provider = if config.logs.export {
+        let exporter = log_exporter(&config.otlp, config.logs.endpoint.as_deref())
+            .context("creating the OTLP log exporter")?;
+        Some(
+            SdkLoggerProvider::builder()
+                .with_resource(resource)
+                .with_batch_exporter(exporter)
+                .build(),
+        )
+    } else {
+        None
+    };
+    // What the exporters log is kept out of the export, which would otherwise feed itself.
+    let exported_logs = match &logger_provider {
+        Some(provider) => Some(
+            OpenTelemetryTracingBridge::new(provider).with_filter(
+                filter()?
+                    .add_directive("opentelemetry=off".parse()?)
+                    .add_directive("hyper=off".parse()?)
+                    .add_directive("h2=off".parse()?)
+                    .add_directive("tonic=off".parse()?)
+                    .add_directive("reqwest=off".parse()?),
+            ),
+        ),
+        None => None,
+    };
     // Spans are filtered on their own, so a quieter log level doesn't lose them.
     let spans = tracer_provider.as_ref().map(|provider| {
         tracing_opentelemetry::layer()
@@ -106,12 +150,14 @@ pub fn init(config: &hylla_config::Telemetry) -> anyhow::Result<Telemetry> {
     tracing_subscriber::registry()
         .with(logs)
         .with(spans)
+        .with(exported_logs)
         .try_init()
         .context("installing the tracing subscriber")?;
 
     Ok(Telemetry {
         meter_provider,
         tracer_provider,
+        logger_provider,
     })
 }
 
@@ -125,6 +171,11 @@ fn sampler(ratio: f64) -> Sampler {
 impl Telemetry {
     /// Exports what's pending now.
     pub fn flush(&self) {
+        if let Some(provider) = &self.logger_provider
+            && let Err(error) = provider.force_flush()
+        {
+            tracing::warn!("flushing logs failed: {error}");
+        }
         if let Some(provider) = &self.tracer_provider
             && let Err(error) = provider.force_flush()
         {
@@ -139,6 +190,11 @@ impl Telemetry {
 
     /// Exports what's pending and stops exporting.
     pub fn shutdown(&self) {
+        if let Some(provider) = &self.logger_provider
+            && let Err(error) = provider.shutdown()
+        {
+            tracing::warn!("shutting down logs failed: {error}");
+        }
         if let Some(provider) = &self.tracer_provider
             && let Err(error) = provider.shutdown()
         {
@@ -184,6 +240,18 @@ fn span_exporter(otlp: &Otlp, signal_endpoint: Option<&str>) -> anyhow::Result<S
         }
         OtlpProtocol::Grpc => {
             over_grpc(SpanExporter::builder().with_tonic(), otlp, endpoint)?.build()?
+        }
+    })
+}
+
+fn log_exporter(otlp: &Otlp, signal_endpoint: Option<&str>) -> anyhow::Result<LogExporter> {
+    let endpoint = endpoint(otlp, signal_endpoint, "/v1/logs");
+    Ok(match otlp.protocol {
+        OtlpProtocol::HttpProtobuf => {
+            over_http(LogExporter::builder().with_http(), otlp, endpoint).build()?
+        }
+        OtlpProtocol::Grpc => {
+            over_grpc(LogExporter::builder().with_tonic(), otlp, endpoint)?.build()?
         }
     })
 }

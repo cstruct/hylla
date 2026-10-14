@@ -19,12 +19,14 @@ foyer = "0.22.6"
 futures = "0.3.34"
 http = "1.5.0"
 mixtrics = { version = "0.2.6", features = ["opentelemetry_0_33"] }
-opentelemetry = { version = "0.33.1", features = ["metrics", "trace"] }
-opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "grpc-tonic", "metrics", "trace"] }
-opentelemetry_sdk = { version = "0.33.1", features = ["metrics", "trace"] }
+opentelemetry = { version = "0.33.1", features = ["logs", "metrics", "trace"] }
+opentelemetry-appender-tracing = "0.33.1"
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "grpc-tonic", "logs", "metrics", "trace"] }
+opentelemetry_sdk = { version = "0.33.1", features = ["logs", "metrics", "trace"] }
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 serde_json = "1.0.154"
 httpdate = "1.0.3"
+humantime = "2.4.0"
 object_store = { version = "0.14.2", features = ["aws", "azure"] }
 percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", default-features = false }
@@ -36,7 +38,7 @@ tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
-opentelemetry-proto = { version = "0.33.1", features = ["gen-tonic-messages", "metrics", "trace"] }
+opentelemetry-proto = { version = "0.33.1", features = ["gen-tonic-messages", "logs", "metrics", "trace"] }
 prost = "0.14.4"
 base64 = "0.23.1"
 async-trait = "0.1.92"

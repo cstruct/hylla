@@ -10,6 +10,7 @@ mod auth;
 pub mod backend;
 mod cache;
 mod cluster;
+mod logs;
 mod metrics;
 mod range;
 mod refresh;

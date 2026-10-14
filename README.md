@@ -47,6 +47,11 @@ telemetry:                    # optional: export over OTLP
     endpoint: http://quickwit:7280/api/v1/otlp/v1/traces   # optional, per signal
     sample_ratio: 0.1   # callers' sampled traces are always continued
     record_paths: false   # paths can be sensitive
+  logs:
+    level: info   # or RUST_LOG
+    format: json   # or text; JSON lines carry trace and span IDs
+    export: true   # over OTLP too
+    endpoint: http://quickwit:7280/api/v1/otlp/v1/logs   # optional, per signal
 cluster:                      # optional: share with other hylla nodes
   listen: 0.0.0.0:7946        # private network only: gossip and data between nodes
   advertise: 10.0.0.5:7946    # how the others reach this node

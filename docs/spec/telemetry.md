@@ -73,3 +73,17 @@ r[telemetry.traces.cluster]
 Sharing updates with other nodes, receiving them, pulling preloaded objects and serving
 chunks to other nodes MUST be spans of one trace, carried between nodes in `traceparent`
 headers. Gossip MUST NOT be traced.
+
+## Logs
+
+r[telemetry.logs]
+Logs MUST be written to stderr, filtered by the configured level, or by `RUST_LOG` when set,
+and an invalid level MUST be refused.
+
+r[telemetry.logs.json]
+In the JSON format, every event MUST be one JSON object on a line of its own, with its time,
+level, target, message and fields, the spans it's in, and the trace and span IDs when traced.
+
+r[telemetry.logs.export]
+When exported, logs MUST be sent over OTLP in batches with the trace context of the span they
+were logged in, filtered by the same level, leaving out what the exporters themselves log.
