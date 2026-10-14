@@ -3,6 +3,9 @@
 A caching layer in front of object storage (S3, Swift and Azure Blob Storage), with a
 hybrid RAM and disk cache. Configured with [ordna](../ordna).
 
+> **Note on LLM use:** large parts of this project were written with an LLM, under human
+> direction. The design and review are human.
+
 ## Configuration
 
 Servers accept requests and route them to backends by path prefix; the first matching
