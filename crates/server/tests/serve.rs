@@ -772,3 +772,88 @@ async fn scheduled_rules_run_at_startup() {
     store.fail(true);
     assert_eq!(get(&app, "/assets/app.css").await.body, content());
 }
+
+/// A cache whose metadata expires after a second and is then served for a minute while it
+/// is revalidated in the background.
+fn revalidating_cache() -> Cache {
+    Cache {
+        stale_while_revalidate: Interval::from_secs(60),
+        stale_if_error: Interval::from_secs(0),
+        ..small_cache(1)
+    }
+}
+
+async fn wait_for(mut condition: impl AsyncFnMut() -> bool) {
+    for _ in 0..100 {
+        if condition().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out");
+}
+
+// r[verify cache.stale-while-revalidate]
+// r[verify config.cache.stale-while-revalidate]
+#[tokio::test]
+async fn expired_hits_are_served_while_revalidating_in_the_background() {
+    let (memory, store) = flaky_store().await;
+    let app = flaky_app(revalidating_cache(), store).await;
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    put(&memory, "app.css", b"body { color: red }".to_vec()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // Past the TTL, the cached version is served at once, and a revalidation starts...
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    // ...which soon finds the new version.
+    wait_for(async || get(&app, "/assets/app.css").await.body == b"body { color: red }").await;
+}
+
+// r[verify cache.revalidation-debounce]
+#[tokio::test]
+async fn concurrent_hits_share_one_revalidation() {
+    let (_, store) = flaky_store().await;
+    let app = flaky_app(revalidating_cache(), store.clone()).await;
+    assert_eq!(get(&app, "/assets/app.css").await.status, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let requests = store.requests();
+    let responses = futures::future::join_all((0..20).map(|_| get(&app, "/assets/app.css"))).await;
+    assert!(responses.iter().all(|response| response.body == content()));
+    wait_for(async || store.requests() > requests).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        store.requests(),
+        requests + 1,
+        "one metadata request for all hits"
+    );
+
+    // The revalidated metadata is fresh again, so further hits need no requests.
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    assert_eq!(store.requests(), requests + 1);
+}
+
+// r[verify cache.revalidation-debounce]
+#[tokio::test]
+async fn failed_revalidations_back_off() {
+    let (_, store) = flaky_store().await;
+    let app = flaky_app(revalidating_cache(), store.clone()).await;
+    assert_eq!(get(&app, "/assets/app.css").await.status, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    store.fail(true);
+
+    let requests = store.requests();
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    wait_for(async || store.requests() > requests).await;
+    // Within the back-off, hits are served without retrying.
+    for _ in 0..5 {
+        assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(store.requests(), requests + 1);
+
+    // After it, the next hit retries.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    wait_for(async || store.requests() > requests + 1).await;
+}

@@ -25,7 +25,7 @@ use crate::{
 
 /// The shared state of all listeners.
 pub struct App {
-    cache: ObjectCache,
+    cache: Arc<ObjectCache>,
     stores: Stores,
     /// The refresh settings of the backends that have any, by backend name.
     refresh: BTreeMap<String, Refresh>,
@@ -67,7 +67,7 @@ impl App {
             .filter_map(|(name, backend)| Some((name.clone(), backend.refresh()?.clone())))
             .collect();
         Ok(Arc::new(Self {
-            cache: ObjectCache::new(&config.cache).await?,
+            cache: Arc::new(ObjectCache::new(&config.cache).await?),
             stores,
             refresh,
             listeners,
@@ -196,7 +196,7 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
 
     let meta = match app
         .cache
-        .metadata(route.backend, store.as_ref(), &path)
+        .metadata(route.backend, store.clone(), &path)
         .await
     {
         Ok(meta) => meta,

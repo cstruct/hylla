@@ -48,6 +48,15 @@ Object metadata (size, ETag, last modified and content type) MUST be cached with
 chunks, in memory and on disk when there is a disk tier, so it survives restarts. Metadata
 older than the configured TTL MUST be fetched again.
 
+r[cache.stale-while-revalidate]
+Metadata past its TTL but within the configured stale-while-revalidate window MUST be used
+without waiting on the backend, while it is revalidated in the background.
+
+r[cache.revalidation-debounce]
+An object MUST have at most one background revalidation running, shared by all requests
+for it. After a background revalidation fails, the object MUST NOT be revalidated in the
+background again until a back-off of the metadata TTL, at least a second, has passed.
+
 r[cache.stale-if-error]
 When metadata past its TTL can't be fetched again because the backend fails, the cached
 metadata MUST still be used if it is younger than the TTL plus the configured

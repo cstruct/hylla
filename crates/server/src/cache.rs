@@ -1,9 +1,10 @@
 use std::{
+    collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -168,7 +169,17 @@ pub struct ObjectCache {
     entries: HybridCache<CacheKey, Bytes>,
     chunk_size: u64,
     metadata_ttl: Duration,
+    stale_while_revalidate: Duration,
     stale_if_error: Duration,
+    /// The background revalidations of objects, by backend and key.
+    revalidations: Mutex<HashMap<(String, String), Revalidation>>,
+}
+
+/// The state of an object's background revalidation.
+enum Revalidation {
+    Running,
+    /// Failed at this time; not retried until the back-off passed.
+    Failed(Instant),
 }
 
 /// How an object listed by the backend compares to the cache.
@@ -216,7 +227,9 @@ impl ObjectCache {
             entries: builder.build().await?,
             chunk_size: config.chunk_size(),
             metadata_ttl: config.metadata_ttl.duration(),
+            stale_while_revalidate: config.stale_while_revalidate.duration(),
             stale_if_error: config.stale_if_error.duration(),
+            revalidations: Mutex::default(),
         })
     }
 
@@ -229,23 +242,29 @@ impl ObjectCache {
     // r[impl cache.not-found]
     /// The metadata of an object.
     ///
-    /// Cached metadata younger than the TTL is used as is. Older metadata is refreshed from
-    /// the backend; if the backend fails, metadata within the stale-if-error window is used
-    /// anyway, so cached objects stay available during outages. A missing object is
-    /// forgotten.
+    /// Cached metadata younger than the TTL is used as is. Metadata within the
+    /// stale-while-revalidate window past it is used too, while it is revalidated in the
+    /// background. Older metadata is refreshed from the backend before it is used; if the
+    /// backend fails, metadata within the stale-if-error window is used anyway, so cached
+    /// objects stay available during outages. A missing object is forgotten.
     pub async fn metadata(
-        &self,
+        self: &Arc<Self>,
         backend: &str,
-        store: &dyn ObjectStore,
+        store: Arc<dyn ObjectStore>,
         path: &ObjectPath,
     ) -> Result<ObjectMeta, ReadError> {
         let cached = self.cached_metadata(backend, path).await;
-        if let Some(cached) = &cached
-            && cached.age() < self.metadata_ttl
-        {
-            return Ok(cached.meta.clone());
+        if let Some(cached) = &cached {
+            if cached.age() < self.metadata_ttl {
+                return Ok(cached.meta.clone());
+            }
+            // r[impl cache.stale-while-revalidate]
+            if cached.age() < self.metadata_ttl + self.stale_while_revalidate {
+                self.revalidate_in_background(backend, store, path);
+                return Ok(cached.meta.clone());
+            }
         }
-        match self.fetch_metadata(backend, store, path).await {
+        match self.fetch_metadata(backend, store.as_ref(), path).await {
             Err(ReadError::Backend(error)) => match cached {
                 Some(cached) if cached.age() < self.metadata_ttl + self.stale_if_error => {
                     tracing::warn!(
@@ -260,6 +279,44 @@ impl ObjectCache {
             },
             result => result,
         }
+    }
+
+    // r[impl cache.revalidation-debounce]
+    /// Revalidates an object's metadata in a background task, unless a revalidation of it is
+    /// already running, or failed within the back-off (the metadata TTL, at least a second).
+    fn revalidate_in_background(
+        self: &Arc<Self>,
+        backend: &str,
+        store: Arc<dyn ObjectStore>,
+        path: &ObjectPath,
+    ) {
+        let key = (backend.to_string(), path.to_string());
+        let backoff = self.metadata_ttl.max(Duration::from_secs(1));
+        {
+            let mut revalidations = self.revalidations.lock().expect("not poisoned");
+            match revalidations.get(&key) {
+                Some(Revalidation::Running) => return,
+                Some(Revalidation::Failed(at)) if at.elapsed() < backoff => return,
+                _ => {}
+            }
+            revalidations.insert(key.clone(), Revalidation::Running);
+        }
+        let cache = self.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            let (backend, _) = &key;
+            let result = cache.fetch_metadata(backend, store.as_ref(), &path).await;
+            let mut revalidations = cache.revalidations.lock().expect("not poisoned");
+            match result {
+                Ok(_) | Err(ReadError::NotFound) => {
+                    revalidations.remove(&key);
+                }
+                Err(ReadError::Backend(error)) => {
+                    tracing::warn!(backend, %path, "background revalidation failed: {error:#}");
+                    revalidations.insert(key.clone(), Revalidation::Failed(Instant::now()));
+                }
+            }
+        });
     }
 
     fn meta_key(backend: &str, path: &ObjectPath) -> CacheKey {
