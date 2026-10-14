@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use hylla_config::{Backend, Config};
 use object_store::{ObjectStore, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder};
 
@@ -10,7 +10,7 @@ pub type Stores = HashMap<String, Arc<dyn ObjectStore>>;
 // r[impl backend.s3]
 /// Creates an object store for every configured backend.
 ///
-/// S3 and Azure Blob Storage backends are supported; Swift backends fail with an error.
+/// S3 and Azure Blob Storage backends are supported.
 pub fn stores(config: &Config) -> anyhow::Result<Stores> {
     config
         .backends
@@ -67,7 +67,6 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
             }
             Ok(Arc::new(builder.build()?))
         }
-        Backend::Swift { .. } => bail!("swift backends are not supported yet"),
     }
 }
 
@@ -110,7 +109,7 @@ mod tests {
 
     // r[verify backend.s3]
     #[test]
-    fn creates_s3_stores_and_rejects_unsupported_types() {
+    fn creates_s3_stores() {
         let s3 = config(Backend::S3 {
             bucket: "assets".into(),
             region: "eu-north-1".into(),
@@ -121,19 +120,5 @@ mod tests {
         });
         let stores = super::stores(&s3).unwrap();
         assert!(stores["b"].to_string().contains("assets"));
-
-        let swift = config(Backend::Swift {
-            auth_url: "https://swift.example.com".into(),
-            container: "c".into(),
-            region: None,
-            username: "u".into(),
-            password: "p".into(),
-            refresh: None,
-        });
-        let error = super::stores(&swift).err().unwrap();
-        assert_eq!(
-            format!("{error:#}"),
-            "backend `b`: swift backends are not supported yet"
-        );
     }
 }

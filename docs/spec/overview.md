@@ -10,9 +10,6 @@ This is the initial scope; requirements are refined as the design takes shape.
 r[backend.s3]
 hylla MUST support Amazon S3 compatible object storage as a backend.
 
-r[backend.swift]
-hylla MUST support OpenStack Swift as a backend.
-
 r[backend.azure-blob]
 hylla MUST support Azure Blob Storage as a backend.
 

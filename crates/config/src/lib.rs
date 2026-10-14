@@ -244,17 +244,6 @@ pub enum Backend {
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
-    /// OpenStack Swift.
-    Swift {
-        auth_url: String,
-        container: String,
-        region: Option<String>,
-        username: String,
-        #[config(secret)]
-        password: String,
-        /// Background refresh of cached objects.
-        refresh: Option<Refresh>,
-    },
     /// Azure Blob Storage.
     AzureBlob {
         account: String,
@@ -379,9 +368,7 @@ impl Backend {
     /// The backend's background refresh, if any.
     pub fn refresh(&self) -> Option<&Refresh> {
         match self {
-            Backend::S3 { refresh, .. }
-            | Backend::Swift { refresh, .. }
-            | Backend::AzureBlob { refresh, .. } => refresh.as_ref(),
+            Backend::S3 { refresh, .. } | Backend::AzureBlob { refresh, .. } => refresh.as_ref(),
         }
     }
 }

@@ -92,7 +92,7 @@ r[config.backends]
 Backends MUST be configured as a map from backend names to backends.
 
 r[config.backends.types]
-A backend MUST be one of `s3`, `swift` or `azure_blob`, selected by its `type` field, with
+A backend MUST be one of `s3` or `azure_blob`, selected by its `type` field, with
 the fields of that type.
 
 r[config.refresh]

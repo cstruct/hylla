@@ -33,10 +33,9 @@ backends:
     bucket: assets
     region: eu-north-1
   archive:
-    type: swift
-    auth_url: https://swift.example.com/v3
+    type: azure_blob
+    account: hyllaarchive
     container: archive
-    username: hylla
 ";
 
 const SECRETS: &str = "\
@@ -45,7 +44,7 @@ backends:
     access_key_id: AKIA123
     secret_access_key: s3cr3t
   archive:
-    password: hunter2
+    account_key: hunter2
 ";
 
 struct Files {
@@ -175,12 +174,11 @@ fn loads_servers_and_backends() {
     );
     assert_eq!(
         config.backends["archive"],
-        Backend::Swift {
-            auth_url: "https://swift.example.com/v3".into(),
+        Backend::AzureBlob {
+            account: "hyllaarchive".into(),
             container: "archive".into(),
-            region: None,
-            username: "hylla".into(),
-            password: "hunter2".into(),
+            endpoint: None,
+            account_key: "hunter2".into(),
             refresh: None,
         }
     );
@@ -189,7 +187,7 @@ fn loads_servers_and_backends() {
 // r[verify config.backends.secrets]
 #[test]
 fn backend_credentials_are_secret() {
-    let config = format!("{CONFIG}    password: leaked\n");
+    let config = format!("{CONFIG}    account_key: leaked\n");
     let files = Files::new("secrets", &config, SECRETS);
     let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) =
         files.load(&[("HYLLA__BACKENDS__ASSETS__SECRET_ACCESS_KEY", "leaked")])
@@ -205,7 +203,7 @@ fn backend_credentials_are_secret() {
     assert_eq!(
         paths,
         vec![
-            "backends.archive.password",
+            "backends.archive.account_key",
             "backends.assets.secret_access_key"
         ]
     );

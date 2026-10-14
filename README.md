@@ -1,6 +1,6 @@
 # hylla
 
-A caching layer in front of object storage (S3, Swift and Azure Blob Storage), with a
+A caching layer in front of object storage (S3 and Azure Blob Storage), with a
 hybrid RAM and disk cache. Configured with [ordna](../ordna).
 
 > **Note on LLM use:** large parts of this project were written with an LLM, under human
@@ -49,7 +49,7 @@ auth:                         # JWT verifiers, by name
     leeway: 30s               # clock skew allowed for exp and nbf
 backends:
   assets:
-    type: s3                  # s3 or azure_blob (swift is configurable but not served yet)
+    type: s3                  # s3 or azure_blob
     bucket: assets
     region: eu-north-1
     endpoint: http://localhost:9000   # optional, for S3 compatible stores
