@@ -111,6 +111,10 @@ r[config.cache.chunks]
 r[config.cache.metadata-ttl]
 `metadata_ttl_seconds` MUST set how long object metadata is cached, defaulting to 30.
 
+r[config.cache.stale-if-error]
+`stale_if_error_seconds` MUST set how long past its TTL cached metadata may still be used
+when the backend fails, defaulting to 86400 (a day). `0` MUST disable it.
+
 r[config.cache.write-policy]
 `write_policy` MUST select when chunks are written to disk: `on_eviction` from memory, the
 default, or `on_insertion`.

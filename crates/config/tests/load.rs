@@ -305,6 +305,7 @@ fn unknown_group_errors_suggest_braces() {
 // r[verify config.cache]
 // r[verify config.cache.chunks]
 // r[verify config.cache.metadata-ttl]
+// r[verify config.cache.stale-if-error]
 // r[verify config.cache.write-policy]
 // r[verify config.cache.memory]
 // r[verify config.cache.disk]
@@ -315,6 +316,7 @@ fn cache_settings_default_when_left_out() {
     assert_eq!(cache, hylla_config::Cache::default());
     assert_eq!(cache.chunk_size(), 1024 * 1024);
     assert_eq!(cache.metadata_ttl().as_secs(), 30);
+    assert_eq!(cache.stale_if_error().as_secs(), 86400);
     assert_eq!(cache.write_policy, WritePolicy::OnEviction);
     assert_eq!(cache.memory.capacity_mib, 256);
     assert_eq!(cache.disk, None);

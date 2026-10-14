@@ -80,6 +80,12 @@ config_tree! {
             /// How long object metadata (size, ETag, content type) is cached, in seconds.
             #[facet(default = 30)]
             pub metadata_ttl_seconds: u64,
+            // r[impl config.cache.stale-if-error]
+            /// How long past its TTL cached metadata may still be used when the backend fails,
+            /// in seconds, so cached objects stay available during backend outages. `0`
+            /// disables serving stale objects.
+            #[facet(default = 86400)]
+            pub stale_if_error_seconds: u64,
             // r[impl config.cache.write-policy]
             /// When chunks are written to disk.
             #[facet(default)]
@@ -118,6 +124,7 @@ impl Default for Cache {
         Self {
             chunk_size_kib: 1024,
             metadata_ttl_seconds: 30,
+            stale_if_error_seconds: 86400,
             write_policy: WritePolicy::default(),
             memory: MemoryCache::default(),
             disk: None,
@@ -140,6 +147,11 @@ impl Cache {
     /// How long object metadata is cached.
     pub fn metadata_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.metadata_ttl_seconds)
+    }
+
+    /// How long past its TTL metadata may be used when the backend fails.
+    pub fn stale_if_error(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.stale_if_error_seconds)
     }
 }
 
