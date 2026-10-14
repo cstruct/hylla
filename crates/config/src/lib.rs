@@ -87,6 +87,59 @@ config_tree! {
         // r[impl config.backends]
         /// Backends by name.
         pub backends: HashMap<String, Backend>,
+        // r[impl config.telemetry]
+        /// Exporting telemetry over OTLP. Off unless enabled per signal.
+        #[facet(default)]
+        pub telemetry: pub struct Telemetry {
+            /// The `service.name` resource attribute.
+            #[facet(default = String::from("hylla"))]
+            pub service_name: String,
+            /// More resource attributes, such as `deployment.environment`. A list, since
+            /// attribute names contain dots, which map keys can't. `OTEL_RESOURCE_ATTRIBUTES`
+            /// is read as well.
+            #[facet(default)]
+            pub resource: Vec<pub struct ResourceAttribute {
+                pub key: String,
+                pub value: String,
+            }>,
+            // r[impl config.telemetry.otlp]
+            /// Where and how to export. Settings left out fall back to the standard
+            /// `OTEL_EXPORTER_OTLP_*` environment variables.
+            #[facet(default)]
+            pub otlp: pub struct Otlp {
+                /// The collector's base URL, such as `http://collector:4318`; over HTTP, the
+                /// signal's path, such as `/v1/metrics`, is appended.
+                pub endpoint: Option<String>,
+                #[facet(default)]
+                pub protocol: #[derive(Default)] #[facet(rename_all = "snake_case")] pub enum OtlpProtocol {
+                    /// Protobuf over HTTP, conventionally on port 4318.
+                    #[default]
+                    HttpProtobuf,
+                    /// gRPC, conventionally on port 4317.
+                    Grpc,
+                },
+                /// Headers sent with every export, such as an API key.
+                #[config(secret)]
+                #[facet(default)]
+                pub headers: HashMap<String, String>,
+                /// How long an export may take, such as `10s`.
+                #[facet(default = Interval::from_secs(10))]
+                pub timeout: Interval,
+            },
+            // r[impl config.telemetry.metrics]
+            /// Exporting metrics.
+            #[facet(default)]
+            pub metrics: pub struct MetricsExport {
+                #[facet(default)]
+                pub enabled: bool,
+                /// The full URL to export metrics to, overriding `otlp.endpoint`, such as
+                /// `http://prometheus:9090/api/v1/otlp/v1/metrics`.
+                pub endpoint: Option<String>,
+                /// How often metrics are exported, such as `30s`.
+                #[facet(default = Interval::from_secs(30))]
+                pub interval: Interval,
+            },
+        },
         // r[impl config.cluster]
         /// Other hylla nodes to share revalidations and preloads with. Optional.
         pub cluster: Option<pub struct Cluster {
@@ -198,6 +251,38 @@ impl Default for Cache {
             write_policy: WritePolicy::default(),
             memory: MemoryCache::default(),
             disk: None,
+        }
+    }
+}
+
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self {
+            service_name: "hylla".into(),
+            resource: Vec::new(),
+            otlp: Otlp::default(),
+            metrics: MetricsExport::default(),
+        }
+    }
+}
+
+impl Default for Otlp {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            protocol: OtlpProtocol::default(),
+            headers: HashMap::new(),
+            timeout: Interval::from_secs(10),
+        }
+    }
+}
+
+impl Default for MetricsExport {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            interval: Interval::from_secs(30),
         }
     }
 }

@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use hylla_config::{
     Backend, ConfigError, ConfigFiles, DiskCache, Interval, JwtAlgorithm, Mapping, MappingAuth,
-    Origin, RefreshMode, RefreshRule, Rewrite, Route, Router, ValidationError, WritePolicy,
-    load_with_env,
+    Origin, OtlpProtocol, RefreshMode, RefreshRule, Rewrite, Route, Router, ValidationError,
+    WritePolicy, load_with_env,
 };
 use ordna_core::{ConfigLoadError, ConfigPath, ConfigValueSource};
 use source_env::EnvSource;
@@ -698,5 +698,72 @@ cluster:
             "invalid cluster config: seed `:7946` must be `host:port`",
             "invalid cluster config: `failure_timeout` must be longer than `gossip_interval`",
         ]
+    );
+}
+
+const TELEMETRY: &str = "\
+servers: {}
+backends: {}
+telemetry:
+  resource:
+    - {key: deployment.environment, value: production}
+  otlp:
+    endpoint: http://collector:4318
+  metrics:
+    enabled: true
+    endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics
+    interval: 15s
+";
+
+// r[verify config.telemetry]
+// r[verify config.telemetry.otlp]
+// r[verify config.telemetry.metrics]
+#[test]
+fn telemetry_is_configured_with_secret_headers() {
+    let files = Files::new("telemetry-defaults", "servers: {}\nbackends: {}\n", "{}");
+    let telemetry = files.load(&[]).unwrap().into_config().telemetry;
+    assert_eq!(telemetry, hylla_config::Telemetry::default());
+    assert_eq!(telemetry.service_name, "hylla");
+    assert!(!telemetry.metrics.enabled);
+    assert_eq!(telemetry.otlp.protocol, OtlpProtocol::HttpProtobuf);
+
+    let secrets = "telemetry: {otlp: {headers: {authorization: Bearer token}}}";
+    let files = Files::new("telemetry", TELEMETRY, secrets);
+    let telemetry = files
+        .load(&[("HYLLA__TELEMETRY__OTLP__PROTOCOL", "grpc")])
+        .unwrap()
+        .into_config()
+        .telemetry;
+    assert_eq!(
+        telemetry.resource,
+        vec![hylla_config::ResourceAttribute {
+            key: "deployment.environment".into(),
+            value: "production".into(),
+        }]
+    );
+    assert_eq!(
+        telemetry.otlp.endpoint.as_deref(),
+        Some("http://collector:4318")
+    );
+    assert_eq!(telemetry.otlp.protocol, OtlpProtocol::Grpc);
+    assert_eq!(telemetry.otlp.headers["authorization"], "Bearer token");
+    assert_eq!(telemetry.otlp.timeout, Interval::from_secs(10));
+    assert!(telemetry.metrics.enabled);
+    assert_eq!(
+        telemetry.metrics.endpoint.as_deref(),
+        Some("http://prometheus:9090/api/v1/otlp/v1/metrics")
+    );
+    assert_eq!(telemetry.metrics.interval, Interval::from_secs(15));
+
+    // Headers are secret: the public file can't set them.
+    let public = format!("{TELEMETRY}  otlp:\n    headers: {{authorization: leaked}}\n")
+        .replace("  otlp:\n    endpoint: http://collector:4318\n", "");
+    let files = Files::new("telemetry-public-headers", &public, "{}");
+    let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) = files.load(&[]) else {
+        panic!("expected violations");
+    };
+    assert_eq!(
+        violations.layer_mismatches()[0].path.to_string(),
+        "telemetry.otlp.headers.authorization"
     );
 }

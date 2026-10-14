@@ -200,3 +200,18 @@ A `listen` address of `0.0.0.0` or `[::]` without an `advertise` address, an uns
 `advertise` address, a key shorter than 32 characters, seeds that aren't `host:port`, a zero
 gossip interval and a failure timeout not longer than the gossip interval MUST be reported
 as invalid.
+
+## Telemetry
+
+r[config.telemetry]
+An optional `telemetry` section MUST configure exporting telemetry: the `service_name`,
+defaulting to `hylla`, and further `resource` attributes as a list of `key` and `value`.
+
+r[config.telemetry.otlp]
+`otlp` MUST configure where and how to export: an optional base `endpoint`, the `protocol`,
+`http_protobuf` (the default) or `grpc`, secret `headers`, and a `timeout` defaulting to
+`10s`.
+
+r[config.telemetry.metrics]
+`metrics` MUST configure exporting metrics: whether it's `enabled` (off by default), an
+optional `endpoint` overriding the OTLP one, and the export `interval`, defaulting to `30s`.

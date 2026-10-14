@@ -96,6 +96,7 @@ async fn node(memory: &Arc<InMemory>, seeds: Vec<String>, key: &str) -> Node {
             ..Cache::default()
         },
         auth: HashMap::new(),
+        telemetry: Default::default(),
         cluster: Some(Cluster {
             listen: addr,
             advertise: None,
