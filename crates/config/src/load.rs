@@ -3,9 +3,9 @@ use std::{fmt, path::PathBuf};
 use ordna_core::{
     ConfigBuilder, ConfigLoadError, ConfigPath, LoadedConfig, SourceFieldPath, SourceRegistration,
 };
-use source_env::{EnvSource, EnvSourceError, EnvVarDetail};
-use source_file::{FileSourceError, FileValueDetail};
-use source_yaml::{DeserializeError, YamlSource, yaml_file};
+use ordna_source_env::{EnvSource, EnvSourceError, EnvVarDetail};
+use ordna_source_file::{FileSourceError, FileValueDetail};
+use ordna_source_yaml::{DeserializeError, YamlSource, yaml_file};
 
 use crate::{Config, ValidationError};
 

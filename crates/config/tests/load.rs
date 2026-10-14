@@ -6,7 +6,7 @@ use hylla_config::{
     WritePolicy, load_with_env,
 };
 use ordna_core::{ConfigLoadError, ConfigPath, ConfigValueSource};
-use source_env::EnvSource;
+use ordna_source_env::EnvSource;
 
 const CONFIG: &str = "\
 servers:
