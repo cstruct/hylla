@@ -30,15 +30,16 @@ use axum::{
 use futures::future::join_all;
 use hylla_config::ClusterShare;
 use object_store::path::Path as ObjectPath;
+use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
-
-use opentelemetry::KeyValue;
+use tracing::{Instrument, Span, field::Empty};
 
 use crate::{
     App,
     cache::{CacheEvent, ChunkKey, ObjectMeta, SharedMeta},
     metrics::METRICS,
+    spans,
 };
 
 use self::sign::Signer;
@@ -273,6 +274,7 @@ impl Cluster {
             .post(format!("http://{addr}{path}"))
             .header(sign::HEADER, signature)
             .header("content-type", "application/json")
+            .headers(spans::trace_headers())
             .timeout(self.failure_timeout)
             .body(body)
             .send()
@@ -301,6 +303,7 @@ impl Cluster {
             .client
             .get(format!("http://{addr}{path_and_query}"))
             .header(sign::HEADER, signature)
+            .headers(spans::trace_headers())
             .timeout(Duration::from_secs(30))
             .send()
             .await?;
@@ -351,14 +354,25 @@ impl Cluster {
             let peers = self.live_peers();
             // r[impl telemetry.metrics.cluster]
             record_updates("sent", &updates, peers.len() as u64);
+            // r[impl telemetry.traces.cluster]
+            let span = tracing::info_span!(
+                "cluster.share",
+                otel.kind = "producer",
+                otel.status_code = Empty,
+                hylla.fetched = updates.fetched.len(),
+                hylla.preloaded = updates.preloaded.len(),
+                hylla.peers = peers.len(),
+            );
             join_all(peers.into_iter().map(|(_, addr)| {
                 let body = body.clone();
                 async move {
                     if let Err(error) = self.post(addr, "/cluster/updates", body).await {
+                        spans::record_error(&Span::current());
                         tracing::warn!(%addr, "sharing updates failed: {error:#}");
                     }
                 }
             }))
+            .instrument(span)
             .await;
         }
     }
@@ -510,8 +524,33 @@ async fn gossip(
     ([("content-type", "application/json")], view).into_response()
 }
 
+/// A span of a request from another node, continuing its trace.
+fn peer_span(name: &'static str, headers: &HeaderMap) -> Span {
+    let span = tracing::info_span!(
+        "peer",
+        otel.name = name,
+        otel.kind = "server",
+        hylla.result = Empty,
+    );
+    spans::continue_trace(&span, headers);
+    span
+}
+
 async fn updates(
     State(app): State<Arc<App>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let span = peer_span("cluster.updates", &headers);
+    receive_updates(app, method, uri, headers, body)
+        .instrument(span)
+        .await
+}
+
+async fn receive_updates(
+    app: Arc<App>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -540,7 +579,15 @@ async fn updates(
             let app = app.clone();
             let cluster = cluster.clone();
             let origin = updates.origin;
-            tokio::spawn(async move { pull(&app, &cluster, origin, shared).await });
+            let span = tracing::info_span!(
+                "cluster.pull",
+                hylla.backend = shared.backend,
+                hylla.object = Empty,
+            );
+            spans::record_object(&span, &shared.key);
+            tokio::spawn(
+                async move { pull(&app, &cluster, origin, shared).await }.instrument(span),
+            );
         }
     }
     StatusCode::NO_CONTENT.into_response()
@@ -606,6 +653,13 @@ async fn chunk(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
+    let span = peer_span("cluster.chunk", &headers);
+    serve_chunk(app, method, uri, headers)
+        .instrument(span)
+        .await
+}
+
+async fn serve_chunk(app: Arc<App>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
     let cluster = match cluster_of(&app) {
         Ok(cluster) => cluster,
         Err(response) => return response,
@@ -624,7 +678,12 @@ async fn chunk(
         index: query.index,
     };
     // Only what's cached: other nodes fall back to the backend themselves.
-    match app.cache.cached_chunk(&key).await {
+    let cached = app.cache.cached_chunk(&key).await;
+    Span::current().record(
+        "hylla.result",
+        if cached.is_some() { "hit" } else { "miss" },
+    );
+    match cached {
         Some(bytes) => bytes.into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }

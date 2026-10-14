@@ -4,7 +4,6 @@ use anyhow::Context;
 use clap::Parser;
 use hylla_config::{ConfigFiles, load};
 use hylla_server::{App, backend, serve, telemetry};
-use tracing_subscriber::EnvFilter;
 
 /// A caching layer in front of object storage.
 #[derive(Parser)]
@@ -20,11 +19,6 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
     let args = Args::parse();
 
     let loaded = load(&ConfigFiles {
@@ -32,6 +26,7 @@ async fn main() -> anyhow::Result<()> {
         secrets: args.secrets,
     })?;
     let config = loaded.into_config();
+    // Logging is set up here too, as configured.
     let telemetry = telemetry::init(&config.telemetry).context("setting up telemetry")?;
     let stores = backend::stores(&config).context("creating backends")?;
     let app = App::new(&config, stores)

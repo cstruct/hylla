@@ -42,3 +42,34 @@ The objects refresh runs handle MUST be counted by backend, rule and outcome.
 r[telemetry.metrics.cluster]
 The live members of the cluster MUST be reported, and updates sent and received, chunks pulled
 from other nodes or backends, and failed gossip exchanges counted.
+
+## Traces
+
+r[telemetry.traces]
+When traces are enabled, spans MUST be exported over OTLP in batches, with the configured
+service name, resource attributes and headers, and logging MUST NOT filter them away.
+
+r[telemetry.traces.sampling]
+The configured share of traces hylla starts MUST be sampled, and traces continued from a
+caller MUST follow the caller's sampling decision.
+
+r[telemetry.traces.propagation]
+Requests MUST continue the trace their W3C `traceparent` header names, if any.
+
+r[telemetry.traces.requests]
+Every request MUST be a server span named by its method and mapping, recording its status
+code, server and mapping, failed when it answers with a server error, and lasting until its
+body is sent.
+
+r[telemetry.traces.spans]
+Metadata and chunk lookups, background revalidations and refresh runs MUST be spans, and so
+MUST every backend request, as a client span recording its outcome and failed when the
+backend fails.
+
+r[telemetry.traces.paths]
+Request and object paths MUST only be recorded in spans when configured to.
+
+r[telemetry.traces.cluster]
+Sharing updates with other nodes, receiving them, pulling preloaded objects and serving
+chunks to other nodes MUST be spans of one trace, carried between nodes in `traceparent`
+headers. Gossip MUST NOT be traced.

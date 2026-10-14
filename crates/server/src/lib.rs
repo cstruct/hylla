@@ -13,6 +13,7 @@ mod cluster;
 mod metrics;
 mod range;
 mod refresh;
+mod spans;
 pub mod telemetry;
 
 pub use app::App;

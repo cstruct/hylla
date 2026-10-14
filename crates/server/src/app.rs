@@ -15,6 +15,7 @@ use percent_encoding::percent_decode_str;
 use anyhow::Context;
 use hylla_config::Refresh;
 use opentelemetry::KeyValue;
+use tracing::{Instrument, field::Empty};
 
 use crate::auth::{self, CompiledAuth, Verifiers};
 
@@ -26,7 +27,7 @@ use crate::{
     cluster::{self, Cluster},
     metrics::{self, METRICS},
     range::{self, RequestedRange},
-    refresh,
+    refresh, spans, telemetry,
 };
 
 /// The shared state of all listeners.
@@ -168,7 +169,25 @@ impl App {
             .stores
             .get(backend)
             .with_context(|| format!("backend `{backend}` has no store"))?;
-        let report = refresh::run(&self.cache, backend, store.clone(), refresh, rule).await?;
+        // r[impl telemetry.traces.spans]
+        let span = tracing::info_span!(
+            "refresh",
+            otel.status_code = Empty,
+            hylla.backend = backend,
+            hylla.rule = rule_index,
+            hylla.listed = Empty,
+            hylla.unchanged = Empty,
+            hylla.changed = Empty,
+            hylla.removed = Empty,
+            hylla.preloaded = Empty,
+            hylla.skipped = Empty,
+            hylla.failed = Empty,
+        );
+        let report = refresh::run(&self.cache, backend, store.clone(), refresh, rule)
+            .instrument(span.clone())
+            .await
+            .inspect_err(|_| spans::record_error(&span))?;
+        span.record("hylla.listed", report.listed);
         // r[impl telemetry.metrics.refresh]
         let counts = [
             ("unchanged", report.unchanged),
@@ -178,6 +197,9 @@ impl App {
             ("skipped", report.skipped),
             ("failed", report.failed),
         ];
+        for (result, count) in counts {
+            span.record(format!("hylla.{result}").as_str(), count);
+        }
         for (result, count) in counts.into_iter().filter(|(_, count)| *count > 0) {
             METRICS.refresh_objects.add(
                 count,
@@ -305,22 +327,46 @@ struct RequestLabels {
 }
 
 // r[impl telemetry.metrics.requests]
+// r[impl telemetry.traces.requests]
 async fn handle(State(listener): State<Listener>, request: Request) -> Response {
     let started = std::time::Instant::now();
     let method = request.method().clone();
+    // The span lasts until the body is sent, which holds it.
+    let span = tracing::info_span!(
+        "request",
+        otel.name = method.as_str(),
+        otel.kind = "server",
+        otel.status_code = Empty,
+        http.request.method = method.as_str(),
+        http.response.status_code = Empty,
+        url.path = Empty,
+        hylla.server = Empty,
+        hylla.mapping = Empty,
+    );
+    spans::continue_trace(&span, request.headers());
+    if telemetry::record_paths() {
+        span.record("url.path", request.uri().path());
+    }
     let mut labels = RequestLabels::default();
-    let response = respond(&listener, request, &mut labels).await;
+    let response = respond(&listener, request, &mut labels)
+        .instrument(span.clone())
+        .await;
+    let status = response.status();
+    span.record("http.response.status_code", status.as_u16());
+    if status.is_server_error() {
+        spans::record_error(&span);
+    }
     let mut attributes = vec![
         KeyValue::new("http.request.method", method.to_string()),
-        KeyValue::new(
-            "http.response.status_code",
-            i64::from(response.status().as_u16()),
-        ),
+        KeyValue::new("http.response.status_code", i64::from(status.as_u16())),
     ];
     if let Some(server) = labels.server {
+        span.record("hylla.server", server.as_str());
         attributes.push(KeyValue::new("hylla.server", server));
     }
     if let Some(mapping) = labels.mapping {
+        spans::rename(&span, format!("{method} {mapping}"));
+        span.record("hylla.mapping", mapping.as_str());
         attributes.push(KeyValue::new("hylla.mapping", mapping));
     }
     METRICS
@@ -475,9 +521,11 @@ async fn serve_object(
         backend: route_backend.to_string(),
         range: range.clone(),
     });
+    // Chunks read while the body is sent belong to the request's span too.
+    let span = tracing::Span::current();
     let read = move |index: u64| {
         let reader = reader.clone();
-        async move { reader.read(index).await }
+        async move { reader.read(index).await }.instrument(span.clone())
     };
 
     // Read the first chunk before answering, so failures can still be reported as 502.

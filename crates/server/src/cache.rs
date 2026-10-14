@@ -16,8 +16,12 @@ use foyer::{
 use hylla_config::WritePolicy;
 use object_store::{Attribute, GetOptions, GetRange, ObjectStore, path::Path as ObjectPath};
 use opentelemetry::KeyValue;
+use tracing::{Instrument, Span, field::Empty};
 
-use crate::metrics::{self, METRICS};
+use crate::{
+    metrics::{self, METRICS},
+    spans,
+};
 
 /// Identifies a chunk of an object.
 ///
@@ -285,8 +289,28 @@ impl ObjectCache {
         store: Arc<dyn ObjectStore>,
         path: &ObjectPath,
     ) -> Result<ObjectMeta, ReadError> {
+        // r[impl telemetry.traces.spans]
+        let span = tracing::info_span!(
+            "metadata",
+            hylla.backend = backend,
+            hylla.result = Empty,
+            hylla.object = Empty,
+        );
+        spans::record_object(&span, path.as_ref());
+        self.lookup_metadata(backend, store, path)
+            .instrument(span)
+            .await
+    }
+
+    async fn lookup_metadata(
+        self: &Arc<Self>,
+        backend: &str,
+        store: Arc<dyn ObjectStore>,
+        path: &ObjectPath,
+    ) -> Result<ObjectMeta, ReadError> {
         // r[impl telemetry.metrics.cache]
         let record = |result: &'static str| {
+            Span::current().record("hylla.result", result);
             METRICS.metadata.add(
                 1,
                 &[
@@ -358,20 +382,25 @@ impl ObjectCache {
         }
         let cache = self.clone();
         let path = path.clone();
-        tokio::spawn(async move {
-            let (backend, _) = &key;
-            let result = cache.fetch_metadata(backend, store.as_ref(), &path).await;
-            let mut revalidations = cache.revalidations.lock().expect("not poisoned");
-            match result {
-                Ok(_) | Err(ReadError::NotFound) => {
-                    revalidations.remove(&key);
-                }
-                Err(ReadError::Backend(error)) => {
-                    tracing::warn!(backend, %path, "background revalidation failed: {error:#}");
-                    revalidations.insert(key.clone(), Revalidation::Failed(Instant::now()));
+        let span = tracing::info_span!("revalidate", hylla.backend = backend, hylla.object = Empty);
+        spans::record_object(&span, path.as_ref());
+        tokio::spawn(
+            async move {
+                let (backend, _) = &key;
+                let result = cache.fetch_metadata(backend, store.as_ref(), &path).await;
+                let mut revalidations = cache.revalidations.lock().expect("not poisoned");
+                match result {
+                    Ok(_) | Err(ReadError::NotFound) => {
+                        revalidations.remove(&key);
+                    }
+                    Err(ReadError::Backend(error)) => {
+                        tracing::warn!(backend, %path, "background revalidation failed: {error:#}");
+                        revalidations.insert(key.clone(), Revalidation::Failed(Instant::now()));
+                    }
                 }
             }
-        });
+            .instrument(span),
+        );
     }
 
     fn meta_key(backend: &str, path: &ObjectPath) -> CacheKey {
@@ -476,9 +505,8 @@ impl ObjectCache {
             head: true,
             ..Default::default()
         };
-        let started = std::time::Instant::now();
-        let result = store.get_opts(path, options).await;
-        metrics::backend_request(backend, "head", started, metrics::outcome(&result));
+        let result =
+            spans::backend_call(backend, "head", Some(path), store.get_opts(path, options)).await;
         match result {
             Ok(result) => {
                 let meta = ObjectMeta {
@@ -585,6 +613,27 @@ impl ObjectCache {
         meta: &ObjectMeta,
         index: u64,
     ) -> Result<(Bytes, bool), ReadError> {
+        let span = tracing::info_span!(
+            "chunk",
+            hylla.backend = backend,
+            hylla.chunk = index,
+            hylla.result = Empty,
+            hylla.object = Empty,
+        );
+        spans::record_object(&span, path.as_ref());
+        self.lookup_chunk(backend, store, path, meta, index)
+            .instrument(span)
+            .await
+    }
+
+    async fn lookup_chunk(
+        &self,
+        backend: &str,
+        store: Arc<dyn ObjectStore>,
+        path: &ObjectPath,
+        meta: &ObjectMeta,
+        index: u64,
+    ) -> Result<(Bytes, bool), ReadError> {
         let start = index * self.chunk_size;
         let end = (start + self.chunk_size).min(meta.size);
         let key = CacheKey::Chunk(ChunkKey {
@@ -604,34 +653,39 @@ impl ObjectCache {
         let (fetch_changed, fetch_fetched) = (changed.clone(), fetched.clone());
         let fetch_path = path.clone();
         let fetch_backend = backend.to_string();
+        // foyer may fetch in a task of its own, outside this span.
+        let span = Span::current();
         let entry = self
             .entries
-            .get_or_fetch(&key, move || async move {
-                fetch_fetched.store(true, Ordering::Relaxed);
-                let started = std::time::Instant::now();
-                let result = store.get_opts(&fetch_path, options).await;
-                metrics::backend_request(&fetch_backend, "get", started, metrics::outcome(&result));
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let gone = matches!(
-                            error,
-                            object_store::Error::Precondition { .. }
-                                | object_store::Error::NotFound { .. }
-                        );
-                        fetch_changed.store(gone, Ordering::Relaxed);
-                        return Err(error);
-                    }
-                };
-                let bytes = result.bytes().await?;
-                METRICS.backend_bytes.add(
-                    bytes.len() as u64,
-                    &[KeyValue::new("hylla.backend", fetch_backend.clone())],
-                );
-                Ok::<_, object_store::Error>(bytes)
+            .get_or_fetch(&key, move || {
+                async move {
+                    fetch_fetched.store(true, Ordering::Relaxed);
+                    let get = async { store.get_opts(&fetch_path, options).await?.bytes().await };
+                    let result =
+                        spans::backend_call(&fetch_backend, "get", Some(&fetch_path), get).await;
+                    let bytes = match result {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            let gone = matches!(
+                                error,
+                                object_store::Error::Precondition { .. }
+                                    | object_store::Error::NotFound { .. }
+                            );
+                            fetch_changed.store(gone, Ordering::Relaxed);
+                            return Err(error);
+                        }
+                    };
+                    METRICS.backend_bytes.add(
+                        bytes.len() as u64,
+                        &[KeyValue::new("hylla.backend", fetch_backend.clone())],
+                    );
+                    Ok::<_, object_store::Error>(bytes)
+                }
+                .instrument(span)
             })
             .await;
         let record = |result: &'static str| {
+            Span::current().record("hylla.result", result);
             METRICS.chunks.add(
                 1,
                 &[

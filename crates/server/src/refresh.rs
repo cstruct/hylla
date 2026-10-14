@@ -6,7 +6,7 @@ use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 
 use crate::{
     cache::{CachedState, ObjectCache, ObjectMeta, ReadError},
-    metrics,
+    spans,
 };
 
 /// What a refresh run did.
@@ -61,17 +61,12 @@ pub async fn run(
     let listed = match (&rule.prefix, &rule.key) {
         (Some(prefix), _) => {
             let prefix = (!prefix.is_empty()).then(|| ObjectPath::from(prefix.as_str()));
-            let started = std::time::Instant::now();
-            let listed = store.list(prefix.as_ref()).try_collect::<Vec<_>>().await;
-            metrics::backend_request(backend, "list", started, metrics::outcome(&listed));
-            listed?
+            let list = store.list(prefix.as_ref()).try_collect::<Vec<_>>();
+            spans::backend_call(backend, "list", prefix.as_ref(), list).await?
         }
         (None, Some(key)) => {
             let path = ObjectPath::from(key.as_str());
-            let started = std::time::Instant::now();
-            let head = store.head(&path).await;
-            metrics::backend_request(backend, "head", started, metrics::outcome(&head));
-            match head {
+            match spans::backend_call(backend, "head", Some(&path), store.head(&path)).await {
                 Ok(meta) => vec![meta],
                 // r[impl refresh.removed]
                 Err(object_store::Error::NotFound { .. }) => {
