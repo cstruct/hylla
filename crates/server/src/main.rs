@@ -7,7 +7,7 @@ use hylla_server::{App, backend, serve, telemetry};
 
 /// A caching layer in front of object storage.
 #[derive(Parser)]
-#[command(version)]
+#[command(name = "hylla", version)]
 struct Args {
     /// The config file.
     #[arg(long, default_value = "config.yaml")]
