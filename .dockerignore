@@ -1,0 +1,6 @@
+/target/
+/.git/
+/.cargo/config.toml
+/Dockerfile
+/.dockerignore
+/.github/
