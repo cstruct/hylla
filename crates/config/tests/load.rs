@@ -893,3 +893,144 @@ fn the_readme_example_loads() {
             .starts_with("-----BEGIN PUBLIC KEY-----\n")
     );
 }
+
+const SHOW: &str = "
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com)
+    mappings ({path_prefix /, backend assets})
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+  }
+}
+cache {
+  metadata_ttl 5m
+}
+";
+
+fn shown() -> hylla_config::Loaded {
+    let secrets = "backends {assets {access_key_id AKIA123, secret_access_key s3cr3t}}";
+    let files = Files::new("show", SHOW, secrets);
+    files
+        .load_with_flags(
+            &[
+                ("HYLLA__CACHE__METADATA_TTL", "1m"),
+                ("HYLLA__CACHE__CHUNK_SIZE_KIB", "512"),
+            ],
+            &[("cache.metadata_ttl", "30s")],
+        )
+        .unwrap()
+}
+
+// r[verify config.show]
+#[test]
+fn show_prints_the_effective_config_with_sources() {
+    let loaded = shown();
+    let shown = hylla_config::render(&loaded);
+    let config = loaded_file(&loaded, "config.styx");
+    let secrets = loaded_file(&loaded, "secrets.styx");
+    for expected in [
+        "    listen 0.0.0.0:8080".to_string(),
+        format!("// {config}"),
+        "    access_key_id \"<redacted>\"".to_string(),
+        format!("// {secrets}"),
+        "  metadata_ttl 30s".to_string(),
+        format!("// a command line flag, overriding env HYLLA__CACHE__METADATA_TTL, {config}"),
+        "  chunk_size_kib 512".to_string(),
+        "// env HYLLA__CACHE__CHUNK_SIZE_KIB".to_string(),
+        "  stale_if_error 1day".to_string(),
+        "// default".to_string(),
+    ] {
+        assert!(
+            shown.contains(&expected),
+            "`{expected}` missing from:\n{shown}"
+        );
+    }
+    // Secrets never show, and optional settings left out don't either.
+    assert!(
+        !shown.contains("AKIA123") && !shown.contains("s3cr3t"),
+        "{shown}"
+    );
+    assert!(!shown.contains("endpoint"), "{shown}");
+    // It's Styx, comments and all.
+    facet_styx::from_str::<facet_value::Value>(&shown).unwrap();
+}
+
+/// The path of the test's `name` file, as shown.
+fn loaded_file(loaded: &hylla_config::Loaded, name: &str) -> String {
+    let source = loaded.source(&path("servers.public.listen")).unwrap();
+    let ConfigValueSource::Direct(Origin::File { file, .. }) = source.winner() else {
+        panic!("expected a file");
+    };
+    file.with_file_name(name).display().to_string()
+}
+
+// r[verify config.explain]
+#[test]
+fn explain_shows_the_shadow_chain() {
+    let loaded = shown();
+    let config = loaded_file(&loaded, "config.styx");
+    assert_eq!(
+        hylla_config::explain(&loaded, "cache.metadata_ttl").unwrap(),
+        format!(
+            "cache.metadata_ttl 30s
+  from a command line flag
+  overriding env HYLLA__CACHE__METADATA_TTL
+  overriding {config}
+"
+        )
+    );
+    // A section explains every field under it, defaults too.
+    let memory = hylla_config::explain(&loaded, "cache.memory").unwrap();
+    assert_eq!(
+        memory,
+        "cache.memory.capacity_mib 256\n  from the default\n"
+    );
+    // Secrets are redacted.
+    assert!(
+        hylla_config::explain(&loaded, "backends.assets.secret_access_key")
+            .unwrap()
+            .starts_with("backends.assets.secret_access_key \"<redacted>\"\n")
+    );
+    // Known fields left out, and unknown ones.
+    assert_eq!(
+        hylla_config::explain(&loaded, "backends.assets.endpoint").unwrap(),
+        "backends.assets.endpoint is not set\n"
+    );
+    assert_eq!(
+        hylla_config::explain(&loaded, "telemetry.otlp.headers").unwrap(),
+        "telemetry.otlp.headers is not set\n"
+    );
+    assert_eq!(
+        hylla_config::explain(&loaded, "cache.nope"),
+        Err(hylla_config::ExplainError::UnknownField(
+            "cache.nope".into()
+        ))
+    );
+    assert_eq!(
+        hylla_config::explain(&loaded, "cache..ttl"),
+        Err(hylla_config::ExplainError::InvalidPath("cache..ttl".into()))
+    );
+}
+
+// r[verify config.show]
+#[test]
+fn the_readme_example_shows_as_styx() {
+    let files = Files::new(
+        "readme-show",
+        &readme_block("// config.styx"),
+        &readme_block("// secrets.styx"),
+    );
+    let shown = hylla_config::render(&files.load(&[]).unwrap());
+    facet_styx::from_str::<facet_value::Value>(&shown).unwrap();
+    assert!(
+        shown.contains("public_key \"-----BEGIN PUBLIC KEY-----\\n"),
+        "{shown}"
+    );
+}

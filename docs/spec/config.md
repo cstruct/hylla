@@ -231,6 +231,19 @@ r[config.telemetry.logs]
 `format`, `text` (the default) or `json`, whether to `export` logs over OTLP (off by default),
 and an optional `endpoint` overriding the OTLP one.
 
+## Inspecting
+
+r[config.show]
+`hylla config show` MUST print the effective configuration as Styx, every value with a
+comment naming the source it came from and the sources it overrides, or that it is a
+default. Secret values MUST be redacted, and settings left out MUST NOT be shown.
+
+r[config.explain]
+`hylla config explain <path>` MUST print the value of the field at the path, or of every
+field under it, with the source it came from and the sources it overrides, highest
+precedence first, saying when a known field is unset and failing for an unknown one.
+Secret values MUST be redacted.
+
 ## Command line flags
 
 r[config.flags]

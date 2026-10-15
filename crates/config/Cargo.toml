@@ -9,10 +9,13 @@ ordna-core = "0.1.1"
 ordna-source-env = "0.1.1"
 ordna-source-file = "0.1.1"
 ordna-source-styx = "0.1.1"
+facet-styx = "4.0.0"
+facet-value = "0.46.0"
 humantime = "2.4.0"
 regex = "1.13.1"
-# Needed by `#[config(path = ...)]` and `#[facet(tag = ...)]`, see ordna's macros.
-facet = { version = "0.46.5", features = ["net"] }
+# Needed by `#[config(path = ...)]` and `#[facet(tag = ...)]`, see ordna's macros, and
+# for reflection when showing the effective config.
+facet = { version = "0.46.5", features = ["net", "reflect"] }
 
 [lints.clippy]
 # Loading config fails with ordna's ConfigLoadError, which is large, but only once, at startup.

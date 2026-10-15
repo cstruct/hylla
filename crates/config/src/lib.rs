@@ -31,6 +31,7 @@
 mod interval;
 mod load;
 mod router;
+mod show;
 mod template;
 mod validate;
 
@@ -43,6 +44,7 @@ pub use load::{
     ConfigError, ConfigFiles, ENV_PREFIX, Loaded, Origin, SourceError, load, load_with_env,
 };
 pub use router::{Route, Router};
+pub use show::{ExplainError, explain, render};
 pub use template::{InvalidTemplate, PathTemplate, RenderError, under_prefix};
 pub use validate::ValidationError;
 
@@ -279,7 +281,7 @@ config_tree! {
             /// The disk tier. Without it, only memory is used.
             pub disk: Option<pub struct DiskCache {
                 /// The directory the cache is stored in.
-                pub path: std::path::PathBuf,
+                pub path: String,
                 /// Capacity in MiB.
                 pub capacity_mib: u64,
                 /// Size of foyer's disk blocks in MiB. A chunk must fit in a block.

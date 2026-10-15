@@ -169,6 +169,22 @@ file and `HYLLA__...` environment variables. `hylla --help` lists them:
 hylla --config config.styx --log-level debug --log-format json --metrics
 ```
 
+To see the config hylla would run with, and where each value comes from:
+
+```bash
+hylla config show --config config.styx --secrets secrets.styx
+```
+
+```styx
+cache {
+  chunk_size_kib 1024              // config.styx
+  metadata_ttl 1m                  // env HYLLA__CACHE__METADATA_TTL, overriding config.styx
+  stale_if_error 1day              // default
+```
+
+`hylla config explain cache.metadata_ttl` shows one field's sources, highest precedence
+first, or those of every field in a section such as `cache`. Secrets are redacted in both.
+
 Requests are matched to a server by their `Host` header:
 
 ```bash

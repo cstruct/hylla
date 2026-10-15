@@ -578,6 +578,7 @@ dependencies = [
  "autocfg",
  "facet-core",
  "facet-macros",
+ "facet-reflect",
 ]
 
 [[package]]
@@ -1165,6 +1166,8 @@ name = "hylla-config"
 version = "0.1.0"
 dependencies = [
  "facet",
+ "facet-styx",
+ "facet-value",
  "humantime",
  "ordna-core",
  "ordna-source-env",
