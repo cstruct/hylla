@@ -13,3 +13,7 @@ humantime = "2.4.0"
 regex = "1.13.1"
 # Needed by `#[config(path = ...)]` and `#[facet(tag = ...)]`, see ordna's macros.
 facet = { version = "0.46.5", features = ["net"] }
+
+[lints.clippy]
+# Loading config fails with ordna's ConfigLoadError, which is large, but only once, at startup.
+result_large_err = "allow"

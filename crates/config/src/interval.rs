@@ -27,11 +27,10 @@ impl TryFrom<String> for Interval {
     }
 }
 
-impl TryFrom<&Interval> for String {
-    type Error = std::convert::Infallible;
-
-    fn try_from(value: &Interval) -> Result<Self, Self::Error> {
-        Ok(humantime::format_duration(value.0).to_string())
+// facet's proxy converts back with `TryFrom`, which this provides.
+impl From<&Interval> for String {
+    fn from(value: &Interval) -> Self {
+        humantime::format_duration(value.0).to_string()
     }
 }
 

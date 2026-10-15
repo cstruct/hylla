@@ -473,6 +473,10 @@ pub async fn start(
 }
 
 /// Verifies a request's signature, answering 401 when it's missing or invalid.
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the response, as in axum"
+)]
 fn verify(
     cluster: &Cluster,
     method: &Method,
@@ -496,6 +500,10 @@ fn verify(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the response, as in axum"
+)]
 fn cluster_of(app: &App) -> Result<&Arc<Cluster>, Response> {
     app.cluster
         .as_ref()

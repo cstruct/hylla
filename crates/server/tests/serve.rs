@@ -162,7 +162,7 @@ async fn get(app: &Arc<App>, path: &str) -> Response {
     request(app, "GET", "cache.example.com", path, &[]).await
 }
 
-fn header<'a>(response: &'a Response, name: header::HeaderName) -> &'a str {
+fn header(response: &Response, name: header::HeaderName) -> &str {
     response.headers[name].to_str().unwrap()
 }
 

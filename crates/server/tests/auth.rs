@@ -166,7 +166,7 @@ async fn get_with(app: &Arc<App>, path: &str, token: &str) -> Response {
     get(app, path, Some(&format!("Bearer {token}"))).await
 }
 
-fn header<'a>(response: &'a Response, name: header::HeaderName) -> Option<&'a str> {
+fn header(response: &Response, name: header::HeaderName) -> Option<&str> {
     response
         .headers
         .get(name)
