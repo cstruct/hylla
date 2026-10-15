@@ -107,6 +107,28 @@ impl Process {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    /// Sends SIGTERM, as `docker stop` does, and waits for the process to exit, returning
+    /// whether it succeeded.
+    fn terminate(&mut self) -> bool {
+        let mut child = self.child.take().unwrap();
+        let sent = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status.success();
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("{} didn't exit on SIGTERM:\n{}", self.name, self.logs());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -448,6 +470,80 @@ backends:
             "{path}"
         );
     }
+}
+
+// r[verify server.shutdown]
+// r[verify cache.disk]
+#[tokio::test]
+#[ignore = "needs versitygw and azurite: run with `mise run e2e`"]
+async fn sigterm_writes_the_cache_to_disk_for_the_next_start() {
+    let dir = TempDir::new("shutdown");
+    let mut versitygw = VersityGw::start(&dir, &["assets"]);
+    upload(
+        &versitygw.store("assets"),
+        "css/app.css",
+        content(),
+        "text/css",
+    )
+    .await;
+
+    let listen = free_addr();
+    let config = format!(
+        "\
+servers:
+  public:
+    listen: {listen}
+    server_names: [cache.example.com]
+    mappings:
+      - path_prefix: /
+        backend: assets
+backends:
+  assets:
+    type: s3
+    bucket: assets
+    region: us-east-1
+    endpoint: {s3}
+cache:
+  chunk_size_kib: 1
+  metadata_ttl: 1h
+  write_policy: on_eviction
+  disk:
+    path: {disk}
+    capacity_mib: 64
+    block_size_mib: 1
+",
+        s3 = versitygw.endpoint(),
+        disk = dir.path("cache").display(),
+    );
+    let secrets = format!(
+        "\
+backends:
+  assets:
+    access_key_id: {S3_ACCESS}
+    secret_access_key: {S3_SECRET}
+"
+    );
+    let mut hylla = Hylla::start(&dir, "hylla", &config, &secrets);
+    assert_eq!(
+        hylla.body("/css/app.css").await,
+        (reqwest::StatusCode::OK, content())
+    );
+    // Only in memory so far: it's written to disk on the way out.
+    assert!(
+        hylla.process.terminate(),
+        "hylla failed on SIGTERM:\n{}",
+        hylla.process.logs()
+    );
+
+    // Without its backend, the next start serves the object from disk.
+    versitygw.process.kill();
+    let restarted = Hylla::start(&dir, "restarted", &config, &secrets);
+    assert_eq!(
+        restarted.body("/css/app.css").await,
+        (reqwest::StatusCode::OK, content()),
+        "{}",
+        restarted.process.logs()
+    );
 }
 
 fn cluster_config(listen: SocketAddr, cluster: SocketAddr, seeds: &[String], s3: &str) -> String {

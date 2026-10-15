@@ -33,11 +33,33 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("creating the cache")?;
 
-    let served = serve(app, async {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutting down");
-    })
-    .await;
+    let served = serve(app, shutdown_signal()).await;
     telemetry.shutdown();
     served
+}
+
+// r[impl server.shutdown]
+/// Completes on Ctrl-C or SIGTERM, which is how containers are stopped. As a container's
+/// first process, hylla would otherwise ignore SIGTERM and be killed without writing its
+/// cache to disk.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::warn!("listening for SIGTERM: {error}");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("shutting down");
 }
