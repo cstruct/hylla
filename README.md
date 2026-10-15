@@ -115,6 +115,10 @@ Any public value can be overridden with environment variables, such as
 
 ## Running
 
+Download a binary for Linux (x86_64 or aarch64, glibc 2.35 or later) or macOS (Apple
+silicon) from the [releases](https://github.com/cstruct/hylla/releases), checked against
+their `SHA256SUMS`, or build it:
+
 ```bash
 cargo run --release -p hylla-server -- --config config.yaml --secrets secrets.yaml
 ```
@@ -191,3 +195,18 @@ ln -s ordna-local.toml .cargo/config.toml
 
 `.cargo/config.toml` is ignored by git. While it's enabled, Cargo.lock records the local
 packages, so remove the link before committing changes to it.
+
+## Releasing
+
+hylla is versioned as one, by `version` in the workspace's [Cargo.toml](Cargo.toml). Bump
+it, then tag the commit with the version:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The [release workflow](.github/workflows/release.yml) checks the tag against the version
+and runs CI. It then builds the binaries, pushes the Docker image, and creates a GitHub
+release with the binaries, their checksums and notes generated from the pull requests
+merged since the last one.

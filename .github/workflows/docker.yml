@@ -3,9 +3,10 @@ name: Docker
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
+  # Releases push their version tags through the release workflow, once CI passes.
+  workflow_call:
 
 permissions:
   contents: read
