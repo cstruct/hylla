@@ -240,6 +240,8 @@ servers:
 backends: {}
 ";
     let files = Files::new("invalid", config, "{}");
+    #[allow(clippy::invalid_regex, reason = "the config's broken pattern")]
+    let invalid_regex_error = || regex::Regex::new("(unclosed").unwrap_err().to_string();
     let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
         panic!("expected validation errors");
     };
@@ -260,7 +262,7 @@ backends: {}
                 server: "a".into(),
                 mapping: 0,
                 rewrite: 0,
-                error: regex::Regex::new("(unclosed").unwrap_err().to_string(),
+                error: invalid_regex_error(),
             },
             ValidationError::UnknownGroup {
                 server: "a".into(),
