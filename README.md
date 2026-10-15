@@ -15,106 +15,138 @@ hybrid RAM and disk cache. Configured with [ordna](https://github.com/cstruct/or
 
 ## Configuration
 
-Servers accept requests and route them to backends by path prefix; the first matching
-mapping wins. Backend credentials are secret and go in a separate secrets file.
+Configuration is written in [Styx](https://github.com/bearcove/styx). Servers accept
+requests and route them to backends by path prefix; the first matching mapping wins.
+Backend credentials are secret and go in a separate secrets file.
 
-```yaml
-# config.yaml
-servers:
-  public:
-    listen: 0.0.0.0:8080
-    server_names: [cache.example.com, cdn.example.com]
-    mappings:
-      - path_prefix: /assets
-        backend: assets
-        rewrites:             # regex replacements, applied in order
-          - pattern: ^/assets/(.*)$
-            replace: /$1      # /assets/app.css → /app.css on the backend
-      - path_prefix: /tenant
-        backend: assets
-        auth:                 # optional: require a JWT
-          verifier: partners
-          paths: ['/tenant/${sub}']   # optional: backend prefixes with claims filled in
-          private: true       # Cache-Control: private (default)
-      - path_prefix: /
-        backend: assets
-telemetry:                    # optional: export over OTLP
-  service_name: hylla
-  resource:
-    - {key: deployment.environment, value: production}
-  otlp:
-    endpoint: http://collector:4318   # or the OTEL_EXPORTER_OTLP_* environment variables
-    protocol: http_protobuf   # or grpc
-  metrics:
-    enabled: true
-    endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics   # optional, per signal
-    interval: 30s
-  traces:
-    enabled: true
-    endpoint: http://quickwit:7280/api/v1/otlp/v1/traces   # optional, per signal
-    sample_ratio: 0.1   # callers' sampled traces are always continued
-    record_paths: false   # paths can be sensitive
-  logs:
-    level: info   # or RUST_LOG
-    format: json   # or text; JSON lines carry trace and span IDs
-    export: true   # over OTLP too
-    endpoint: http://quickwit:7280/api/v1/otlp/v1/logs   # optional, per signal
-cluster:                      # optional: share with other hylla nodes
-  listen: 0.0.0.0:7946        # private network only: gossip and data between nodes
-  advertise: 10.0.0.5:7946    # how the others reach this node
-  seeds: [hylla-headless.cache.svc.cluster.local:7946]   # addresses or DNS names
-  share:
-    metadata: true            # push revalidated metadata to the other nodes
-    preload: true             # one node runs each refresh rule; the others pull from it
-auth:                         # JWT verifiers, by name
-  partners:
-    algorithm: ES256          # RS256..512, PS256..512, ES256, ES384 or EdDSA
-    public_key: |
-      -----BEGIN PUBLIC KEY-----
-      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
-      -----END PUBLIC KEY-----
-    audience: hylla           # optional; required in tokens when set (so is issuer)
-    leeway: 30s               # clock skew allowed for exp and nbf
-backends:
-  assets:
-    type: s3                  # s3 or azure_blob
-    bucket: assets
-    region: eu-north-1
-    endpoint: http://localhost:9000   # optional, for S3 compatible stores
-    refresh:                  # optional background refresh of this backend's objects
-      concurrency: 4          # objects refreshed at the same time
-      rules:
-        - prefix: css/        # backend keys; directory-like, '' for everything
-          every: 15m
-          mode: revalidate    # disabled, revalidate (default), preload or both
-        - key: index.html     # or a single key
-          every: 10m
-          mode: both
-          max_objects: 1      # preloading needs max_objects and/or max_mib
-cache:                        # optional, every setting has a default
-  chunk_size_kib: 1024        # objects are cached in chunks of this size
-  metadata_ttl: 30s           # how long size, ETag and content type are cached
-  stale_while_revalidate: 0s  # past the TTL, keep serving this long while revalidating in
-                              # the background, so requests don't wait; 0s disables
-  stale_if_error: 1d          # keep serving cached objects this long past their TTL
-                              # while the backend fails; 0s disables
-  write_policy: on_eviction   # or on_insertion: when chunks are written to disk
-  memory:
-    capacity_mib: 256
-  disk:                       # optional; without it only memory is used
-    path: /var/cache/hylla
-    capacity_mib: 10240
-    block_size_mib: 16        # foyer disk blocks; a chunk must fit in one
+```styx
+// config.styx
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com cdn.example.com)
+    mappings (
+      {
+        path_prefix /assets
+        backend assets
+        // Regex replacements, applied in order: /assets/app.css is /app.css on the backend.
+        rewrites ({pattern "^/assets/(.*)$", replace /$1})
+      }
+      {
+        path_prefix /tenant
+        backend assets
+        // Optional: require a JWT.
+        auth {
+          verifier partners
+          // Optional: backend prefixes with claims filled in.
+          paths ("/tenant/${sub}")
+          // Cache-Control: private (the default).
+          private true
+        }
+      }
+      {path_prefix /, backend assets}
+    )
+  }
+}
+// Optional: export over OTLP.
+telemetry {
+  service_name hylla
+  resource ({key deployment.environment, value production})
+  otlp {
+    // Or the OTEL_EXPORTER_OTLP_* environment variables.
+    endpoint http://collector:4318
+    protocol http_protobuf  // or grpc
+  }
+  metrics {
+    enabled true
+    endpoint http://prometheus:9090/api/v1/otlp/v1/metrics  // optional, per signal
+    interval 30s
+  }
+  traces {
+    enabled true
+    endpoint http://quickwit:7280/api/v1/otlp/v1/traces  // optional, per signal
+    sample_ratio 0.1  // callers' sampled traces are always continued
+    record_paths false  // paths can be sensitive
+  }
+  logs {
+    level info  // or RUST_LOG
+    format json  // or text; JSON lines carry trace and span IDs
+    export true  // over OTLP too
+    endpoint http://quickwit:7280/api/v1/otlp/v1/logs  // optional, per signal
+  }
+}
+// Optional: share with other hylla nodes.
+cluster {
+  listen 0.0.0.0:7946  // private network only: gossip and data between nodes
+  advertise 10.0.0.5:7946  // how the others reach this node
+  seeds (hylla-headless.cache.svc.cluster.local:7946)  // addresses or DNS names
+  share {
+    metadata true  // push revalidated metadata to the other nodes
+    preload true  // one node runs each refresh rule; the others pull from it
+  }
+}
+// JWT verifiers, by name.
+auth {
+  partners {
+    algorithm ES256  // RS256..512, PS256..512, ES256, ES384 or EdDSA
+    public_key "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...\n-----END PUBLIC KEY-----\n"
+    audience hylla  // optional; required in tokens when set (so is issuer)
+    leeway 30s  // clock skew allowed for exp and nbf
+  }
+}
+backends {
+  assets {
+    type s3  // s3 or azure_blob
+    bucket assets
+    region eu-north-1
+    endpoint http://localhost:9000  // optional, for S3 compatible stores
+    // Optional background refresh of this backend's objects.
+    refresh {
+      concurrency 4  // objects refreshed at the same time
+      rules (
+        // Backend keys: directory-like prefixes ("" for everything), or a single key.
+        // Modes: disabled, revalidate (the default), preload or both.
+        {prefix css/, every 15m, mode revalidate}
+        // Preloading needs max_objects and/or max_mib.
+        {key index.html, every 10m, mode both, max_objects 1}
+      )
+    }
+  }
+}
+// Optional, every setting has a default.
+cache {
+  chunk_size_kib 1024  // objects are cached in chunks of this size
+  metadata_ttl 30s  // how long size, ETag and content type are cached
+  // Past the TTL, keep serving this long while revalidating in the background, so
+  // requests don't wait; 0s disables.
+  stale_while_revalidate 0s
+  // Keep serving cached objects this long past their TTL while the backend fails; 0s
+  // disables.
+  stale_if_error 1d
+  write_policy on_eviction  // or on_insertion: when chunks are written to disk
+  memory {
+    capacity_mib 256
+  }
+  // Optional; without it only memory is used.
+  disk {
+    path /var/cache/hylla
+    capacity_mib 10240
+    block_size_mib 16  // foyer disk blocks; a chunk must fit in one
+  }
+}
 ```
 
-```yaml
-# secrets.yaml
-cluster:
-  key: replace-with-a-long-random-string  # shared by the nodes, at least 32 characters
-backends:
-  assets:
-    access_key_id: AKIA...
-    secret_access_key: ...
+```styx
+// secrets.styx
+cluster {
+  key replace-with-a-long-random-string  // shared by the nodes, at least 32 characters
+}
+backends {
+  assets {
+    access_key_id AKIA...
+    secret_access_key ...
+  }
+}
 ```
 
 Any public value can be overridden with environment variables, such as
@@ -127,14 +159,14 @@ silicon) from the [releases](https://github.com/cstruct/hylla/releases), checked
 their `SHA256SUMS`, or build it:
 
 ```bash
-cargo run --release -p hylla-server -- --config config.yaml --secrets secrets.yaml
+cargo run --release -p hylla-server -- --config config.styx --secrets secrets.styx
 ```
 
 A few settings can be overridden for a single run with flags, which win over the config
 file and `HYLLA__...` environment variables. `hylla --help` lists them:
 
 ```bash
-hylla --config config.yaml --log-level debug --log-format json --metrics
+hylla --config config.styx --log-level debug --log-format json --metrics
 ```
 
 Requests are matched to a server by their `Host` header:
@@ -162,14 +194,14 @@ Everything between nodes is signed with the shared key.
 Images for `linux/amd64` and `linux/arm64` are on Docker Hub as
 [`cstruct/hylla`](https://hub.docker.com/r/cstruct/hylla): `latest` and versions such as
 `0.1.0` and `0.1` from releases, and `edge` from `main`. The config is read from
-`/etc/hylla/config.yaml`, and a disk cache at `/var/cache/hylla` can be kept on a volume:
+`/etc/hylla/config.styx`, and a disk cache at `/var/cache/hylla` can be kept on a volume:
 
 ```bash
 docker run -p 8080:8080 \
-  -v ./config.yaml:/etc/hylla/config.yaml:ro \
-  -v ./secrets.yaml:/etc/hylla/secrets.yaml:ro \
+  -v ./config.styx:/etc/hylla/config.styx:ro \
+  -v ./secrets.styx:/etc/hylla/secrets.styx:ro \
   -v hylla-cache:/var/cache/hylla \
-  cstruct/hylla --config /etc/hylla/config.yaml --secrets /etc/hylla/secrets.yaml
+  cstruct/hylla --config /etc/hylla/config.styx --secrets /etc/hylla/secrets.styx
 ```
 
 hylla runs as the distroless `nonroot` user (65532), so a directory mounted for the disk

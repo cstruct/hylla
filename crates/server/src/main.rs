@@ -11,7 +11,7 @@ use ordna_core::{ConfigPath, ValuesSource};
 #[command(name = "hylla", version)]
 struct Args {
     /// The config file.
-    #[arg(long, default_value = "config.yaml")]
+    #[arg(long, default_value = "config.styx")]
     config: PathBuf,
     /// The secrets file, holding backend credentials.
     #[arg(long)]
@@ -142,8 +142,8 @@ mod tests {
     fn flags_set_their_config_fields() {
         let dir = std::env::temp_dir().join(format!("hylla-flags-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let config = dir.join("config.yaml");
-        std::fs::write(&config, "servers: {}\nbackends: {}\n").unwrap();
+        let config = dir.join("config.styx");
+        std::fs::write(&config, "servers {}\nbackends {}\n").unwrap();
         let args = Args::try_parse_from([
             "hylla",
             "--log-level=debug",

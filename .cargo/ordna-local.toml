@@ -8,4 +8,4 @@
 ordna-core = { path = "../ordna/crates/core" }
 ordna-source-env = { path = "../ordna/crates/source-env" }
 ordna-source-file = { path = "../ordna/crates/source-file" }
-ordna-source-yaml = { path = "../ordna/crates/source-yaml" }
+ordna-source-styx = { path = "../ordna/crates/source-styx" }

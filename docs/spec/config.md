@@ -3,28 +3,33 @@
 hylla's configuration consists of servers, which accept requests, and backends, which
 hold the objects.
 
-```yaml
-servers:
-  public:
-    listen: 0.0.0.0:8080
-    server_names: [cache.example.com]
-    mappings:
-      - path_prefix: /assets
-        backend: assets
-        rewrites:
-          - pattern: ^/assets/(.*)$
-            replace: /$1
-backends:
-  assets:
-    type: s3
-    bucket: assets
-    region: eu-north-1
+```styx
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com)
+    mappings (
+      {
+        path_prefix /assets
+        backend assets
+        rewrites ({pattern "^/assets/(.*)$", replace /$1})
+      }
+    )
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+  }
+}
 ```
 
 ## Sources
 
 r[config.sources]
-The configuration MUST be loaded from a public YAML config file, an optional YAML secrets
+The configuration MUST be loaded from a public Styx config file, an optional Styx secrets
 file, `HYLLA__` prefixed environment variables and command line flags, in that order of
 precedence (lowest first).
 

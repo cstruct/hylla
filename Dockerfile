@@ -27,4 +27,4 @@ COPY --from=build --chown=65532:65532 /cache /var/cache/hylla
 # Mount the config here, and the secrets file next to it if any.
 WORKDIR /etc/hylla
 ENTRYPOINT ["/usr/local/bin/hylla"]
-CMD ["--config", "/etc/hylla/config.yaml"]
+CMD ["--config", "/etc/hylla/config.styx"]

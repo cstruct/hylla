@@ -6,7 +6,7 @@ use ordna_core::{
 };
 use ordna_source_env::{EnvSource, EnvSourceError, EnvVarDetail};
 use ordna_source_file::{FileSourceError, FileValueDetail};
-use ordna_source_yaml::{DeserializeError, YamlSource, yaml_file};
+use ordna_source_styx::{DeserializeError, StyxSource, styx_file};
 
 use crate::{Config, ValidationError};
 
@@ -107,11 +107,11 @@ pub fn load_with_env(files: &ConfigFiles, env: EnvSource) -> Result<Loaded, Conf
     let builder = ConfigBuilder::<Config, _, _>::new().source_named(
         "config",
         file_registration(),
-        yaml_file(&files.config),
+        styx_file(&files.config),
     );
     let builder = match &files.secrets {
         Some(secrets) => {
-            builder.source_named("secrets", file_registration(), yaml_file(secrets).secrets())
+            builder.source_named("secrets", file_registration(), styx_file(secrets).secrets())
         }
         None => builder,
     };
@@ -133,7 +133,7 @@ fn flag_registration() -> SourceRegistration<ValuesSource, Origin, SourceError> 
     )
 }
 
-fn file_registration() -> SourceRegistration<YamlSource, Origin, SourceError> {
+fn file_registration() -> SourceRegistration<StyxSource, Origin, SourceError> {
     SourceRegistration::new(SourceError::File, |path, detail: FileValueDetail| {
         Origin::File {
             file: detail.file,

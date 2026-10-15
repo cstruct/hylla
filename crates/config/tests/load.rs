@@ -8,43 +8,50 @@ use hylla_config::{
 use ordna_core::{ConfigLoadError, ConfigPath, ConfigValueSource};
 use ordna_source_env::EnvSource;
 
-const CONFIG: &str = "\
-servers:
-  public:
-    listen: 0.0.0.0:8080
-    server_names: [cache.example.com, cdn.example.com]
-    mappings:
-      - path_prefix: /assets
-        backend: assets
-        rewrites:
-          - pattern: ^/assets/(.*)$
-            replace: /$1
-      - path_prefix: /
-        backend: archive
-  internal:
-    listen: 0.0.0.0:8080
-    server_names: [cache.internal]
-    mappings:
-      - path_prefix: /
-        backend: assets
-backends:
-  assets:
-    type: s3
-    bucket: assets
-    region: eu-north-1
-  archive:
-    type: azure_blob
-    account: hyllaarchive
-    container: archive
-";
+const CONFIG: &str = r#"
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com cdn.example.com)
+    mappings (
+      {
+        path_prefix /assets
+        backend assets
+        rewrites ({pattern "^/assets/(.*)$", replace /$1})
+      }
+      {path_prefix /, backend archive}
+    )
+  }
+  internal {
+    listen 0.0.0.0:8080
+    server_names (cache.internal)
+    mappings ({path_prefix /, backend assets})
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+  }
+  archive {
+    type azure_blob
+    account hyllaarchive
+    container archive
+  }
+}
+"#;
 
-const SECRETS: &str = "\
-backends:
-  assets:
-    access_key_id: AKIA123
-    secret_access_key: s3cr3t
-  archive:
-    account_key: hunter2
+const SECRETS: &str = "
+backends {
+  assets {
+    access_key_id AKIA123
+    secret_access_key s3cr3t
+  }
+  archive {
+    account_key hunter2
+  }
+}
 ";
 
 struct Files {
@@ -56,17 +63,17 @@ impl Files {
         let dir = std::env::temp_dir().join(format!("hylla-config-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.yaml"), config).unwrap();
-        std::fs::write(dir.join("secrets.yaml"), secrets).unwrap();
+        std::fs::write(dir.join("config.styx"), config).unwrap();
+        std::fs::write(dir.join("secrets.styx"), secrets).unwrap();
         Self { dir }
     }
 
     fn config(&self) -> PathBuf {
-        self.dir.join("config.yaml")
+        self.dir.join("config.styx")
     }
 
     fn secrets(&self) -> PathBuf {
-        self.dir.join("secrets.yaml")
+        self.dir.join("secrets.styx")
     }
 
     fn load(
@@ -199,7 +206,10 @@ fn loads_servers_and_backends() {
 // r[verify config.backends.secrets]
 #[test]
 fn backend_credentials_are_secret() {
-    let config = format!("{CONFIG}    account_key: leaked\n");
+    let config = CONFIG.replace(
+        "container archive",
+        "container archive\n    account_key leaked",
+    );
     let files = Files::new("secrets", &config, SECRETS);
     let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) =
         files.load(&[("HYLLA__BACKENDS__ASSETS__SECRET_ACCESS_KEY", "leaked")])
@@ -230,28 +240,34 @@ fn backend_credentials_are_secret() {
 // r[verify config.validate.unique-hosts]
 #[test]
 fn invalid_configs_report_every_problem() {
-    let config = "\
-servers:
-  a:
-    listen: 0.0.0.0:8080
-    server_names: [cache.example.com]
-    mappings:
-      - path_prefix: assets
-        backend: missing
-        rewrites:
-          - pattern: (unclosed
-            replace: /
-          - pattern: ^/(.*)$
-            replace: /$1a
-  b:
-    listen: 0.0.0.0:8080
-    server_names: [Cache.Example.com]
-  c:
-    listen: 0.0.0.0:9090
-    server_names: []
-backends: {}
-";
-    let files = Files::new("invalid", config, "{}");
+    let config = r#"
+servers {
+  a {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com)
+    mappings (
+      {
+        path_prefix assets
+        backend missing
+        rewrites (
+          {pattern "(unclosed", replace /}
+          {pattern "^/(.*)$", replace /$1a}
+        )
+      }
+    )
+  }
+  b {
+    listen 0.0.0.0:8080
+    server_names (Cache.Example.com)
+  }
+  c {
+    listen 0.0.0.0:9090
+    server_names ()
+  }
+}
+backends {}
+"#;
+    let files = Files::new("invalid", config, "");
     #[allow(clippy::invalid_regex, reason = "the config's broken pattern")]
     let invalid_regex_error = || regex::Regex::new("(unclosed").unwrap_err().to_string();
     let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
@@ -296,8 +312,8 @@ backends: {}
 #[test]
 fn listen_must_be_an_address_and_port() {
     let config = CONFIG.replace(
-        "listen: 0.0.0.0:8080\n    server_names: [cache.example.com, cdn",
-        "listen: 8080\n    server_names: [cache.example.com, cdn",
+        "listen 0.0.0.0:8080\n    server_names (cache.example.com cdn",
+        "listen 8080\n    server_names (cache.example.com cdn",
     );
     let files = Files::new("listen", &config, SECRETS);
     let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) = files.load(&[]) else {
@@ -343,16 +359,17 @@ fn cache_settings_default_when_left_out() {
     assert_eq!(cache.disk, None);
 
     let config = format!(
-        "{CONFIG}cache:
-  metadata_ttl: 5m
-  stale_while_revalidate: 1m
-  stale_if_error: 0s
-  write_policy: on_insertion
-  memory:
-    capacity_mib: 64
-  disk:
-    path: /var/cache/hylla
-    capacity_mib: 1024
+        "{CONFIG}cache {{
+  metadata_ttl 5m
+  stale_while_revalidate 1m
+  stale_if_error 0s
+  write_policy on_insertion
+  memory {{capacity_mib 64}}
+  disk {{
+    path /var/cache/hylla
+    capacity_mib 1024
+  }}
+}}
 "
     );
     let files = Files::new("cache-settings", &config, SECRETS);
@@ -381,11 +398,13 @@ fn cache_settings_default_when_left_out() {
 #[test]
 fn cache_sizes_are_validated() {
     let config = format!(
-        "{CONFIG}cache:
-  chunk_size_kib: 16384
-  disk:
-    path: /var/cache/hylla
-    capacity_mib: 32
+        "{CONFIG}cache {{
+  chunk_size_kib 16384
+  disk {{
+    path /var/cache/hylla
+    capacity_mib 32
+  }}
+}}
 "
     );
     let files = Files::new("cache-invalid", &config, SECRETS);
@@ -398,25 +417,23 @@ fn cache_sizes_are_validated() {
     assert!(reasons[1].contains("must hold at least 4 blocks"));
 }
 
-const REFRESH: &str = "\
-servers: {}
-backends:
-  assets:
-    type: s3
-    bucket: assets
-    region: eu-north-1
-    refresh:
-      rules:
-        - prefix: css/
-          every: 15m
-        - key: index.html
-          every: 1h 30m
-          mode: both
-          max_objects: 1
-        - prefix: ''
-          every: 1d
-          mode: disabled
-";
+const REFRESH: &str = r#"
+servers {}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+    refresh {
+      rules (
+        {prefix css/, every 15m}
+        {key index.html, every "1h 30m", mode both, max_objects 1}
+        {prefix "", every 1d, mode disabled}
+      )
+    }
+  }
+}
+"#;
 
 // r[verify config.refresh]
 // r[verify config.refresh.rules]
@@ -427,7 +444,7 @@ fn backends_configure_refresh_rules() {
     let files = Files::new(
         "refresh",
         REFRESH,
-        "backends: {assets: {access_key_id: a, secret_access_key: b}}",
+        "backends {assets {access_key_id a, secret_access_key b}}",
     );
     let config = files
         .load(&[("HYLLA__BACKENDS__ASSETS__REFRESH__CONCURRENCY", "8")])
@@ -469,8 +486,8 @@ fn backends_configure_refresh_rules() {
     assert!(!RefreshMode::Disabled.revalidates() && !RefreshMode::Disabled.preloads());
 
     // Durations must parse.
-    let invalid = REFRESH.replace("every: 15m", "every: soon");
-    let files = Files::new("refresh-duration", &invalid, "{}");
+    let invalid = REFRESH.replace("every 15m", "every soon");
+    let files = Files::new("refresh-duration", &invalid, "");
     let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) = files.load(&[]) else {
         panic!("expected violations");
     };
@@ -480,29 +497,28 @@ fn backends_configure_refresh_rules() {
 // r[verify config.validate.refresh]
 #[test]
 fn refresh_rules_are_validated() {
-    let config = "\
-servers: {}
-backends:
-  assets:
-    type: s3
-    bucket: assets
-    region: eu-north-1
-    refresh:
-      concurrency: 0
-      rules:
-        - prefix: css/
-          key: app.css
-          every: 15m
-        - key: /app.css
-          every: 0s
-        - prefix: css/
-          every: 15m
-          mode: preload
+    let config = "
+servers {}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+    refresh {
+      concurrency 0
+      rules (
+        {prefix css/, key app.css, every 15m}
+        {key /app.css, every 0s}
+        {prefix css/, every 15m, mode preload}
+      )
+    }
+  }
+}
 ";
     let files = Files::new(
         "refresh-invalid",
         config,
-        "backends: {assets: {access_key_id: a, secret_access_key: b}}",
+        "backends {assets {access_key_id a, secret_access_key b}}",
     );
     let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
         panic!("expected validation errors");
@@ -522,42 +538,46 @@ backends:
     );
 }
 
-const AUTH: &str = "\
-auth:
-  partners:
-    algorithm: ES256
-    public_key: |
-      -----BEGIN PUBLIC KEY-----
-      key
-      -----END PUBLIC KEY-----
-    audience: hylla
-  internal:
-    algorithm: EdDSA
-    public_key: key
-    leeway: 1m
-servers:
-  public:
-    listen: 0.0.0.0:8080
-    server_names: [cache.example.com]
-    mappings:
-      - path_prefix: /tenant
-        backend: assets
-        auth:
-          verifier: partners
-          paths: ['/tenant/${sub}', /shared]
-      - path_prefix: /reports
-        backend: assets
-        auth:
-          verifier: internal
-          private: false
-      - path_prefix: /
-        backend: assets
-backends:
-  assets:
-    type: s3
-    bucket: assets
-    region: eu-north-1
-";
+const AUTH: &str = r#"
+auth {
+  partners {
+    algorithm ES256
+    public_key "-----BEGIN PUBLIC KEY-----\nkey\n-----END PUBLIC KEY-----\n"
+    audience hylla
+  }
+  internal {
+    algorithm EdDSA
+    public_key key
+    leeway 1m
+  }
+}
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com)
+    mappings (
+      {
+        path_prefix /tenant
+        backend assets
+        auth {verifier partners, paths ("/tenant/${sub}" /shared)}
+      }
+      {
+        path_prefix /reports
+        backend assets
+        auth {verifier internal, private false}
+      }
+      {path_prefix /, backend assets}
+    )
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+  }
+}
+"#;
 
 // r[verify config.auth.verifiers]
 // r[verify config.auth.algorithms]
@@ -568,7 +588,7 @@ fn mappings_configure_auth() {
     let files = Files::new(
         "auth",
         AUTH,
-        "backends: {assets: {access_key_id: a, secret_access_key: b}}",
+        "backends {assets {access_key_id a, secret_access_key b}}",
     );
     let config = files.load(&[]).unwrap().into_config();
 
@@ -606,8 +626,8 @@ fn mappings_configure_auth() {
     assert_eq!(mappings[2].auth, None);
 
     // Algorithms are the asymmetric JWT ones only.
-    let hmac = AUTH.replace("algorithm: ES256", "algorithm: HS256");
-    let files = Files::new("auth-hmac", &hmac, "{}");
+    let hmac = AUTH.replace("algorithm ES256", "algorithm HS256");
+    let files = Files::new("auth-hmac", &hmac, "");
     assert!(matches!(
         files.load(&[]),
         Err(ConfigError::Load(ConfigLoadError::Violations(_)))
@@ -618,15 +638,15 @@ fn mappings_configure_auth() {
 #[test]
 fn mapping_auth_is_validated() {
     let config = AUTH
-        .replace("verifier: internal", "verifier: missing")
+        .replace("verifier internal", "verifier missing")
         .replace(
-            "paths: ['/tenant/${sub}', /shared]",
-            "paths: ['tenant/${sub}', '/${a b}']",
+            r#"paths ("/tenant/${sub}" /shared)"#,
+            r#"paths ("tenant/${sub}" "/${a b}")"#,
         );
     let files = Files::new(
         "auth-invalid",
         &config,
-        "backends: {assets: {access_key_id: a, secret_access_key: b}}",
+        "backends {assets {access_key_id a, secret_access_key b}}",
     );
     let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
         panic!("expected validation errors");
@@ -638,14 +658,15 @@ fn mapping_auth_is_validated() {
     assert!(errors[2].contains("mapping 1") && errors[2].contains("unknown verifier `missing`"));
 }
 
-const CLUSTER: &str = "\
-servers: {}
-backends: {}
-cluster:
-  listen: 0.0.0.0:7946
-  advertise: 10.0.0.5:7946
-  seeds: [10.0.0.6:7946, hylla.cache.svc.cluster.local:7946]
-  gossip_interval: 500ms
+const CLUSTER: &str = "
+servers {}
+backends {}
+cluster {
+  listen 0.0.0.0:7946
+  advertise 10.0.0.5:7946
+  seeds (10.0.0.6:7946 hylla.cache.svc.cluster.local:7946)
+  gossip_interval 500ms
+}
 ";
 
 // r[verify config.cluster]
@@ -654,7 +675,7 @@ cluster:
 // r[verify config.cluster.share]
 #[test]
 fn clusters_are_configured_with_a_secret_key() {
-    let secrets = "cluster: {key: a cluster key of at least thirty-two characters}";
+    let secrets = r#"cluster {key "a cluster key of at least thirty-two characters"}"#;
     let files = Files::new("cluster", CLUSTER, secrets);
     let cluster = files.load(&[]).unwrap().into_config().cluster.unwrap();
     assert_eq!(cluster.listen, "0.0.0.0:7946".parse().unwrap());
@@ -675,7 +696,10 @@ fn clusters_are_configured_with_a_secret_key() {
     assert!(cluster.share.metadata && cluster.share.preload);
 
     // The key is secret: the public file can't set it.
-    let public = format!("{CLUSTER}  key: a cluster key of at least thirty-two characters\n");
+    let public = CLUSTER.replace(
+        "gossip_interval 500ms",
+        "gossip_interval 500ms\n  key \"a cluster key of at least thirty-two characters\"",
+    );
     let files = Files::new("cluster-public-key", &public, secrets);
     let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) = files.load(&[]) else {
         panic!("expected violations");
@@ -689,15 +713,16 @@ fn clusters_are_configured_with_a_secret_key() {
 // r[verify config.validate.cluster]
 #[test]
 fn cluster_settings_are_validated() {
-    let config = "\
-servers: {}
-backends: {}
-cluster:
-  listen: 0.0.0.0:7946
-  seeds: [10.0.0.6, ':7946']
-  gossip_interval: 10s
+    let config = "
+servers {}
+backends {}
+cluster {
+  listen 0.0.0.0:7946
+  seeds (10.0.0.6 :7946)
+  gossip_interval 10s
+}
 ";
-    let files = Files::new("cluster-invalid", config, "cluster: {key: short}");
+    let files = Files::new("cluster-invalid", config, "cluster {key short}");
     let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
         panic!("expected validation errors");
     };
@@ -715,27 +740,31 @@ cluster:
     );
 }
 
-const TELEMETRY: &str = "\
-servers: {}
-backends: {}
-telemetry:
-  resource:
-    - {key: deployment.environment, value: production}
-  otlp:
-    endpoint: http://collector:4318
-  metrics:
-    enabled: true
-    endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics
-    interval: 15s
-  traces:
-    enabled: true
-    endpoint: http://quickwit:7280/api/v1/otlp/v1/traces
-    sample_ratio: 0.25
-  logs:
-    level: info,hylla_server=debug
-    format: json
-    export: true
-";
+const TELEMETRY: &str = r#"
+servers {}
+backends {}
+telemetry {
+  resource ({key deployment.environment, value production})
+  otlp {
+    endpoint http://collector:4318
+  }
+  metrics {
+    enabled true
+    endpoint http://prometheus:9090/api/v1/otlp/v1/metrics
+    interval 15s
+  }
+  traces {
+    enabled true
+    endpoint http://quickwit:7280/api/v1/otlp/v1/traces
+    sample_ratio 0.25
+  }
+  logs {
+    level "info,hylla_server=debug"
+    format json
+    export true
+  }
+}
+"#;
 
 // r[verify config.telemetry]
 // r[verify config.telemetry.otlp]
@@ -744,7 +773,7 @@ telemetry:
 // r[verify config.telemetry.logs]
 #[test]
 fn telemetry_is_configured_with_secret_headers() {
-    let files = Files::new("telemetry-defaults", "servers: {}\nbackends: {}\n", "{}");
+    let files = Files::new("telemetry-defaults", "servers {}\nbackends {}\n", "");
     let telemetry = files.load(&[]).unwrap().into_config().telemetry;
     assert_eq!(telemetry, hylla_config::Telemetry::default());
     assert_eq!(telemetry.service_name, "hylla");
@@ -757,7 +786,7 @@ fn telemetry_is_configured_with_secret_headers() {
     assert_eq!(telemetry.logs.format, hylla_config::LogFormat::Text);
     assert!(!telemetry.logs.export);
 
-    let secrets = "telemetry: {otlp: {headers: {authorization: Bearer token}}}";
+    let secrets = r#"telemetry {otlp {headers {authorization "Bearer token"}}}"#;
     let files = Files::new("telemetry", TELEMETRY, secrets);
     let telemetry = files
         .load(&[("HYLLA__TELEMETRY__OTLP__PROTOCOL", "grpc")])
@@ -796,9 +825,11 @@ fn telemetry_is_configured_with_secret_headers() {
     assert_eq!(telemetry.logs.endpoint, None);
 
     // Headers are secret: the public file can't set them.
-    let public = format!("{TELEMETRY}  otlp:\n    headers: {{authorization: leaked}}\n")
-        .replace("  otlp:\n    endpoint: http://collector:4318\n", "");
-    let files = Files::new("telemetry-public-headers", &public, "{}");
+    let public = TELEMETRY.replace(
+        "endpoint http://collector:4318",
+        "headers {authorization leaked}",
+    );
+    let files = Files::new("telemetry-public-headers", &public, "");
     let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) = files.load(&[]) else {
         panic!("expected violations");
     };
@@ -811,8 +842,8 @@ fn telemetry_is_configured_with_secret_headers() {
 // r[verify config.flags]
 #[test]
 fn flags_override_the_config_file_and_environment() {
-    let config = "servers: {}\nbackends: {}\ntelemetry: {logs: {level: warn}}\n";
-    let files = Files::new("flags", config, "{}");
+    let config = "servers {}\nbackends {}\ntelemetry {logs {level warn}}\n";
+    let files = Files::new("flags", config, "");
     let env = [("HYLLA__TELEMETRY__LOGS__LEVEL", "info")];
     let loaded = files
         .load_with_flags(&env, &[("telemetry.logs.level", "debug")])
@@ -831,4 +862,34 @@ fn flags_override_the_config_file_and_environment() {
     // Without the flag, the environment wins over the file.
     let loaded = files.load(&env).unwrap();
     assert_eq!(loaded.config().telemetry.logs.level, "info");
+}
+
+/// The ```styx block of the README starting with `first_line`.
+fn readme_block(first_line: &str) -> String {
+    let readme =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap();
+    let start = readme
+        .find(&format!("```styx\n{first_line}\n"))
+        .unwrap_or_else(|| panic!("no README block starting with `{first_line}`"))
+        + "```styx\n".len();
+    let end = start + readme[start..].find("```").unwrap();
+    readme[start..end].to_string()
+}
+
+// r[verify config.sources]
+#[test]
+fn the_readme_example_loads() {
+    let files = Files::new(
+        "readme",
+        &readme_block("// config.styx"),
+        &readme_block("// secrets.styx"),
+    );
+    let config = files.load(&[]).unwrap().into_config();
+    assert_eq!(config.servers["public"].mappings.len(), 3);
+    assert_eq!(config.backends["assets"].refresh().unwrap().rules.len(), 2);
+    assert!(
+        config.auth["partners"]
+            .public_key
+            .starts_with("-----BEGIN PUBLIC KEY-----\n")
+    );
 }
