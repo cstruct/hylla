@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/hylla-mark-dark.svg">
+    <img src="assets/hylla-mark.svg" alt="" width="112">
+  </picture>
+</p>
+
 # hylla
 
 A caching layer in front of object storage (S3 and Azure Blob Storage), with a
