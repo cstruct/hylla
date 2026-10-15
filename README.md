@@ -139,6 +139,24 @@ rule runs on one node, metadata fetched from a backend is pushed to the other no
 others pull what a node preloads directly from it, so the backend serves it once per cluster.
 Everything between nodes is signed with the shared key.
 
+### Docker
+
+Images for `linux/amd64` and `linux/arm64` are on Docker Hub as
+[`cstruct/hylla`](https://hub.docker.com/r/cstruct/hylla): `latest` and versions such as
+`0.1.0` and `0.1` from releases, and `edge` from `main`. The config is read from
+`/etc/hylla/config.yaml`, and a disk cache at `/var/cache/hylla` can be kept on a volume:
+
+```bash
+docker run -p 8080:8080 \
+  -v ./config.yaml:/etc/hylla/config.yaml:ro \
+  -v ./secrets.yaml:/etc/hylla/secrets.yaml:ro \
+  -v hylla-cache:/var/cache/hylla \
+  cstruct/hylla --config /etc/hylla/config.yaml --secrets /etc/hylla/secrets.yaml
+```
+
+hylla runs as the distroless `nonroot` user (65532), so a directory mounted for the disk
+cache must be writable by it. A new named volume is.
+
 ## Testing
 
 ```bash
