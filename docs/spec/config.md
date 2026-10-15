@@ -25,8 +25,8 @@ backends:
 
 r[config.sources]
 The configuration MUST be loaded from a public YAML config file, an optional YAML secrets
-file and `HYLLA__` prefixed environment variables, in that order of precedence (lowest
-first).
+file, `HYLLA__` prefixed environment variables and command line flags, in that order of
+precedence (lowest first).
 
 r[config.validate]
 A loaded configuration MUST be validated, and every problem found MUST be reported
@@ -225,3 +225,11 @@ r[config.telemetry.logs]
 `logs` MUST configure logging: the `level` as filter directives, defaulting to `info`, the
 `format`, `text` (the default) or `json`, whether to `export` logs over OTLP (off by default),
 and an optional `endpoint` overriding the OTLP one.
+
+## Command line flags
+
+r[config.flags]
+Command line flags MUST override the config file and environment variables for the
+telemetry settings most often changed for a single run, and the memory cache's capacity:
+`--log-level`, `--log-format`, `--otlp-endpoint`, `--metrics`, `--traces` and
+`--cache-memory-mib`.

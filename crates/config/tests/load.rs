@@ -73,10 +73,22 @@ impl Files {
         &self,
         env: &[(&'static str, &'static str)],
     ) -> Result<hylla_config::Loaded, ConfigError> {
+        self.load_with_flags(env, &[])
+    }
+
+    fn load_with_flags(
+        &self,
+        env: &[(&'static str, &'static str)],
+        flags: &[(&str, &str)],
+    ) -> Result<hylla_config::Loaded, ConfigError> {
         load_with_env(
             &ConfigFiles {
                 config: self.config(),
                 secrets: Some(self.secrets()),
+                flags: flags
+                    .iter()
+                    .map(|(field, value)| (path(field), value.to_string()))
+                    .collect(),
             },
             EnvSource::from_vars(env.iter().copied()).prefix("HYLLA"),
         )
@@ -794,4 +806,29 @@ fn telemetry_is_configured_with_secret_headers() {
         violations.layer_mismatches()[0].path.to_string(),
         "telemetry.otlp.headers.authorization"
     );
+}
+
+// r[verify config.flags]
+#[test]
+fn flags_override_the_config_file_and_environment() {
+    let config = "servers: {}\nbackends: {}\ntelemetry: {logs: {level: warn}}\n";
+    let files = Files::new("flags", config, "{}");
+    let env = [("HYLLA__TELEMETRY__LOGS__LEVEL", "info")];
+    let loaded = files
+        .load_with_flags(&env, &[("telemetry.logs.level", "debug")])
+        .unwrap();
+    assert_eq!(loaded.config().telemetry.logs.level, "debug");
+    assert_eq!(
+        loaded
+            .source(&path("telemetry.logs.level"))
+            .unwrap()
+            .winner(),
+        &ConfigValueSource::Direct(hylla_config::Origin::Flag {
+            path: path("telemetry.logs.level"),
+        })
+    );
+
+    // Without the flag, the environment wins over the file.
+    let loaded = files.load(&env).unwrap();
+    assert_eq!(loaded.config().telemetry.logs.level, "info");
 }

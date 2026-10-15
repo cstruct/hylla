@@ -5,10 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-ordna-core = "0.1.0"
-ordna-source-env = "0.1.0"
-ordna-source-file = "0.1.0"
-ordna-source-yaml = "0.1.0"
+ordna-core = "0.1.1"
+ordna-source-env = "0.1.1"
+ordna-source-file = "0.1.1"
+ordna-source-yaml = "0.1.1"
 humantime = "2.4.0"
 regex = "1.13.1"
 # Needed by `#[config(path = ...)]` and `#[facet(tag = ...)]`, see ordna's macros.

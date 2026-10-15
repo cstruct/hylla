@@ -130,6 +130,13 @@ their `SHA256SUMS`, or build it:
 cargo run --release -p hylla-server -- --config config.yaml --secrets secrets.yaml
 ```
 
+A few settings can be overridden for a single run with flags, which win over the config
+file and `HYLLA__...` environment variables. `hylla --help` lists them:
+
+```bash
+hylla --config config.yaml --log-level debug --log-format json --metrics
+```
+
 Requests are matched to a server by their `Host` header:
 
 ```bash
