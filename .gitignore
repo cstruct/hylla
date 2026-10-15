@@ -7,3 +7,6 @@
 *.swp
 *~
 .DS_Store
+
+# Local cargo config, such as .cargo/ordna-local.toml enabled for developing with ordna
+/.cargo/config.toml

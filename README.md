@@ -1,7 +1,7 @@
 # hylla
 
 A caching layer in front of object storage (S3 and Azure Blob Storage), with a
-hybrid RAM and disk cache. Configured with [ordna](../ordna).
+hybrid RAM and disk cache. Configured with [ordna](https://github.com/cstruct/ordna).
 
 > **Note on LLM use:** large parts of this project were written with an LLM, under human
 > direction. The design and review are human.
@@ -160,3 +160,16 @@ The behaviour is specified in [docs/spec](docs/spec) and tracked with
 ```bash
 tracey query status
 ```
+
+## Developing with ordna
+
+hylla's config is built on [ordna](https://github.com/cstruct/ordna), taken from crates.io.
+To build against a checkout of ordna next to this one instead, while changing both, patch it
+in with [.cargo/ordna-local.toml](.cargo/ordna-local.toml):
+
+```bash
+ln -s ordna-local.toml .cargo/config.toml
+```
+
+`.cargo/config.toml` is ignored by git. While it's enabled, Cargo.lock records the local
+packages, so remove the link before committing changes to it.

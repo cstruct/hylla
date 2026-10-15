@@ -5,10 +5,10 @@ edition = "2024"
 rust-version = "1.90"
 
 [dependencies]
-ordna-core = { path = "../../../ordna/crates/core" }
-ordna-source-env = { path = "../../../ordna/crates/source-env" }
-ordna-source-file = { path = "../../../ordna/crates/source-file" }
-ordna-source-yaml = { path = "../../../ordna/crates/source-yaml" }
+ordna-core = "0.1.0"
+ordna-source-env = "0.1.0"
+ordna-source-file = "0.1.0"
+ordna-source-yaml = "0.1.0"
 humantime = "2.4.0"
 regex = "1.13.1"
 # Needed by `#[config(path = ...)]` and `#[facet(tag = ...)]`, see ordna's macros.

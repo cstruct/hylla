@@ -1,0 +1,11 @@
+# Builds hylla against a checkout of ordna next to it, rather than ordna from crates.io,
+# for developing both at once. Enable it with:
+#
+#     ln -s ordna-local.toml .cargo/config.toml
+#
+# Cargo.lock then records the local packages, so don't commit it while this is enabled.
+[patch.crates-io]
+ordna-core = { path = "../ordna/crates/core" }
+ordna-source-env = { path = "../ordna/crates/source-env" }
+ordna-source-file = { path = "../ordna/crates/source-file" }
+ordna-source-yaml = { path = "../ordna/crates/source-yaml" }
