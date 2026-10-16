@@ -22,6 +22,7 @@ mixtrics = { version = "0.2.6", features = ["opentelemetry_0_33"] }
 opentelemetry = { version = "0.33.1", features = ["logs", "metrics", "trace"] }
 opentelemetry-appender-tracing = "0.33.1"
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "grpc-tonic", "logs", "metrics", "trace"] }
+ordna-core = "0.1.1"
 opentelemetry_sdk = { version = "0.33.1", features = ["logs", "metrics", "trace"] }
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 serde_json = "1.0.154"
@@ -38,6 +39,7 @@ tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
+ordna-source-env = "0.1.1"
 opentelemetry-proto = { version = "0.33.1", features = ["gen-tonic-messages", "logs", "metrics", "trace"] }
 prost = "0.14.4"
 base64 = "0.23.1"

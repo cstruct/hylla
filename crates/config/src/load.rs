@@ -2,10 +2,11 @@ use std::{fmt, path::PathBuf};
 
 use ordna_core::{
     ConfigBuilder, ConfigLoadError, ConfigPath, LoadedConfig, SourceFieldPath, SourceRegistration,
+    ValueDetail, ValuesSource,
 };
 use ordna_source_env::{EnvSource, EnvSourceError, EnvVarDetail};
 use ordna_source_file::{FileSourceError, FileValueDetail};
-use ordna_source_yaml::{DeserializeError, YamlSource, yaml_file};
+use ordna_source_styx::{DeserializeError, StyxSource, styx_file};
 
 use crate::{Config, ValidationError};
 
@@ -20,6 +21,8 @@ pub struct ConfigFiles {
     pub config: PathBuf,
     /// The secrets file, holding backend credentials.
     pub secrets: Option<PathBuf>,
+    /// Values given by command line flags, overriding everything else.
+    pub flags: ValuesSource,
 }
 
 /// Where a config value came from.
@@ -34,12 +37,16 @@ pub enum Origin {
         key: String,
         path: ConfigPath,
     },
+    /// A command line flag.
+    Flag {
+        path: ConfigPath,
+    },
 }
 
 impl SourceFieldPath for Origin {
     fn field_path(&self) -> &ConfigPath {
         match self {
-            Origin::Env { path, .. } | Origin::File { path, .. } => path,
+            Origin::Env { path, .. } | Origin::File { path, .. } | Origin::Flag { path } => path,
         }
     }
 
@@ -47,6 +54,7 @@ impl SourceFieldPath for Origin {
         match self {
             Origin::Env { .. } => "env",
             Origin::File { .. } => "file",
+            Origin::Flag { .. } => "flag",
         }
     }
 }
@@ -87,7 +95,7 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Loads and validates the config from `files`, overridden by `HYLLA__...` environment
-/// variables.
+/// variables, and those by the flags given.
 pub fn load(files: &ConfigFiles) -> Result<Loaded, ConfigError> {
     load_with_env(files, EnvSource::with_prefix(ENV_PREFIX))
 }
@@ -99,16 +107,18 @@ pub fn load_with_env(files: &ConfigFiles, env: EnvSource) -> Result<Loaded, Conf
     let builder = ConfigBuilder::<Config, _, _>::new().source_named(
         "config",
         file_registration(),
-        yaml_file(&files.config),
+        styx_file(&files.config),
     );
     let builder = match &files.secrets {
         Some(secrets) => {
-            builder.source_named("secrets", file_registration(), yaml_file(secrets).secrets())
+            builder.source_named("secrets", file_registration(), styx_file(secrets).secrets())
         }
         None => builder,
     };
+    // r[impl config.flags]
     let loaded = builder
         .source_named("env", env_registration(), env)
+        .source_named("flags", flag_registration(), files.flags.clone())
         .load_with_meta()
         .map_err(ConfigError::Load)?;
     // r[impl config.validate]
@@ -116,7 +126,14 @@ pub fn load_with_env(files: &ConfigFiles, env: EnvSource) -> Result<Loaded, Conf
     Ok(loaded)
 }
 
-fn file_registration() -> SourceRegistration<YamlSource, Origin, SourceError> {
+fn flag_registration() -> SourceRegistration<ValuesSource, Origin, SourceError> {
+    SourceRegistration::new(
+        |never| match never {},
+        |path, _: ValueDetail| Origin::Flag { path },
+    )
+}
+
+fn file_registration() -> SourceRegistration<StyxSource, Origin, SourceError> {
     SourceRegistration::new(SourceError::File, |path, detail: FileValueDetail| {
         Origin::File {
             file: detail.file,

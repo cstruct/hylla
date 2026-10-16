@@ -3,30 +3,35 @@
 hylla's configuration consists of servers, which accept requests, and backends, which
 hold the objects.
 
-```yaml
-servers:
-  public:
-    listen: 0.0.0.0:8080
-    server_names: [cache.example.com]
-    mappings:
-      - path_prefix: /assets
-        backend: assets
-        rewrites:
-          - pattern: ^/assets/(.*)$
-            replace: /$1
-backends:
-  assets:
-    type: s3
-    bucket: assets
-    region: eu-north-1
+```styx
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com)
+    mappings (
+      {
+        path_prefix /assets
+        backend assets
+        rewrites ({pattern "^/assets/(.*)$", replace /$1})
+      }
+    )
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+  }
+}
 ```
 
 ## Sources
 
 r[config.sources]
-The configuration MUST be loaded from a public YAML config file, an optional YAML secrets
-file and `HYLLA__` prefixed environment variables, in that order of precedence (lowest
-first).
+The configuration MUST be loaded from a public Styx config file, an optional Styx secrets
+file, `HYLLA__` prefixed environment variables and command line flags, in that order of
+precedence (lowest first).
 
 r[config.validate]
 A loaded configuration MUST be validated, and every problem found MUST be reported
@@ -225,3 +230,24 @@ r[config.telemetry.logs]
 `logs` MUST configure logging: the `level` as filter directives, defaulting to `info`, the
 `format`, `text` (the default) or `json`, whether to `export` logs over OTLP (off by default),
 and an optional `endpoint` overriding the OTLP one.
+
+## Inspecting
+
+r[config.show]
+`hylla config show` MUST print the effective configuration as Styx, every value with a
+comment naming the source it came from and the sources it overrides, or that it is a
+default. Secret values MUST be redacted, and settings left out MUST NOT be shown.
+
+r[config.explain]
+`hylla config explain <path>` MUST print the value of the field at the path, or of every
+field under it, with the source it came from and the sources it overrides, highest
+precedence first, saying when a known field is unset and failing for an unknown one.
+Secret values MUST be redacted.
+
+## Command line flags
+
+r[config.flags]
+Command line flags MUST override the config file and environment variables for the
+telemetry settings most often changed for a single run, and the memory cache's capacity:
+`--log-level`, `--log-format`, `--otlp-endpoint`, `--metrics`, `--traces` and
+`--cache-memory-mib`.

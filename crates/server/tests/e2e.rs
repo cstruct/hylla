@@ -310,8 +310,8 @@ struct Hylla {
 
 impl Hylla {
     fn start(dir: &TempDir, name: &str, config: &str, secrets: &str) -> Self {
-        let config_path = dir.path(&format!("{name}.yaml"));
-        let secrets_path = dir.path(&format!("{name}-secrets.yaml"));
+        let config_path = dir.path(&format!("{name}.styx"));
+        let secrets_path = dir.path(&format!("{name}-secrets.styx"));
         fs::write(&config_path, config).unwrap();
         fs::write(&secrets_path, secrets).unwrap();
         let addr = listen_addr(config);
@@ -350,7 +350,7 @@ impl Hylla {
 fn listen_addr(config: &str) -> SocketAddr {
     config
         .lines()
-        .find_map(|line| line.trim().strip_prefix("listen: "))
+        .find_map(|line| line.trim().strip_prefix("listen "))
         .unwrap()
         .parse()
         .unwrap()
@@ -391,45 +391,51 @@ async fn serves_from_versitygw_and_azurite() {
 
     let listen = free_addr();
     let config = format!(
-        "\
-servers:
-  public:
-    listen: {listen}
-    server_names: [cache.example.com]
-    mappings:
-      - path_prefix: /s3
-        backend: assets
-        rewrites: [{{pattern: '^/s3/(.*)$', replace: '/$1'}}]
-      - path_prefix: /azure
-        backend: media
-        rewrites: [{{pattern: '^/azure/(.*)$', replace: '/$1'}}]
-backends:
-  assets:
-    type: s3
-    bucket: assets
-    region: us-east-1
-    endpoint: {s3}
-  media:
-    type: azure_blob
-    account: {AZURE_ACCOUNT}
-    container: media
-    endpoint: {azure}
-cache:
-  chunk_size_kib: 1
-  metadata_ttl: 1h
-",
+        r#"
+servers {{
+  public {{
+    listen {listen}
+    server_names (cache.example.com)
+    mappings (
+      {{path_prefix /s3, backend assets, rewrites ({{pattern "^/s3/(.*)$", replace /$1}})}}
+      {{path_prefix /azure, backend media, rewrites ({{pattern "^/azure/(.*)$", replace /$1}})}}
+    )
+  }}
+}}
+backends {{
+  assets {{
+    type s3
+    bucket assets
+    region us-east-1
+    endpoint {s3}
+  }}
+  media {{
+    type azure_blob
+    account {AZURE_ACCOUNT}
+    container media
+    endpoint {azure}
+  }}
+}}
+cache {{
+  chunk_size_kib 1
+  metadata_ttl 1h
+}}
+"#,
         s3 = versitygw.endpoint(),
         azure = azurite.endpoint(),
     );
     let secrets = format!(
-        "\
-backends:
-  assets:
-    access_key_id: {S3_ACCESS}
-    secret_access_key: {S3_SECRET}
-  media:
-    account_key: {AZURE_KEY}
-"
+        r#"
+backends {{
+  assets {{
+    access_key_id {S3_ACCESS}
+    secret_access_key {S3_SECRET}
+  }}
+  media {{
+    account_key "{AZURE_KEY}"
+  }}
+}}
+"#
     );
     let hylla = Hylla::start(&dir, "hylla", &config, &secrets);
 
@@ -489,39 +495,45 @@ async fn sigterm_writes_the_cache_to_disk_for_the_next_start() {
 
     let listen = free_addr();
     let config = format!(
-        "\
-servers:
-  public:
-    listen: {listen}
-    server_names: [cache.example.com]
-    mappings:
-      - path_prefix: /
-        backend: assets
-backends:
-  assets:
-    type: s3
-    bucket: assets
-    region: us-east-1
-    endpoint: {s3}
-cache:
-  chunk_size_kib: 1
-  metadata_ttl: 1h
-  write_policy: on_eviction
-  disk:
-    path: {disk}
-    capacity_mib: 64
-    block_size_mib: 1
-",
+        r#"
+servers {{
+  public {{
+    listen {listen}
+    server_names (cache.example.com)
+    mappings ({{path_prefix /, backend assets}})
+  }}
+}}
+backends {{
+  assets {{
+    type s3
+    bucket assets
+    region us-east-1
+    endpoint {s3}
+  }}
+}}
+cache {{
+  chunk_size_kib 1
+  metadata_ttl 1h
+  write_policy on_eviction
+  disk {{
+    path "{disk}"
+    capacity_mib 64
+    block_size_mib 1
+  }}
+}}
+"#,
         s3 = versitygw.endpoint(),
         disk = dir.path("cache").display(),
     );
     let secrets = format!(
-        "\
-backends:
-  assets:
-    access_key_id: {S3_ACCESS}
-    secret_access_key: {S3_SECRET}
-"
+        r#"
+backends {{
+  assets {{
+    access_key_id {S3_ACCESS}
+    secret_access_key {S3_SECRET}
+  }}
+}}
+"#
     );
     let mut hylla = Hylla::start(&dir, "hylla", &config, &secrets);
     assert_eq!(
@@ -548,49 +560,53 @@ backends:
 
 fn cluster_config(listen: SocketAddr, cluster: SocketAddr, seeds: &[String], s3: &str) -> String {
     format!(
-        "\
-servers:
-  public:
-    listen: {listen}
-    server_names: [cache.example.com]
-    mappings:
-      - path_prefix: /
-        backend: assets
-backends:
-  assets:
-    type: s3
-    bucket: assets
-    region: us-east-1
-    endpoint: {s3}
-    refresh:
-      rules:
-        - prefix: ''
-          every: 1h
-          mode: preload
-          max_objects: 10
-cache:
-  chunk_size_kib: 1
-  metadata_ttl: 1h
-cluster:
-  listen: {cluster}
-  seeds: [{seeds}]
-  gossip_interval: 300ms
-  failure_timeout: 3s
-",
-        seeds = seeds.join(", "),
+        r#"
+servers {{
+  public {{
+    listen {listen}
+    server_names (cache.example.com)
+    mappings ({{path_prefix /, backend assets}})
+  }}
+}}
+backends {{
+  assets {{
+    type s3
+    bucket assets
+    region us-east-1
+    endpoint {s3}
+    refresh {{
+      rules ({{prefix "", every 1h, mode preload, max_objects 10}})
+    }}
+  }}
+}}
+cache {{
+  chunk_size_kib 1
+  metadata_ttl 1h
+}}
+cluster {{
+  listen {cluster}
+  seeds ({seeds})
+  gossip_interval 300ms
+  failure_timeout 3s
+}}
+"#,
+        seeds = seeds.join(" "),
     )
 }
 
 fn cluster_secrets() -> String {
     format!(
-        "\
-backends:
-  assets:
-    access_key_id: {S3_ACCESS}
-    secret_access_key: {S3_SECRET}
-cluster:
-  key: {CLUSTER_KEY}
-"
+        r#"
+backends {{
+  assets {{
+    access_key_id {S3_ACCESS}
+    secret_access_key {S3_SECRET}
+  }}
+}}
+cluster {{
+  key "{CLUSTER_KEY}"
+}}
+"#
     )
 }
 

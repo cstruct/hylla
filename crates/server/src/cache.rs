@@ -250,7 +250,7 @@ impl ObjectCache {
             .storage();
         if let Some(disk) = &config.disk {
             std::fs::create_dir_all(&disk.path)
-                .with_context(|| format!("creating {}", disk.path.display()))?;
+                .with_context(|| format!("creating {}", disk.path))?;
             let device = FsDeviceBuilder::new(&disk.path)
                 .with_capacity(usize::try_from(disk.capacity_mib * 1024 * 1024)?)
                 .build()?;

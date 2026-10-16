@@ -1,21 +1,29 @@
-//! hylla's configuration, loaded with [ordna](../../../ordna).
+//! hylla's configuration, loaded with [ordna](https://github.com/cstruct/ordna) from
+//! [Styx](https://github.com/bearcove/styx) files.
 //!
-//! ```yaml
-//! servers:
-//!   public:
-//!     listen: 0.0.0.0:8080
-//!     server_names: [cache.example.com]
-//!     mappings:                  # first match wins
-//!       - path_prefix: /assets
-//!         backend: assets
-//!         rewrites:              # optional, applied in order
-//!           - pattern: ^/assets/(.*)$
-//!             replace: /$1       # /assets/x → /x on the backend
-//! backends:
-//!   assets:
-//!     type: s3
-//!     bucket: assets
-//!     region: eu-north-1
+//! ```styx
+//! servers {
+//!   public {
+//!     listen 0.0.0.0:8080
+//!     server_names (cache.example.com)
+//!     // First match wins.
+//!     mappings (
+//!       {
+//!         path_prefix /assets
+//!         backend assets
+//!         // Optional, applied in order: /assets/x is /x on the backend.
+//!         rewrites ({pattern "^/assets/(.*)$", replace /$1})
+//!       }
+//!     )
+//!   }
+//! }
+//! backends {
+//!   assets {
+//!     type s3
+//!     bucket assets
+//!     region eu-north-1
+//!   }
+//! }
 //! ```
 //!
 //! Backend credentials are secret: they can only come from the secrets file.
@@ -23,6 +31,7 @@
 mod interval;
 mod load;
 mod router;
+mod show;
 mod template;
 mod validate;
 
@@ -35,6 +44,7 @@ pub use load::{
     ConfigError, ConfigFiles, ENV_PREFIX, Loaded, Origin, SourceError, load, load_with_env,
 };
 pub use router::{Route, Router};
+pub use show::{ExplainError, explain, render};
 pub use template::{InvalidTemplate, PathTemplate, RenderError, under_prefix};
 pub use validate::ValidationError;
 
@@ -271,7 +281,7 @@ config_tree! {
             /// The disk tier. Without it, only memory is used.
             pub disk: Option<pub struct DiskCache {
                 /// The directory the cache is stored in.
-                pub path: std::path::PathBuf,
+                pub path: String,
                 /// Capacity in MiB.
                 pub capacity_mib: u64,
                 /// Size of foyer's disk blocks in MiB. A chunk must fit in a block.
@@ -492,7 +502,7 @@ pub struct RefreshRule {
 #[facet(rename_all = "snake_case")]
 pub enum RefreshMode {
     /// Nothing, disabling the rule. Spelled `disabled` rather than `none` or `off`, which
-    /// YAML parsers may read as null or false.
+    /// some config formats read as null or false.
     Disabled,
     /// Re-checks cached objects, updating their metadata, so changes are picked up without
     /// requests waiting on the backend.

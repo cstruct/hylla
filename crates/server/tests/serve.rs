@@ -331,7 +331,7 @@ async fn serves_through_a_disk_tier() {
         write_policy: WritePolicy::OnInsertion,
         memory: MemoryCache { capacity_mib: 1 },
         disk: Some(DiskCache {
-            path: dir.clone(),
+            path: dir.display().to_string(),
             capacity_mib: 16,
             block_size_mib: 1,
         }),
@@ -366,7 +366,7 @@ fn disk_cache(
         write_policy: WritePolicy::OnEviction,
         memory: MemoryCache { capacity_mib: 1 },
         disk: Some(DiskCache {
-            path: dir.to_path_buf(),
+            path: dir.display().to_string(),
             capacity_mib: 16,
             block_size_mib: 1,
         }),
