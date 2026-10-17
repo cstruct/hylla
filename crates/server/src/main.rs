@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use hylla_config::{ConfigFiles, explain, load, render};
+use hylla_config::{ConfigFiles, explain, inspect, load, render};
 use hylla_server::{App, backend, serve, telemetry};
 use ordna_core::{ConfigPath, ValuesSource};
 
@@ -110,13 +110,19 @@ async fn main() -> anyhow::Result<()> {
     match args.command.unwrap_or(Command::Serve) {
         Command::Serve => run(&files).await,
         // r[impl config.show]
+        // r[impl config.show.missing]
+        // A config that doesn't load is shown as far as it got, and then fails.
         Command::Config(ConfigCommand::Show) => {
-            print!("{}", render(&load(&files)?));
+            let inspected = inspect(&files)?;
+            print!("{}", render(&inspected));
+            inspected.into_loaded()?;
             Ok(())
         }
         // r[impl config.explain]
         Command::Config(ConfigCommand::Explain { path }) => {
-            print!("{}", explain(&load(&files)?, &path)?);
+            let inspected = inspect(&files)?;
+            print!("{}", explain(&inspected, &path)?);
+            inspected.into_loaded()?;
             Ok(())
         }
     }

@@ -238,6 +238,12 @@ r[config.show]
 comment naming the source it came from and the sources it overrides, or that it is a
 default. Secret values MUST be redacted, and settings left out MUST NOT be shown.
 
+r[config.show.missing]
+When the configuration doesn't load, `hylla config show` and `hylla config explain` MUST
+show it as far as it loaded, marking every required field no source set as missing, and
+then fail with the reasons it doesn't load. An invalid configuration MUST be shown in full
+before failing with its validation errors.
+
 r[config.explain]
 `hylla config explain <path>` MUST print the value of the field at the path, or of every
 field under it, with the source it came from and the sources it overrides, highest

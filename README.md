@@ -185,6 +185,20 @@ cache {
 `hylla config explain cache.metadata_ttl` shows one field's sources, highest precedence
 first, or those of every field in a section such as `cache`. Secrets are redacted in both.
 
+A config that doesn't load is shown as far as it got, with the required fields no source
+set marked, and the command then fails with what's wrong. Without `--secrets`, that shows
+everything but the credentials:
+
+```styx
+backends {
+  assets {
+    type s3                        // config.styx
+    bucket assets                  // config.styx
+    region eu-north-1              // config.styx
+    access_key_id "<missing>"      // missing: required, but not set
+    secret_access_key "<missing>"  // missing: required, but not set
+```
+
 Requests are matched to a server by their `Host` header:
 
 ```bash
