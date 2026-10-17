@@ -56,6 +56,10 @@ header. Its first name MUST be its public host, used for absolute URLs.
 r[config.server.mappings]
 A server MUST have a list of mappings from request path prefixes to backends.
 
+r[config.validate.mappings]
+A configuration without a server with at least one mapping MUST be reported as invalid,
+since it would serve nothing.
+
 r[config.validate.server-names]
 A server without server names MUST be reported as invalid.
 

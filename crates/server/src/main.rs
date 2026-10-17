@@ -221,7 +221,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hylla-flags-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("config.styx");
-        std::fs::write(&config, "servers {}\nbackends {}\n").unwrap();
+        std::fs::write(
+            &config,
+            "servers {public {listen 0.0.0.0:8080, server_names (a), mappings ({path_prefix /, backend b})}}
+backends {b {type s3, bucket b, region r}}
+",
+        )
+        .unwrap();
+        let secrets = dir.join("secrets.styx");
+        std::fs::write(
+            &secrets,
+            "backends {b {access_key_id a, secret_access_key b}}",
+        )
+        .unwrap();
         let args = Args::try_parse_from([
             "hylla",
             "--log-level=debug",
@@ -238,7 +250,7 @@ mod tests {
             &ConfigFiles {
                 config,
                 config_required: true,
-                secrets: None,
+                secrets: Some(secrets),
                 flags: args.flags.values(),
             },
             EnvSource::from_vars(Vec::<(String, String)>::new()),

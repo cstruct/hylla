@@ -11,6 +11,8 @@ pub enum ValidationError {
         mapping: usize,
         backend: String,
     },
+    /// No server maps any requests to a backend, so hylla would serve nothing.
+    NoMappings,
     /// A server has no server names.
     NoServerNames { server: String },
     /// A mapping's path prefix doesn't start with `/`.
@@ -68,6 +70,10 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "mapping {mapping} of server `{server}` uses unknown backend `{backend}`"
+            ),
+            Self::NoMappings => write!(
+                f,
+                "no server maps requests to a backend: configure a server with at least one mapping"
             ),
             Self::NoServerNames { server } => write!(f, "server `{server}` has no server names"),
             Self::RelativePath {
@@ -155,6 +161,15 @@ impl Config {
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
         let mut hosts = BTreeMap::<(SocketAddr, String), Vec<String>>::new();
+
+        // r[impl config.validate.mappings]
+        if self
+            .servers
+            .values()
+            .all(|server| server.mappings.is_empty())
+        {
+            errors.push(ValidationError::NoMappings);
+        }
 
         let mut servers = self.servers.iter().collect::<Vec<_>>();
         servers.sort_by_key(|(name, _)| *name);
