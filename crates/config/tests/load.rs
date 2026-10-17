@@ -88,6 +88,7 @@ impl Files {
         hylla_config::inspect_with_env(
             &ConfigFiles {
                 config: self.config(),
+                config_required: true,
                 secrets: secrets.then(|| self.secrets()),
                 flags: Default::default(),
             },
@@ -104,6 +105,7 @@ impl Files {
         load_with_env(
             &ConfigFiles {
                 config: self.config(),
+                config_required: true,
                 secrets: Some(self.secrets()),
                 flags: flags
                     .iter()
@@ -1148,4 +1150,32 @@ fn show_prints_an_invalid_config_before_failing() {
             .any(|error| matches!(error, ValidationError::UnknownBackend { backend, .. } if backend == "nope")),
         "{errors:?}"
     );
+}
+
+// r[verify config.file]
+#[test]
+fn a_required_config_file_must_exist_and_an_optional_one_may_not() {
+    let files = Files::new("config-file", "", "");
+    let missing = files.dir.join("nope.styx");
+    let inspect = |config_required| {
+        hylla_config::inspect_with_env(
+            &ConfigFiles {
+                config: missing.clone(),
+                config_required,
+                secrets: None,
+                flags: Default::default(),
+            },
+            EnvSource::from_vars([("HYLLA__CACHE__METADATA_TTL", "1m")]).prefix("HYLLA"),
+        )
+    };
+
+    let error = inspect(true).unwrap_err().to_string();
+    assert!(
+        error.starts_with(&format!("failed to read `{}`: ", missing.display())),
+        "{error}"
+    );
+
+    // Without the file, the config is loaded from the other sources.
+    let loaded = inspect(false).unwrap().into_loaded().unwrap();
+    assert_eq!(loaded.config().cache.metadata_ttl, Interval::from_secs(60));
 }

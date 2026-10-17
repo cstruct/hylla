@@ -33,6 +33,10 @@ The configuration MUST be loaded from a public Styx config file, an optional Sty
 file, `HYLLA__` prefixed environment variables and command line flags, in that order of
 precedence (lowest first).
 
+r[config.file]
+A config file given with `--config` MUST exist. Without `--config`, `config.styx` MUST be
+read if it exists, and the configuration loaded without a config file otherwise.
+
 r[config.validate]
 A loaded configuration MUST be validated, and every problem found MUST be reported
 together.

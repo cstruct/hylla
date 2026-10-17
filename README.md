@@ -162,6 +162,10 @@ their `SHA256SUMS`, or build it:
 cargo run --release -p hylla-server -- --config config.styx --secrets secrets.styx
 ```
 
+Without `--config`, hylla reads `config.styx` from the working directory if there is one,
+and otherwise runs on environment variables and flags alone. A file given with `--config`
+must exist.
+
 A few settings can be overridden for a single run with flags, which win over the config
 file and `HYLLA__...` environment variables. `hylla --help` lists them:
 
