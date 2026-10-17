@@ -6,15 +6,18 @@ use hylla_config::{ConfigFiles, explain, inspect, load, render};
 use hylla_server::{App, backend, serve, telemetry};
 use ordna_core::{ConfigPath, ValuesSource};
 
+/// The config file read when `--config` isn't given, if it exists.
+const DEFAULT_CONFIG: &str = "config.styx";
+
 /// A caching layer in front of object storage.
 #[derive(Parser)]
 #[command(name = "hylla", version)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
-    /// The config file.
-    #[arg(long, default_value = "config.styx", global = true)]
-    config: PathBuf,
+    /// The config file. Without it, `config.styx` is read if it exists
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     /// The secrets file, holding backend credentials.
     #[arg(long, global = true)]
     secrets: Option<PathBuf>,
@@ -102,8 +105,10 @@ impl ConfigFlags {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    // r[impl config.file]
     let files = ConfigFiles {
-        config: args.config,
+        config_required: args.config.is_some(),
+        config: args.config.unwrap_or_else(|| DEFAULT_CONFIG.into()),
         secrets: args.secrets,
         flags: args.flags.values(),
     };
@@ -191,7 +196,7 @@ mod tests {
 
         let args = Args::try_parse_from(["hylla", "config", "show", "--config", "b.styx"]).unwrap();
         assert_eq!(args.command, Some(Command::Config(ConfigCommand::Show)));
-        assert_eq!(args.config, std::path::PathBuf::from("b.styx"));
+        assert_eq!(args.config, Some(std::path::PathBuf::from("b.styx")));
 
         let args = Args::try_parse_from([
             "hylla",
@@ -216,7 +221,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hylla-flags-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("config.styx");
-        std::fs::write(&config, "servers {}\nbackends {}\n").unwrap();
+        std::fs::write(
+            &config,
+            "servers {public {listen 0.0.0.0:8080, server_names (a), mappings ({path_prefix /, backend b})}}
+backends {b {type s3, bucket b, region r}}
+",
+        )
+        .unwrap();
+        let secrets = dir.join("secrets.styx");
+        std::fs::write(
+            &secrets,
+            "backends {b {access_key_id a, secret_access_key b}}",
+        )
+        .unwrap();
         let args = Args::try_parse_from([
             "hylla",
             "--log-level=debug",
@@ -232,7 +249,8 @@ mod tests {
         let loaded = load_with_env(
             &ConfigFiles {
                 config,
-                secrets: None,
+                config_required: true,
+                secrets: Some(secrets),
                 flags: args.flags.values(),
             },
             EnvSource::from_vars(Vec::<(String, String)>::new()),

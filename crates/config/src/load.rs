@@ -19,6 +19,9 @@ pub const ENV_PREFIX: &str = "HYLLA";
 pub struct ConfigFiles {
     /// The public config file.
     pub config: PathBuf,
+    /// Whether the config file must exist. Without it, a missing file sets nothing, as for
+    /// the default file, which hylla runs without when it isn't there.
+    pub config_required: bool,
     /// The secrets file, holding backend credentials.
     pub secrets: Option<PathBuf>,
     /// Values given by command line flags, overriding everything else.
@@ -148,7 +151,10 @@ impl fmt::Display for ConfigError {
                 }
                 Ok(())
             }
-            Self::Load(error) => write!(f, "failed to load the config: {error:?}"),
+            Self::Load(ConfigLoadError::Source(error)) => match &error.error {
+                SourceError::File(error) => write!(f, "{error}"),
+                SourceError::Env(error) => write!(f, "failed to read the environment: {error}"),
+            },
             Self::Invalid(errors) => {
                 write!(f, "invalid config:")?;
                 for error in errors {
@@ -190,7 +196,7 @@ pub fn inspect_with_env(files: &ConfigFiles, env: EnvSource) -> Result<Inspected
     let builder = ConfigBuilder::<Config, _, _>::new().source_named(
         "config",
         file_registration(),
-        styx_file(&files.config),
+        config_file(files),
     );
     let builder = match &files.secrets {
         Some(secrets) => {
@@ -216,6 +222,16 @@ pub fn inspect_with_env(files: &ConfigFiles, env: EnvSource) -> Result<Inspected
         Err(PartialLoadError::Source(error)) => {
             Err(ConfigError::Load(ConfigLoadError::Source(error)))
         }
+    }
+}
+
+// r[impl config.file]
+fn config_file(files: &ConfigFiles) -> StyxSource {
+    let file = styx_file(&files.config);
+    if files.config_required {
+        file
+    } else {
+        file.optional()
     }
 }
 

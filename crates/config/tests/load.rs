@@ -54,6 +54,12 @@ backends {
 }
 ";
 
+/// A server mapping requests to a backend, for tests of other settings: a config without
+/// one is invalid. Its credentials are [`MINIMAL_SECRETS`].
+const MINIMAL: &str = "servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}\nbackends {assets {type s3, bucket assets, region eu-north-1}}\n";
+
+const MINIMAL_SECRETS: &str = "backends {assets {access_key_id a, secret_access_key b}}\n";
+
 struct Files {
     dir: PathBuf,
 }
@@ -88,6 +94,7 @@ impl Files {
         hylla_config::inspect_with_env(
             &ConfigFiles {
                 config: self.config(),
+                config_required: true,
                 secrets: secrets.then(|| self.secrets()),
                 flags: Default::default(),
             },
@@ -104,6 +111,7 @@ impl Files {
         load_with_env(
             &ConfigFiles {
                 config: self.config(),
+                config_required: true,
                 secrets: Some(self.secrets()),
                 flags: flags
                     .iter()
@@ -431,7 +439,7 @@ fn cache_sizes_are_validated() {
 }
 
 const REFRESH: &str = r#"
-servers {}
+servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
 backends {
   assets {
     type s3
@@ -515,7 +523,7 @@ fn backends_configure_refresh_rules() {
 #[test]
 fn refresh_rules_are_validated() {
     let config = "
-servers {}
+servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
 backends {
   assets {
     type s3
@@ -676,8 +684,8 @@ fn mapping_auth_is_validated() {
 }
 
 const CLUSTER: &str = "
-servers {}
-backends {}
+servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
+backends {assets {type s3, bucket assets, region eu-north-1}}
 cluster {
   listen 0.0.0.0:7946
   advertise 10.0.0.5:7946
@@ -692,7 +700,10 @@ cluster {
 // r[verify config.cluster.share]
 #[test]
 fn clusters_are_configured_with_a_secret_key() {
-    let secrets = r#"cluster {key "a cluster key of at least thirty-two characters"}"#;
+    let secrets = &format!(
+        r#"cluster {{key "a cluster key of at least thirty-two characters"}}
+{MINIMAL_SECRETS}"#
+    );
     let files = Files::new("cluster", CLUSTER, secrets);
     let cluster = files.load(&[]).unwrap().into_config().cluster.unwrap();
     assert_eq!(cluster.listen, "0.0.0.0:7946".parse().unwrap());
@@ -731,15 +742,19 @@ fn clusters_are_configured_with_a_secret_key() {
 #[test]
 fn cluster_settings_are_validated() {
     let config = "
-servers {}
-backends {}
+servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
+backends {assets {type s3, bucket assets, region eu-north-1}}
 cluster {
   listen 0.0.0.0:7946
   seeds (10.0.0.6 :7946)
   gossip_interval 10s
 }
 ";
-    let files = Files::new("cluster-invalid", config, "cluster {key short}");
+    let files = Files::new(
+        "cluster-invalid",
+        config,
+        &format!("cluster {{key short}}\n{MINIMAL_SECRETS}"),
+    );
     let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
         panic!("expected validation errors");
     };
@@ -758,8 +773,8 @@ cluster {
 }
 
 const TELEMETRY: &str = r#"
-servers {}
-backends {}
+servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
+backends {assets {type s3, bucket assets, region eu-north-1}}
 telemetry {
   resource ({key deployment.environment, value production})
   otlp {
@@ -790,7 +805,7 @@ telemetry {
 // r[verify config.telemetry.logs]
 #[test]
 fn telemetry_is_configured_with_secret_headers() {
-    let files = Files::new("telemetry-defaults", "servers {}\nbackends {}\n", "");
+    let files = Files::new("telemetry-defaults", MINIMAL, MINIMAL_SECRETS);
     let telemetry = files.load(&[]).unwrap().into_config().telemetry;
     assert_eq!(telemetry, hylla_config::Telemetry::default());
     assert_eq!(telemetry.service_name, "hylla");
@@ -803,7 +818,10 @@ fn telemetry_is_configured_with_secret_headers() {
     assert_eq!(telemetry.logs.format, hylla_config::LogFormat::Text);
     assert!(!telemetry.logs.export);
 
-    let secrets = r#"telemetry {otlp {headers {authorization "Bearer token"}}}"#;
+    let secrets = &format!(
+        r#"telemetry {{otlp {{headers {{authorization "Bearer token"}}}}}}
+{MINIMAL_SECRETS}"#
+    );
     let files = Files::new("telemetry", TELEMETRY, secrets);
     let telemetry = files
         .load(&[("HYLLA__TELEMETRY__OTLP__PROTOCOL", "grpc")])
@@ -859,8 +877,8 @@ fn telemetry_is_configured_with_secret_headers() {
 // r[verify config.flags]
 #[test]
 fn flags_override_the_config_file_and_environment() {
-    let config = "servers {}\nbackends {}\ntelemetry {logs {level warn}}\n";
-    let files = Files::new("flags", config, "");
+    let config = format!("{MINIMAL}telemetry {{logs {{level warn}}}}\n");
+    let files = Files::new("flags", &config, MINIMAL_SECRETS);
     let env = [("HYLLA__TELEMETRY__LOGS__LEVEL", "info")];
     let loaded = files
         .load_with_flags(&env, &[("telemetry.logs.level", "debug")])
@@ -1148,4 +1166,64 @@ fn show_prints_an_invalid_config_before_failing() {
             .any(|error| matches!(error, ValidationError::UnknownBackend { backend, .. } if backend == "nope")),
         "{errors:?}"
     );
+}
+
+// r[verify config.file]
+#[test]
+fn a_required_config_file_must_exist_and_an_optional_one_may_not() {
+    let files = Files::new("config-file", "", "");
+    let missing = files.dir.join("nope.styx");
+    let inspect = |config_required| {
+        hylla_config::inspect_with_env(
+            &ConfigFiles {
+                config: missing.clone(),
+                config_required,
+                secrets: None,
+                flags: Default::default(),
+            },
+            EnvSource::from_vars([("HYLLA__CACHE__METADATA_TTL", "1m")]).prefix("HYLLA"),
+        )
+    };
+
+    let error = inspect(true).unwrap_err().to_string();
+    assert!(
+        error.starts_with(&format!("failed to read `{}`: ", missing.display())),
+        "{error}"
+    );
+
+    // Without the file, the config is loaded from the other sources. Without a server
+    // it's invalid, but still shows.
+    let hylla_config::Inspected::Loaded { loaded, invalid } = inspect(false).unwrap() else {
+        panic!("expected the config to load");
+    };
+    assert_eq!(invalid, [ValidationError::NoMappings]);
+    assert_eq!(loaded.config().cache.metadata_ttl, Interval::from_secs(60));
+}
+
+// r[verify config.validate.mappings]
+#[test]
+fn a_config_must_map_requests_to_a_backend() {
+    let config = "
+servers {public {listen 0.0.0.0:8080, server_names (cache.example.com)}}
+backends {assets {type s3, bucket assets, region eu-north-1}}
+";
+    let files = Files::new("no-mappings", config, MINIMAL_SECRETS);
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    assert_eq!(errors, [ValidationError::NoMappings]);
+
+    // It still shows, failing afterwards.
+    let inspected = files.inspect(true);
+    let shown = hylla_config::render(&inspected);
+    assert!(shown.contains("    listen 0.0.0.0:8080"), "{shown}");
+    assert_eq!(
+        inspected.into_loaded().unwrap_err().to_string(),
+        "invalid config:\n- no server maps requests to a backend: configure a server with at \
+         least one mapping"
+    );
+
+    // One server with a mapping is enough.
+    let files = Files::new("one-mapping", MINIMAL, MINIMAL_SECRETS);
+    files.load(&[]).unwrap();
 }
