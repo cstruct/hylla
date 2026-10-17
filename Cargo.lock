@@ -1956,21 +1956,22 @@ dependencies = [
 
 [[package]]
 name = "ordna-core"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6f869ace93125494e7bb5509bcc28189cc9937403daf8bd063ed7ed5dd81752"
+checksum = "27f60e4821a6445bea65b18ccbbab7445beb38673cda89f6ade567131e1149b6"
 dependencies = [
  "facet",
  "facet-core",
+ "facet-reflect",
  "facet-value",
  "ordna-macros",
 ]
 
 [[package]]
 name = "ordna-macros"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61fe71f6a25f0ea856fff38259bcbe81d2b5af91e36979ab78532829666e01d2"
+checksum = "6e70ace10c993057b1a635c62b827c294ca1a00e329c9f7298e90c006a0870c3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1979,9 +1980,9 @@ dependencies = [
 
 [[package]]
 name = "ordna-source-env"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65ba0f16b7b841655204329e205be7c560882e1bd48d38ffa4f469d0c3b56e48"
+checksum = "adea14c28db4d774dbd617ab029e0147828c86b25e5a2171192db057c753185b"
 dependencies = [
  "facet-value",
  "ordna-core",
@@ -1989,9 +1990,9 @@ dependencies = [
 
 [[package]]
 name = "ordna-source-file"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bed22c21027b3f830acb3aa6f54c8f5cc7ba9210a707555a230a03945a476d38"
+checksum = "fd905ca183fa9ab34d844f6ab99d2c38f38d5f0ba0856e1d5904291df61f7870"
 dependencies = [
  "facet-value",
  "ordna-core",
@@ -1999,9 +2000,9 @@ dependencies = [
 
 [[package]]
 name = "ordna-source-styx"
-version = "0.1.1"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45fda36588c10b55be217abaca50ed4906dfd01927f090a465b63c683612e995"
+checksum = "1699d321e9bc316379bd2d87e2af78499469eb35c240b2deb8d7476f3682ef12"
 dependencies = [
  "facet-styx",
  "facet-value",

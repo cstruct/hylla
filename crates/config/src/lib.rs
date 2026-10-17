@@ -41,7 +41,8 @@ use ordna_core::{config, config_tree};
 
 pub use interval::Interval;
 pub use load::{
-    ConfigError, ConfigFiles, ENV_PREFIX, Loaded, Origin, SourceError, load, load_with_env,
+    ConfigError, ConfigFiles, ENV_PREFIX, Inspected, Loaded, Origin, SourceError, inspect,
+    inspect_with_env, load, load_with_env,
 };
 pub use router::{Route, Router};
 pub use show::{ExplainError, explain, render};

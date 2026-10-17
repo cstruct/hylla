@@ -83,6 +83,19 @@ impl Files {
         self.load_with_flags(env, &[])
     }
 
+    /// The config as far as it loads, without the secrets file when `secrets` is false.
+    fn inspect(&self, secrets: bool) -> hylla_config::Inspected {
+        hylla_config::inspect_with_env(
+            &ConfigFiles {
+                config: self.config(),
+                secrets: secrets.then(|| self.secrets()),
+                flags: Default::default(),
+            },
+            EnvSource::from_vars::<&str, &str>([]).prefix("HYLLA"),
+        )
+        .unwrap()
+    }
+
     fn load_with_flags(
         &self,
         env: &[(&'static str, &'static str)],
@@ -487,7 +500,11 @@ fn backends_configure_refresh_rules() {
 
     // Durations must parse.
     let invalid = REFRESH.replace("every 15m", "every soon");
-    let files = Files::new("refresh-duration", &invalid, "");
+    let files = Files::new(
+        "refresh-duration",
+        &invalid,
+        "backends {assets {access_key_id a, secret_access_key b}}",
+    );
     let Err(ConfigError::Load(ConfigLoadError::Violations(violations))) = files.load(&[]) else {
         panic!("expected violations");
     };
@@ -932,9 +949,9 @@ fn shown() -> hylla_config::Loaded {
 #[test]
 fn show_prints_the_effective_config_with_sources() {
     let loaded = shown();
-    let shown = hylla_config::render(&loaded);
     let config = loaded_file(&loaded, "config.styx");
     let secrets = loaded_file(&loaded, "secrets.styx");
+    let shown = hylla_config::render(&loaded.into());
     for expected in [
         "    listen 0.0.0.0:8080".to_string(),
         format!("// {config}"),
@@ -976,6 +993,7 @@ fn loaded_file(loaded: &hylla_config::Loaded, name: &str) -> String {
 fn explain_shows_the_shadow_chain() {
     let loaded = shown();
     let config = loaded_file(&loaded, "config.styx");
+    let loaded = hylla_config::Inspected::from(loaded);
     assert_eq!(
         hylla_config::explain(&loaded, "cache.metadata_ttl").unwrap(),
         format!(
@@ -1027,10 +1045,107 @@ fn the_readme_example_shows_as_styx() {
         &readme_block("// config.styx"),
         &readme_block("// secrets.styx"),
     );
-    let shown = hylla_config::render(&files.load(&[]).unwrap());
+    let shown = hylla_config::render(&files.load(&[]).unwrap().into());
     facet_styx::from_str::<facet_value::Value>(&shown).unwrap();
     assert!(
         shown.contains("public_key \"-----BEGIN PUBLIC KEY-----\\n"),
         "{shown}"
+    );
+}
+
+const INCOMPLETE: &str = "
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com)
+    mappings (
+      {path_prefix /assets, backend assets}
+      {backend assets}
+    )
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+  }
+}
+cluster {
+  listen 10.0.0.1:7000
+}
+";
+
+// r[verify config.show.missing]
+#[test]
+fn show_marks_the_missing_fields_of_a_config_that_does_not_load() {
+    let files = Files::new("show-missing", INCOMPLETE, "");
+    let inspected = files.inspect(false);
+    let shown = hylla_config::render(&inspected);
+    for expected in [
+        "    bucket assets",
+        "    access_key_id \"<missing>\"      // missing: required, but not set",
+        "    secret_access_key \"<missing>\"  // missing: required, but not set",
+        "  key \"<missing>\"                 // missing: required, but not set",
+        // Items of lists are marked on their line.
+        "      {path_prefix \"<missing>\", backend assets, rewrites ()}  // missing: path_prefix",
+        // Defaults are filled in, in the order a loaded config shows them.
+        "  seeds ()                        // default\n  gossip_interval 1s",
+    ] {
+        assert!(
+            shown.contains(expected),
+            "`{expected}` missing from:\n{shown}"
+        );
+    }
+    facet_styx::from_str::<facet_value::Value>(&shown).unwrap();
+
+    let error = inspected.into_loaded().unwrap_err().to_string();
+    assert_eq!(
+        error,
+        "failed to load the config:
+- missing required field `servers.public.mappings.1.path_prefix`
+- missing required field `backends.assets.access_key_id`
+- missing required field `backends.assets.secret_access_key`
+- missing required field `cluster.key`"
+    );
+}
+
+// r[verify config.show.missing]
+#[test]
+fn explain_says_which_fields_are_missing() {
+    let files = Files::new("explain-missing", INCOMPLETE, "");
+    let inspected = files.inspect(false);
+    let explained = hylla_config::explain(&inspected, "backends.assets").unwrap();
+    assert!(
+        explained.ends_with(
+            "backends.assets.access_key_id is missing: required, but not set
+backends.assets.secret_access_key is missing: required, but not set
+"
+        ),
+        "{explained}"
+    );
+    assert_eq!(
+        hylla_config::explain(&inspected, "servers.public.mappings.1.path_prefix").unwrap(),
+        "servers.public.mappings.1.path_prefix is missing: required, but not set\n"
+    );
+}
+
+// r[verify config.show.missing]
+#[test]
+fn show_prints_an_invalid_config_before_failing() {
+    let config = CONFIG.replace("backend archive", "backend nope");
+    let files = Files::new("show-invalid", &config, SECRETS);
+    let inspected = files.inspect(true);
+    let shown = hylla_config::render(&inspected);
+    assert!(shown.contains("backend nope"), "{shown}");
+    assert!(!shown.contains("<missing>"), "{shown}");
+    let Err(ConfigError::Invalid(errors)) = inspected.into_loaded() else {
+        panic!("expected validation errors");
+    };
+    assert!(
+        errors
+            .iter()
+            .any(|error| matches!(error, ValidationError::UnknownBackend { backend, .. } if backend == "nope")),
+        "{errors:?}"
     );
 }
