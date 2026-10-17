@@ -1,11 +1,11 @@
 name: Docker
 
+# Images are pushed for version tags only, through the release workflow once CI passes.
+# Pull requests, and runs started by hand on a branch, only check that the image builds;
+# started by hand on a version tag, a run pushes that version again.
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
-  # Releases push their version tags through the release workflow, once CI passes.
   workflow_call:
 
 permissions:
@@ -18,16 +18,16 @@ concurrency:
 env:
   # The Docker Hub repository, overridable with the DOCKERHUB_IMAGE variable.
   IMAGE: ${{ vars.DOCKERHUB_IMAGE || 'cstruct/hylla' }}
-  # Pull requests only check that the image builds.
-  PUSH: ${{ github.event_name != 'pull_request' }}
+  # Only version tags are pushed.
+  PUSH: ${{ startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   build:
     name: Build (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    # The Docker Hub credentials are in the deploy environment; pull requests don't push.
-    environment: ${{ github.event_name != 'pull_request' && 'deploy' || '' }}
+    # The Docker Hub credentials are in the deploy environment, only needed to push.
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'deploy' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -90,7 +90,7 @@ jobs:
 
   merge:
     name: Push the image
-    if: github.event_name != 'pull_request'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -112,7 +112,7 @@ jobs:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # v1.2.3 tags 1.2.3, 1.2 and latest; main tags edge; every push tags sha-<commit>.
+      # v1.2.3 tags 1.2.3, 1.2 and latest; a prerelease such as v1.3.0-rc.1 only 1.3.0-rc.1.
       - name: Image tags
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -121,8 +121,6 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=edge,branch=main
-            type=sha
 
       - name: Create the multi-platform image
         working-directory: ${{ runner.temp }}/digests

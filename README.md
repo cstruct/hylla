@@ -227,7 +227,7 @@ Everything between nodes is signed with the shared key.
 
 Images for `linux/amd64` and `linux/arm64` are on Docker Hub as
 [`cstruct/hylla`](https://hub.docker.com/r/cstruct/hylla): `latest` and versions such as
-`0.1.0` and `0.1` from releases, and `edge` from `main`. The config is read from
+`0.1.0` and `0.1`, pushed by releases only. The config is read from
 `/etc/hylla/config.styx`, and a disk cache at `/var/cache/hylla` can be kept on a volume:
 
 ```bash
