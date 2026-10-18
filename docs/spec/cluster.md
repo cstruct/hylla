@@ -53,6 +53,14 @@ r[cluster.share-preload]
 Objects a node preloads MUST be announced to the other live nodes, unless sharing preloads
 is turned off.
 
+r[cluster.share-forgets]
+Objects changed through a node's control plane MUST be announced to the other live nodes,
+whatever sharing is turned off, so they forget their metadata too.
+
+r[cluster.apply-forgets]
+A node MUST forget the metadata of objects another node announces as changed, after applying
+the metadata in the same update, so metadata fetched before the change doesn't stay.
+
 r[cluster.reannounce]
 Preload runs MUST announce unchanged objects too, so nodes that joined later catch up on the
 next run, pulling only the chunks they don't have.

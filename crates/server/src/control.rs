@@ -362,7 +362,7 @@ impl Plane {
         )
         .await?;
         // r[impl control.invalidate]
-        self.app.cache.forget(&mapping.backend, &key);
+        self.app.cache.forget_everywhere(&mapping.backend, &key);
         Ok(())
     }
 
@@ -371,7 +371,7 @@ impl Plane {
         let key = mapping.key(path)?;
         let store = self.store(mapping)?;
         spans::backend_call(&mapping.backend, "delete", Some(&key), store.delete(&key)).await?;
-        self.app.cache.forget(&mapping.backend, &key);
+        self.app.cache.forget_everywhere(&mapping.backend, &key);
         Ok(())
     }
 
@@ -392,8 +392,8 @@ impl Plane {
             store.rename(&from, &to),
         )
         .await?;
-        self.app.cache.forget(&mapping.backend, &from);
-        self.app.cache.forget(&mapping.backend, &to);
+        self.app.cache.forget_everywhere(&mapping.backend, &from);
+        self.app.cache.forget_everywhere(&mapping.backend, &to);
         Ok(())
     }
 

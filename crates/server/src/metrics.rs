@@ -76,7 +76,9 @@ pub static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
             .build(),
         cluster_updates: meter
             .u64_counter("hylla.cluster.updates")
-            .with_description("Metadata and preload updates sent to and received from nodes")
+            .with_description(
+                "Metadata, preload and forget updates sent to and received from nodes",
+            )
             .build(),
         cluster_pulled_chunks: meter
             .u64_counter("hylla.cluster.pulled_chunks")

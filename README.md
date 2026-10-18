@@ -221,7 +221,7 @@ With a `cluster`, nodes find each other by gossip through their seeds; a DNS nam
 returning every node, such as a Kubernetes headless service, works as a seed. Each refresh
 rule runs on one node, metadata fetched from a backend is pushed to the other nodes, and the
 others pull what a node preloads directly from it, so the backend serves it once per cluster.
-Everything between nodes is signed with the shared key.
+Objects changed through the control plane are forgotten by every node. Everything between nodes is signed with the shared key.
 
 With `tls`, nodes also talk over mutual TLS, accepting only each other's certificates:
 
@@ -326,8 +326,8 @@ hylla hash-password
 which reads the password from stdin. Changes from other sites are refused, since browsers
 send Basic credentials along with them. Writable mappings can't have rewrites, since their
 backend keys must map back to their paths, and can't use a read-only `hylla` backend. After
-a change, the node forgets the object's cached metadata; other nodes of a cluster pick the
-change up when their metadata expires.
+a change, the node forgets the object's cached metadata, and tells the other live nodes of a
+cluster to forget it too.
 
 The UI is built with [Leptos](https://leptos.dev) and rendered on the server, and works
 without JavaScript. Releases and the Docker image embed its hydration bundle, which

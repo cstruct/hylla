@@ -3,11 +3,12 @@ mod common;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::body::{Body, to_bytes};
+use base64::Engine;
 use common::{Flaky, Pki};
 use http::{Request, StatusCode, header};
 use hylla_config::{
-    Backend, Cache, Cluster, ClusterShare, ClusterTls, Config, Interval, Mapping, Refresh,
-    RefreshMode, RefreshRule, Server,
+    Backend, Cache, Cluster, ClusterShare, ClusterTls, Config, Control, ControlUser, Interval,
+    Mapping, Refresh, RefreshMode, RefreshRule, Server,
 };
 use hylla_server::App;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
@@ -53,7 +54,7 @@ impl Drop for Node {
 }
 
 async fn node(memory: &Arc<InMemory>, seeds: Vec<String>, key: &str) -> Node {
-    node_with_tls(memory, seeds, key, None).await
+    node_with(memory, seeds, key, None, None).await
 }
 
 async fn node_with_tls(
@@ -61,6 +62,42 @@ async fn node_with_tls(
     seeds: Vec<String>,
     key: &str,
     tls: Option<ClusterTls>,
+) -> Node {
+    node_with(memory, seeds, key, tls, None).await
+}
+
+/// A node whose mapping is writable through its control plane, by `admin`.
+async fn writable_node(memory: &Arc<InMemory>, seeds: Vec<String>) -> Node {
+    let control = Control {
+        listen: "127.0.0.1:9090".parse().unwrap(),
+        users: HashMap::from([(
+            "admin".into(),
+            ControlUser {
+                password_hash: hash(PASSWORD),
+            },
+        )]),
+        max_upload_mib: 1,
+    };
+    node_with(memory, seeds, KEY, None, Some(control)).await
+}
+
+const PASSWORD: &str = "correct horse battery staple";
+
+fn hash(password: &str) -> String {
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    let salt = SaltString::encode_b64(b"a salt for tests").unwrap();
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .unwrap()
+        .to_string()
+}
+
+async fn node_with(
+    memory: &Arc<InMemory>,
+    seeds: Vec<String>,
+    key: &str,
+    tls: Option<ClusterTls>,
+    control: Option<Control>,
 ) -> Node {
     let addr = free_addr();
     let store = Flaky::new(memory.clone());
@@ -74,7 +111,7 @@ async fn node_with_tls(
                     path_prefix: "/".into(),
                     backend: "assets".into(),
                     rewrites: Vec::new(),
-                    writable: false,
+                    writable: control.is_some(),
                     auth: None,
                 }],
             },
@@ -107,7 +144,7 @@ async fn node_with_tls(
         },
         auth: HashMap::new(),
         telemetry: Default::default(),
-        control: None,
+        control,
         serve_backends: None,
         cluster: Some(Cluster {
             listen: addr,
@@ -120,6 +157,7 @@ async fn node_with_tls(
             share: ClusterShare::default(),
         }),
     };
+    config.validate().unwrap();
     let stores = HashMap::from([("assets".to_string(), store.clone() as Arc<dyn ObjectStore>)]);
     let app = App::new(&config, stores).await.unwrap();
     let tasks = app.start_cluster().await.unwrap();
@@ -274,6 +312,57 @@ async fn preloads_are_pulled_from_the_node_that_preloaded() {
         0,
         "the other node never asked its backend"
     );
+}
+
+/// Changes `/app.css` through `app`'s control plane, signed in as `admin`.
+async fn change(app: &Arc<App>, method: &str, body: &'static str) {
+    let credentials = base64::engine::general_purpose::STANDARD.encode(format!("admin:{PASSWORD}"));
+    let request = Request::builder()
+        .method(method)
+        .uri("/v1/mappings/public/0/objects/app.css")
+        .header(header::HOST, "127.0.0.1:9090")
+        .header(header::AUTHORIZATION, format!("Basic {credentials}"))
+        .body(Body::from(body))
+        .unwrap();
+    let response = app
+        .control_router()
+        .unwrap()
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT, "{method}");
+}
+
+// r[verify cluster.share-forgets]
+// r[verify cluster.apply-forgets]
+// r[verify control.invalidate]
+#[tokio::test]
+async fn objects_changed_through_the_control_plane_are_forgotten_by_every_node() {
+    let memory = backend().await;
+    let a = writable_node(&memory, Vec::new()).await;
+    let b = writable_node(&memory, vec![a.addr.to_string()]).await;
+    for node in [&a, &b] {
+        eventually("both nodes to join", async || {
+            node.app.cluster_members().len() == 2
+        })
+        .await;
+    }
+    // B caches app.css, metadata and chunks, for an hour.
+    assert_eq!(request(&b.app, "GET", "/app.css").await.1, content());
+
+    // Overwritten through A, B serves the new content rather than what it cached.
+    change(&a.app, "PUT", "changed").await;
+    eventually("B to forget the overwritten object", async || {
+        request(&b.app, "GET", "/app.css").await.1 == b"changed"
+    })
+    .await;
+
+    // Deleted through A, B no longer serves it.
+    change(&a.app, "DELETE", "").await;
+    eventually("B to forget the deleted object", async || {
+        request(&b.app, "GET", "/app.css").await.0 == StatusCode::NOT_FOUND
+    })
+    .await;
 }
 
 // r[verify cluster.auth]

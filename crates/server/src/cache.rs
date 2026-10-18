@@ -180,8 +180,8 @@ pub struct ObjectCache {
     stale_if_error: Duration,
     /// The background revalidations of objects, by backend and key.
     revalidations: Mutex<HashMap<(String, String), Revalidation>>,
-    /// Where metadata fetched from backends, and preloaded objects, are reported, when
-    /// they're shared with a cluster.
+    /// Where metadata fetched from backends, preloaded objects and objects changed through
+    /// this node are reported, when they're shared with a cluster.
     events: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<CacheEvent>>,
 }
 
@@ -192,6 +192,8 @@ pub enum CacheEvent {
     Fetched(SharedMeta),
     /// An object was preloaded into the cache.
     Preloaded(SharedMeta),
+    /// An object was changed here, so its metadata must be forgotten everywhere.
+    Forgotten { backend: String, key: String },
 }
 
 /// An object's metadata, as shared between nodes.
@@ -540,6 +542,16 @@ impl ObjectCache {
     /// Forgets the metadata of an object.
     pub(crate) fn forget(&self, backend: &str, path: &ObjectPath) {
         self.entries.remove(&Self::meta_key(backend, path));
+    }
+
+    /// Forgets the metadata of an object changed through this node, reporting it so the
+    /// other nodes of a cluster forget it too.
+    pub(crate) fn forget_everywhere(&self, backend: &str, path: &ObjectPath) {
+        self.forget(backend, path);
+        self.report(|| CacheEvent::Forgotten {
+            backend: backend.to_string(),
+            key: path.to_string(),
+        });
     }
 
     /// How a listed object compares to the cache.
