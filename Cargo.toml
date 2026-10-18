@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/config", "crates/server"]
+members = ["crates/config", "crates/control", "crates/server"]
 resolver = "2"
 
 # hylla is released as one: the tag of a release must match this version.
@@ -7,3 +7,12 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
+
+# The control plane UI's WASM bundle, built small, as `mise run ui` does.
+[profile.ui]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

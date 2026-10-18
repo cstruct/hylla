@@ -25,9 +25,11 @@ use crate::{
     cache::CacheEvent,
     cache::{ObjectCache, ObjectMeta, ReadError},
     cluster::{self, Cluster},
+    control::{self, ControlSettings, MappingEntry},
     metrics::{self, METRICS},
     range::{self, RequestedRange},
     refresh, spans, telemetry,
+    upstream::{self, Upstream},
 };
 
 /// The shared state of all listeners.
@@ -36,6 +38,14 @@ pub struct App {
     pub(crate) stores: Stores,
     /// The cluster this node shares with, if any.
     pub(crate) cluster: Option<Arc<Cluster>>,
+    /// The backends this node serves to other nodes, if any.
+    pub(crate) upstream: Option<Upstream>,
+    /// The control plane's settings, if it's configured.
+    pub(crate) control: Option<Arc<ControlSettings>>,
+    /// Every server's mappings, for the control plane.
+    pub(crate) mappings: Vec<MappingEntry>,
+    /// The type of each backend, such as `s3`, by backend name.
+    pub(crate) backend_kinds: BTreeMap<String, &'static str>,
     /// The cache's events, until the cluster starts sharing them.
     cluster_events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<CacheEvent>>>,
     /// Observable instruments, kept alive while the app is.
@@ -65,7 +75,7 @@ impl App {
         let mut listeners = BTreeMap::<SocketAddr, Vec<Arc<Server>>>::new();
         let mut servers = config.servers.iter().collect::<Vec<_>>();
         servers.sort_by_key(|(name, _)| *name);
-        for (name, server) in servers {
+        for (name, server) in servers.iter().copied() {
             let router = MappingRouter::new(server).map_err(|(mapping, rewrite, error)| {
                 anyhow::anyhow!("server `{name}`, mapping {mapping}, rewrite {rewrite}: {error}")
             })?;
@@ -115,6 +125,42 @@ impl App {
             }
             None => (None, None),
         };
+        let control = config
+            .control
+            .as_ref()
+            .map(ControlSettings::new)
+            .transpose()?
+            .map(Arc::new);
+        let mut mappings = Vec::new();
+        for (name, server) in &servers {
+            for (index, mapping) in server.mappings.iter().enumerate() {
+                mappings.push(MappingEntry {
+                    server: (*name).clone(),
+                    index,
+                    path_prefix: mapping.path_prefix.clone(),
+                    backend: mapping.backend.clone(),
+                    writable: mapping.writable,
+                    rewrites: !mapping.rewrites.is_empty(),
+                });
+            }
+        }
+        let backend_kinds = config
+            .backends
+            .iter()
+            .map(|(name, backend)| {
+                let kind = match backend {
+                    hylla_config::Backend::S3 { .. } => "s3",
+                    hylla_config::Backend::AzureBlob { .. } => "azure_blob",
+                    hylla_config::Backend::Hylla { .. } => "hylla",
+                };
+                (name.clone(), kind)
+            })
+            .collect();
+        let upstream = config
+            .serve_backends
+            .as_ref()
+            .map(Upstream::new)
+            .transpose()?;
         let mut gauges = Vec::new();
         if let Some(cluster) = &cluster {
             let cluster = Arc::downgrade(cluster);
@@ -135,6 +181,10 @@ impl App {
             stores,
             _gauges: gauges,
             cluster,
+            upstream,
+            control,
+            mappings,
+            backend_kinds,
             cluster_events: std::sync::Mutex::new(cluster_events),
             refresh,
             listeners,
@@ -228,6 +278,33 @@ impl App {
             .take()
             .context("the cluster was already started")?;
         cluster::start(self, cluster, events).await
+    }
+
+    /// The control plane's service, if it's configured.
+    pub fn control_router(self: &Arc<Self>) -> Option<axum::Router> {
+        self.control
+            .as_ref()
+            .map(|settings| control::router(self, settings))
+    }
+
+    /// Starts the control plane, if configured.
+    pub async fn start_control(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+        match &self.control {
+            Some(settings) => Ok(vec![control::start(self, settings).await?]),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Starts serving backends to other nodes, if configured.
+    pub async fn start_upstream(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+        match &self.upstream {
+            Some(serving) => Ok(vec![upstream::start(self, serving).await?]),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The addresses of the live nodes of the cluster, this one included, or none without a
@@ -443,7 +520,7 @@ fn mark_private(mut response: Response, private: bool) -> Response {
     response
 }
 
-async fn serve_object(
+pub(crate) async fn serve_object(
     app: &Arc<App>,
     backend: &str,
     store: &Arc<dyn object_store::ObjectStore>,
@@ -466,6 +543,19 @@ async fn serve_object(
         }
     };
     let mut headers = object_headers(&meta);
+
+    // r[impl server.if-match]
+    if let Some(if_match) = request_headers.get(header::IF_MATCH) {
+        let matches = if_match.to_str().is_ok_and(|value| {
+            value.split(',').any(|tag| {
+                let tag = tag.trim();
+                tag == "*" || meta.etag.as_deref() == Some(tag)
+            })
+        });
+        if !matches {
+            return (StatusCode::PRECONDITION_FAILED, headers).into_response();
+        }
+    }
 
     // r[impl server.conditional]
     if let (Some(etag), Some(if_none_match)) =

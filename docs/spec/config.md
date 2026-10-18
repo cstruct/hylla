@@ -84,6 +84,14 @@ replacing the first match of its pattern in the result of the previous one, givi
 path requested from the backend. A rewrite whose pattern doesn't match MUST leave the path
 as is.
 
+r[config.mappings.writable]
+A mapping MAY be `writable`, defaulting to not, letting the control plane change its
+objects under its path prefix.
+
+r[config.validate.writable]
+A writable mapping with rewrites, or whose backend is a `hylla` backend, MUST be reported as
+invalid.
+
 r[config.validate.backend-refs]
 A mapping using a backend that isn't configured MUST be reported as invalid.
 
@@ -105,8 +113,17 @@ r[config.backends]
 Backends MUST be configured as a map from backend names to backends.
 
 r[config.backends.types]
-A backend MUST be one of `s3` or `azure_blob`, selected by its `type` field, with
+A backend MUST be one of `s3`, `azure_blob` or `hylla`, selected by its `type` field, with
 the fields of that type.
+
+r[config.backends.hylla]
+A `hylla` backend MUST configure the `url` of another hylla node serving backends, the name
+of the `backend` on that node, and `tls` with the PEM files of the `ca` its certificate
+must be issued by and of this node's `cert` and `key`.
+
+r[config.validate.hylla-backends]
+A `hylla` backend whose `url` isn't an `https://` URL with a host, with an empty `backend`,
+or with an empty TLS file MUST be reported as invalid.
 
 r[config.refresh]
 A backend MAY have a `refresh` section with `rules` and a `concurrency`, defaulting to 4,
@@ -191,6 +208,42 @@ r[config.validate.auth]
 A mapping's auth naming a verifier that isn't configured, or with a path template that
 doesn't parse, MUST be reported as invalid.
 
+## Serving backends
+
+r[config.serve-backends]
+An optional `serve_backends` section MUST configure serving backends to other hylla nodes:
+the `listen` address, the names of the `backends` served, and `tls` with the PEM files of
+the `ca` other nodes' certificates must be issued by and of this node's `cert` and `key`,
+and the `client_name` other nodes' certificates must be issued for.
+
+r[config.validate.serve-backends]
+`serve_backends` without backends, naming a backend that isn't configured, listening on the
+address of a server or the cluster, with an empty TLS file, or with a `client_name` that
+isn't a DNS name MUST be reported as invalid.
+
+## Control plane
+
+r[config.control]
+An optional `control` section MUST configure the control plane: the `listen` address, the
+`users`, and `max_upload_mib`, the largest upload, defaulting to 256.
+
+r[config.control.users]
+`users` MUST map user names to their `password_hash`, an argon2 hash in PHC form, which is
+secret, so only the secrets file can set it.
+
+r[config.control.oidc]
+An optional `oidc` section in `control` MUST configure signing in through an OpenID
+provider: its `issuer`, the `client_id` and an optional secret `client_secret`, the control
+plane's own `url`, the `groups` allowed in, the `groups_claim` holding them, defaulting to
+`groups`, the `scopes` asked for besides `openid`, defaulting to `email` and `groups`, and
+the `session_ttl`, defaulting to `8h`.
+
+r[config.validate.control]
+A control plane without users or `oidc`, with a password hash that isn't an argon2 hash, a
+zero `max_upload_mib`, listening on the address of a server, the cluster or
+`serve_backends`, or with `oidc` whose `issuer` or `url` isn't a URL, without a client id or
+groups, or with a zero session lifetime MUST be reported as invalid.
+
 ## Cluster
 
 r[config.cluster]
@@ -205,14 +258,19 @@ DNS name.
 r[config.cluster.key]
 `key` MUST be the secret shared by the nodes, so only the secrets file can set it.
 
+r[config.cluster.tls]
+An optional `tls` section in `cluster` MUST turn on mutual TLS between the nodes, from the
+PEM files of the `ca` nodes' certificates must be issued by and of this node's `cert` and
+`key`, and the `server_name` every node's certificate is issued for.
+
 r[config.cluster.share]
 `share` MUST turn sharing `metadata` and `preload`s on or off, both defaulting to on.
 
 r[config.validate.cluster]
 A `listen` address of `0.0.0.0` or `[::]` without an `advertise` address, an unspecified
 `advertise` address, a key shorter than 32 characters, seeds that aren't `host:port`, a zero
-gossip interval and a failure timeout not longer than the gossip interval MUST be reported
-as invalid.
+gossip interval, a failure timeout not longer than the gossip interval, and TLS settings
+with an empty file or a `server_name` that isn't a DNS name MUST be reported as invalid.
 
 ## Telemetry
 

@@ -166,12 +166,14 @@ fn loads_servers_and_backends() {
                     pattern: "^/assets/(.*)$".into(),
                     replace: "/$1".into(),
                 }],
+                writable: false,
                 auth: None,
             },
             Mapping {
                 path_prefix: "/".into(),
                 backend: "archive".into(),
                 rewrites: Vec::new(),
+                writable: false,
                 auth: None,
             },
         ]
@@ -1106,7 +1108,7 @@ fn show_marks_the_missing_fields_of_a_config_that_does_not_load() {
         "    secret_access_key \"<missing>\"  // missing: required, but not set",
         "  key \"<missing>\"                 // missing: required, but not set",
         // Items of lists are marked on their line.
-        "      {path_prefix \"<missing>\", backend assets, rewrites ()}  // missing: path_prefix",
+        "      {path_prefix \"<missing>\", backend assets, rewrites (), writable false}  // missing: path_prefix",
         // Defaults are filled in, in the order a loaded config shows them.
         "  seeds ()                        // default\n  gossip_interval 1s",
     ] {
@@ -1226,4 +1228,186 @@ backends {assets {type s3, bucket assets, region eu-north-1}}
     // One server with a mapping is enough.
     let files = Files::new("one-mapping", MINIMAL, MINIMAL_SECRETS);
     files.load(&[]).unwrap();
+}
+
+// r[verify config.cluster.tls]
+// r[verify config.validate.cluster]
+#[test]
+fn cluster_tls_is_configured_with_files_and_a_server_name() {
+    let config = format!(
+        "{MINIMAL}cluster {{
+  listen 10.0.0.5:7946
+  tls {{
+    ca /etc/hylla/tls/ca.crt
+    cert /etc/hylla/tls/tls.crt
+    key /etc/hylla/tls/tls.key
+    server_name hylla.cluster
+  }}
+}}
+"
+    );
+    let secrets = format!(
+        "cluster {{key \"a cluster key of at least thirty-two characters\"}}\n{MINIMAL_SECRETS}"
+    );
+    let files = Files::new("cluster-tls", &config, &secrets);
+    let cluster = files.load(&[]).unwrap().into_config().cluster.unwrap();
+    assert_eq!(
+        cluster.tls,
+        Some(hylla_config::ClusterTls {
+            ca: "/etc/hylla/tls/ca.crt".into(),
+            cert: "/etc/hylla/tls/tls.crt".into(),
+            key: "/etc/hylla/tls/tls.key".into(),
+            server_name: "hylla.cluster".into(),
+        })
+    );
+
+    for (server_name, valid) in [
+        ("hylla", true),
+        ("hylla-0.hylla.cache.svc", true),
+        ("10.0.0.5", false),
+        ("-hylla.cluster", false),
+        ("hylla..cluster", false),
+        ("hylla_cluster", false),
+    ] {
+        let config = config
+            .replace(
+                "server_name hylla.cluster",
+                &format!("server_name {server_name}"),
+            )
+            .replace("key /etc/hylla/tls/tls.key", "key \"\"");
+        let files = Files::new("cluster-tls-invalid", &config, &secrets);
+        let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+            panic!("expected validation errors for `{server_name}`");
+        };
+        let mut expected = vec!["invalid cluster config: `tls.key` must be a file".to_string()];
+        if !valid {
+            expected.push(format!(
+                "invalid cluster config: `tls.server_name` is `{server_name}`, which isn't a DNS name"
+            ));
+        }
+        let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(errors, expected, "server name `{server_name}`");
+    }
+}
+
+const HYLLA_BACKEND: &str = "
+servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend shield})}}
+backends {
+  shield {
+    type hylla
+    url https://shield.internal:7947
+    backend assets
+    tls {
+      ca /etc/hylla/tls/ca.crt
+      cert /etc/hylla/tls/tls.crt
+      key /etc/hylla/tls/tls.key
+    }
+  }
+}
+";
+
+// r[verify config.backends.hylla]
+// r[verify config.backends.types]
+// r[verify config.validate.hylla-backends]
+#[test]
+fn hylla_backends_read_another_node_over_tls() {
+    let files = Files::new("hylla-backend", HYLLA_BACKEND, "");
+    let config = files.load(&[]).unwrap().into_config();
+    assert_eq!(
+        config.backends["shield"],
+        Backend::Hylla {
+            url: "https://shield.internal:7947".into(),
+            backend: "assets".into(),
+            tls: hylla_config::HyllaTls {
+                ca: "/etc/hylla/tls/ca.crt".into(),
+                cert: "/etc/hylla/tls/tls.crt".into(),
+                key: "/etc/hylla/tls/tls.key".into(),
+            },
+            refresh: None,
+        }
+    );
+
+    let invalid = HYLLA_BACKEND
+        .replace(
+            "url https://shield.internal:7947",
+            "url http://shield.internal:7947",
+        )
+        .replace("backend assets", "backend \"\"")
+        .replace("ca /etc/hylla/tls/ca.crt", "ca \"\"");
+    let files = Files::new("hylla-backend-invalid", &invalid, "");
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            "backend `shield` is invalid: `url` is `http://shield.internal:7947`, which isn't an \
+             `https://` URL with a host",
+            "backend `shield` is invalid: `backend` must name a backend of the other node",
+            "backend `shield` is invalid: `tls.ca` must be a file",
+        ]
+    );
+}
+
+// r[verify config.serve-backends]
+// r[verify config.validate.serve-backends]
+#[test]
+fn backends_are_served_to_other_nodes_over_tls() {
+    let serve = "serve_backends {
+  listen 0.0.0.0:7947
+  backends (assets)
+  tls {
+    ca /etc/hylla/tls/ca.crt
+    cert /etc/hylla/tls/tls.crt
+    key /etc/hylla/tls/tls.key
+    client_name hylla.downstream
+  }
+}
+";
+    let files = Files::new(
+        "serve-backends",
+        &format!("{MINIMAL}{serve}"),
+        MINIMAL_SECRETS,
+    );
+    let config = files.load(&[]).unwrap().into_config();
+    assert_eq!(
+        config.serve_backends,
+        Some(hylla_config::ServeBackends {
+            listen: "0.0.0.0:7947".parse().unwrap(),
+            backends: vec!["assets".into()],
+            tls: hylla_config::ServeTls {
+                ca: "/etc/hylla/tls/ca.crt".into(),
+                cert: "/etc/hylla/tls/tls.crt".into(),
+                key: "/etc/hylla/tls/tls.key".into(),
+                client_name: "hylla.downstream".into(),
+            },
+        })
+    );
+
+    let invalid = serve
+        .replace("listen 0.0.0.0:7947", "listen 0.0.0.0:8080")
+        .replace("backends (assets)", "backends (assets nope)")
+        .replace("key /etc/hylla/tls/tls.key", "key \"\"")
+        .replace("client_name hylla.downstream", "client_name 10.0.0.1");
+    let files = Files::new(
+        "serve-backends-invalid",
+        &format!("{MINIMAL}{invalid}"),
+        MINIMAL_SECRETS,
+    );
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            "invalid serve_backends config: `backends` names unknown backend `nope`",
+            "invalid serve_backends config: `listen` is 0.0.0.0:8080, which server `public` \
+             listens on too",
+            "invalid serve_backends config: `tls.key` must be a file",
+            "invalid serve_backends config: `tls.client_name` is `10.0.0.1`, which isn't a DNS \
+             name",
+        ]
+    );
 }

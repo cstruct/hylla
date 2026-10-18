@@ -7,8 +7,8 @@
 
 # hylla
 
-A caching layer in front of object storage (S3 and Azure Blob Storage), with a
-hybrid RAM and disk cache. Configured with [ordna](https://github.com/cstruct/ordna).
+A caching layer in front of object storage (S3, Azure Blob Storage, or another hylla),
+with a hybrid RAM and disk cache. Configured with [ordna](https://github.com/cstruct/ordna).
 
 > **Note on LLM use:** large parts of this project were written with an LLM, under human
 > direction. The design and review are human.
@@ -221,7 +221,152 @@ With a `cluster`, nodes find each other by gossip through their seeds; a DNS nam
 returning every node, such as a Kubernetes headless service, works as a seed. Each refresh
 rule runs on one node, metadata fetched from a backend is pushed to the other nodes, and the
 others pull what a node preloads directly from it, so the backend serves it once per cluster.
-Everything between nodes is signed with the shared key.
+Objects changed through the control plane are forgotten by every node. Everything between nodes is signed with the shared key.
+
+With `tls`, nodes also talk over mutual TLS, accepting only each other's certificates:
+
+```styx
+cluster {
+  listen 0.0.0.0:7946
+  advertise 10.0.0.5:7946
+  seeds (hylla-cluster.cache.svc.cluster.local:7946)
+  tls {
+    ca /etc/hylla/tls/ca.crt
+    cert /etc/hylla/tls/tls.crt
+    key /etc/hylla/tls/tls.key
+    server_name hylla.cluster
+  }
+}
+```
+
+Every node's certificate must be issued by the `ca` for `server_name` as a DNS name, with
+both the server and client auth usages, since a node is both. Nodes are reached by address,
+which changes as they come and go, so certificates are checked for `server_name`, not
+addresses. Use a CA for the cluster only. The certificate and key are read again when their
+files change, so tools like cert-manager can rotate them without a restart; the CA is read
+at startup. All nodes need `tls` on or off together, since a node with TLS doesn't talk to
+one without.
+
+A node can also serve its backends to other hylla nodes, which use it as a `hylla` backend.
+It answers them through its cache, so it fetches each object from its own backend once for
+all of them, as an origin shield. They read from it as from object storage, without sharing
+their caches with it. This is always over mutual TLS:
+
+```styx
+// The shield, serving its `assets` backend.
+serve_backends {
+  listen 0.0.0.0:7947
+  backends (assets)
+  tls {
+    ca /etc/hylla/tls/ca.crt
+    cert /etc/hylla/tls/tls.crt  // issued for shield.internal
+    key /etc/hylla/tls/tls.key
+    client_name hylla.downstream
+  }
+}
+```
+
+```styx
+// A node using it.
+backends {
+  assets {
+    type hylla
+    url https://shield.internal:7947
+    backend assets
+    tls {
+      ca /etc/hylla/tls/ca.crt
+      cert /etc/hylla/tls/tls.crt  // issued for hylla.downstream
+      key /etc/hylla/tls/tls.key
+    }
+  }
+}
+```
+
+The serving node's certificate must be issued for the host in the URL, and the other nodes'
+certificates for its `client_name`, by the CA each side trusts. Only the listed backends are
+served; others are refused. Refresh rules on the other nodes list through it. Certificates
+are read again when they change, as for a cluster.
+
+### Control plane
+
+The optional control plane is a web UI and JSON API for the people running hylla: the last
+request and the last failure of each backend, the mappings, and browsing their objects.
+Mappings marked `writable` can also have objects uploaded, deleted and moved there, under
+their path prefix only. Public listeners never write.
+
+```styx
+// config.styx
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com)
+    mappings (
+      {path_prefix /uploads, backend assets, writable true}
+      {path_prefix /, backend assets}
+    )
+  }
+}
+control {
+  listen 127.0.0.1:9090  // keep it private
+  max_upload_mib 256     // the default
+}
+```
+
+```styx
+// secrets.styx
+control {users {admin {password_hash "$argon2id$v=19$m=19456,t=2,p=1$..."}}}
+```
+
+People can sign in through an OpenID provider, such as Konklav,
+with the authorization code flow and PKCE, if they're in one of the allowed groups:
+
+```styx
+control {
+  listen 127.0.0.1:9090
+  oidc {
+    issuer https://id.example.com
+    client_id hylla
+    url https://hylla-control.internal  // the provider redirects to {url}/auth/callback
+    groups (hylla-admin)                // from the `groups` claim, or `groups_claim`
+  }
+}
+// secrets.styx, for a confidential client
+control {oidc {client_secret "..."}}
+```
+
+Register the client with the redirect URI `{url}/auth/callback` and, to sign out at the
+provider too, the post-logout redirect URI `{url}/`. With Konklav, give the client the
+`openid`, `email` and `groups` scopes and `visible_groups` such as `hylla-*`, and the
+users the global role `hylla-admin`. Sessions are kept in memory, per node, for
+`session_ttl` (8 hours by default).
+
+Users in `users` sign in with HTTP Basic auth, as scripts do. Hash their passwords with:
+
+```bash
+hylla hash-password
+```
+
+which reads the password from stdin. Changes from other sites are refused, since browsers
+send Basic credentials along with them. Writable mappings can't have rewrites, since their
+backend keys must map back to their paths, and can't use a read-only `hylla` backend. After
+a change, the node forgets the object's cached metadata, and tells the other live nodes of a
+cluster to forget it too.
+
+The UI is built with [Leptos](https://leptos.dev) and rendered on the server, and works
+without JavaScript. Releases and the Docker image embed its hydration bundle, which
+`mise run ui` builds into `target/site/pkg` for local builds:
+
+```bash
+mise run ui
+```
+
+The JSON API, for scripts:
+
+```bash
+curl -u admin https://hylla-control.internal/v1/backends
+curl -u admin -T app.css https://hylla-control.internal/v1/mappings/public/0/objects/css/app.css
+curl -u admin -X DELETE https://hylla-control.internal/v1/mappings/public/0/objects/css/app.css
+```
 
 ### Docker
 

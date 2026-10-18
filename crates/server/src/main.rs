@@ -32,6 +32,8 @@ enum Command {
     /// Inspect the config, as loaded from files, the environment and flags
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Hash a password read from stdin, for a control plane user's `password_hash`
+    HashPassword,
 }
 
 #[derive(clap::Subcommand, Debug, PartialEq, Eq)]
@@ -123,6 +125,18 @@ async fn main() -> anyhow::Result<()> {
             inspected.into_loaded()?;
             Ok(())
         }
+        // r[impl control.hash-password]
+        Command::HashPassword => {
+            let mut password = String::new();
+            std::io::stdin()
+                .read_line(&mut password)
+                .context("reading the password from stdin")?;
+            println!(
+                "{}",
+                hash_password(password.trim_end_matches(['\r', '\n']))?
+            );
+            Ok(())
+        }
         // r[impl config.explain]
         Command::Config(ConfigCommand::Explain { path }) => {
             let inspected = inspect(&files)?;
@@ -131,6 +145,22 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// An argon2 hash of `password`, with a random salt, as a PHC string.
+fn hash_password(password: &str) -> anyhow::Result<String> {
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    if password.is_empty() {
+        anyhow::bail!("the password is empty");
+    }
+    let mut salt = [0u8; 16];
+    aws_lc_rs::rand::fill(&mut salt).map_err(|_| anyhow::anyhow!("generating a salt"))?;
+    let salt = SaltString::encode_b64(&salt)
+        .map_err(|error| anyhow::anyhow!("encoding the salt: {error}"))?;
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|error| anyhow::anyhow!("hashing the password: {error}"))
 }
 
 async fn run(files: &ConfigFiles) -> anyhow::Result<()> {
@@ -181,6 +211,32 @@ mod tests {
     use ordna_source_env::EnvSource;
 
     use super::{Args, Command, ConfigCommand};
+
+    // r[verify control.hash-password]
+    #[test]
+    fn passwords_hash_to_argon2_phc_strings() {
+        use argon2::{Argon2, PasswordHash, PasswordVerifier};
+
+        let hash = super::hash_password("correct horse").unwrap();
+        assert!(hash.starts_with("$argon2id$"), "{hash}");
+        let parsed = PasswordHash::new(&hash).unwrap();
+        assert!(
+            Argon2::default()
+                .verify_password(b"correct horse", &parsed)
+                .is_ok()
+        );
+        assert!(
+            Argon2::default()
+                .verify_password(b"wrong", &parsed)
+                .is_err()
+        );
+        assert_ne!(
+            hash,
+            super::hash_password("correct horse").unwrap(),
+            "salted"
+        );
+        assert!(super::hash_password("").is_err());
+    }
 
     #[test]
     fn arguments_are_valid() {

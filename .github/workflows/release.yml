@@ -76,11 +76,11 @@ jobs:
         with:
           persist-credentials: false
 
-      # Only Rust, as pinned in mise.toml, not the end-to-end tests' tools.
+      # Only Rust and wasm-bindgen, as pinned in mise.toml, not the end-to-end tests' tools.
       - name: Install Rust
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
         with:
-          install_args: rust
+          install_args: rust github:wasm-bindgen/wasm-bindgen
 
       - name: Cache Cargo dependencies and build artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -92,6 +92,10 @@ jobs:
           key: release-${{ matrix.target }}-${{ hashFiles('mise.toml', 'Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
             release-${{ matrix.target }}-
+
+      # Embedded in the binary, so the control plane's UI is hydrated.
+      - name: Build the UI's hydration bundle
+        run: mise run ui
 
       - name: Build release binary
         run: cargo build --locked --release --bin hylla --target "$TARGET"

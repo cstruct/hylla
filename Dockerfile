@@ -3,6 +3,9 @@
 # Keep the Rust version in sync with mise.toml.
 FROM rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6 AS chef
 RUN cargo install cargo-chef --locked --version 0.1.78
+# For the control plane UI's hydration bundle. Keep wasm-bindgen in sync with mise.toml.
+RUN rustup target add wasm32-unknown-unknown \
+    && cargo install wasm-bindgen-cli --locked --version 0.2.128
 WORKDIR /src
 
 # The dependencies, from the manifests alone, so they're only rebuilt when those change.
@@ -14,6 +17,10 @@ FROM chef AS build
 COPY --from=plan /src/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json
 COPY . .
+# The UI's hydration bundle, as `mise run ui` builds it, embedded in the binary.
+RUN cargo build --locked --profile ui -p hylla-control --lib --target wasm32-unknown-unknown --features hydrate \
+    && wasm-bindgen --target web --no-typescript --out-dir target/site/pkg --out-name hylla \
+        target/wasm32-unknown-unknown/ui/hylla_control.wasm
 RUN cargo build --release --locked --bin hylla
 # Distroless has no shell to create the disk cache's directory with.
 RUN mkdir /cache

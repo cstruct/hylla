@@ -78,6 +78,12 @@ config_tree! {
                     /// `${name}`.
                     pub replace: String,
                 }>,
+                // r[impl config.mappings.writable]
+                /// Whether the control plane may change the mapping's objects: upload,
+                /// delete and move them, under its path prefix only. Public listeners never
+                /// write.
+                #[facet(default)]
+                pub writable: bool,
                 // r[impl config.auth.mappings]
                 /// Requires requests to carry a valid JWT. Without it, the mapping is public.
                 pub auth: Option<pub struct MappingAuth {
@@ -218,6 +224,25 @@ config_tree! {
             /// least 32 characters.
             #[config(secret)]
             pub key: String,
+            // r[impl config.cluster.tls]
+            /// Mutual TLS between the nodes, encrypting what they send each other and
+            /// checking their certificates. Without it, nodes talk plain HTTP, though signed
+            /// with the key either way.
+            pub tls: Option<pub struct ClusterTls {
+                /// The PEM file of the CA certificates nodes' certificates must be issued
+                /// by. Use a CA for the cluster only: any certificate it issued for
+                /// `server_name` is a node. Read at startup.
+                pub ca: String,
+                /// The PEM file of this node's certificate chain, read again when it
+                /// changes, so certificates can be rotated without a restart.
+                pub cert: String,
+                /// The PEM file of this node's private key, read again when it changes.
+                pub key: String,
+                /// The DNS name every node's certificate is issued for, such as
+                /// `hylla.cluster`. Nodes reach each other by address, which changes as
+                /// nodes come and go, so certificates are checked for this name instead.
+                pub server_name: String,
+            }>,
             // r[impl config.cluster.share]
             /// What the nodes share.
             #[facet(default)]
@@ -231,6 +256,78 @@ config_tree! {
                 #[facet(default = true)]
                 pub preload: bool,
             },
+        }>,
+        // r[impl config.serve-backends]
+        /// Serving backends to other hylla nodes, which use them as `hylla` backends, over
+        /// mutual TLS. Optional.
+        pub serve_backends: Option<pub struct ServeBackends {
+            /// The address of the listener, such as `0.0.0.0:7947`.
+            pub listen: SocketAddr,
+            /// The names of the backends served. Requests for others are refused.
+            pub backends: Vec<String>,
+            /// The listener's certificate, and what other nodes' certificates must be.
+            pub tls: pub struct ServeTls {
+                /// The PEM file of the CA certificates other nodes' certificates must be
+                /// issued by. Read at startup.
+                pub ca: String,
+                /// The PEM file of this node's certificate chain, issued for the host other
+                /// nodes reach it at. Read again when it changes.
+                pub cert: String,
+                /// The PEM file of this node's private key, read again when it changes.
+                pub key: String,
+                /// The DNS name other nodes' certificates must be issued for, such as
+                /// `hylla.downstream`, so not every certificate the CA issued is a client.
+                pub client_name: String,
+            },
+        }>,
+        // r[impl config.control]
+        /// The control plane: a web UI and JSON API showing the status of each backend and
+        /// browsing the mappings, changing the objects of writable ones. Optional.
+        pub control: Option<pub struct Control {
+            /// The address to listen on, such as `127.0.0.1:9090`. Keep it private.
+            pub listen: SocketAddr,
+            // r[impl config.control.users]
+            /// The users signing in, with HTTP Basic auth, by name.
+            #[facet(default)]
+            pub users: HashMap<String, pub struct ControlUser {
+                /// An argon2 hash of the user's password, as `hylla hash-password` prints
+                /// it, so only the secrets file can set it.
+                #[config(secret)]
+                pub password_hash: String,
+            }>,
+            /// The largest upload, in MiB.
+            #[facet(default = 256)]
+            pub max_upload_mib: u64,
+            // r[impl config.control.oidc]
+            /// Signing in through an OpenID provider, such as Konklav, with the
+            /// authorization code flow and PKCE. Basic auth keeps working for `users`.
+            pub oidc: Option<pub struct ControlOidc {
+                /// The provider's issuer, such as `https://id.example.com`. Its discovery
+                /// document is read from `{issuer}/.well-known/openid-configuration`.
+                pub issuer: String,
+                /// The client id hylla is registered with.
+                pub client_id: String,
+                /// The client's secret, for a confidential client. Without it, hylla signs
+                /// in as a public client, protected by PKCE alone.
+                #[config(secret)]
+                pub client_secret: Option<String>,
+                /// The control plane's own URL, as browsers reach it, such as
+                /// `https://hylla-control.internal`. The provider redirects back to
+                /// `{url}/auth/callback`, and to `{url}/` after signing out.
+                pub url: String,
+                /// The groups allowed in: a user must be in at least one.
+                pub groups: Vec<String>,
+                /// The claim of the ID token, or of the user info, listing the user's
+                /// groups.
+                #[facet(default = String::from("groups"))]
+                pub groups_claim: String,
+                /// The scopes asked for besides `openid`, such as `email` and `groups`.
+                #[facet(default = vec![String::from("email"), String::from("groups")])]
+                pub scopes: Vec<String>,
+                /// How long a sign-in lasts, such as `8h`.
+                #[facet(default = Interval::from_secs(8 * 60 * 60))]
+                pub session_ttl: Interval,
+            }>,
         }>,
         // r[impl config.auth.verifiers]
         /// JWT verifiers by name, used by mappings' `auth`.
@@ -418,6 +515,34 @@ pub enum Backend {
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
+    // r[impl config.backends.hylla]
+    /// Another hylla node serving one of its backends with `serve_backends`, over mutual
+    /// TLS. Objects come through that node's cache, so it fetches them from its backend once
+    /// for every node using it.
+    Hylla {
+        /// The node's base URL, such as `https://shield.internal:7947`. Its certificate must
+        /// be issued for the URL's host.
+        url: String,
+        /// The name of the backend on that node.
+        backend: String,
+        tls: HyllaTls,
+        /// Background refresh of cached objects.
+        refresh: Option<Refresh>,
+    },
+}
+
+/// Mutual TLS with a `hylla` backend.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HyllaTls {
+    /// The PEM file of the CA certificates the node's certificate must be issued by. Read at
+    /// startup.
+    pub ca: String,
+    /// The PEM file of this node's certificate chain, presented to the other node, issued for
+    /// its `client_name`. Read again when it changes.
+    pub cert: String,
+    /// The PEM file of this node's private key, read again when it changes.
+    pub key: String,
 }
 
 /// Checks JWTs: their signature against a public key, and their `exp` and `nbf` claims, and
@@ -529,7 +654,9 @@ impl Backend {
     /// The backend's background refresh, if any.
     pub fn refresh(&self) -> Option<&Refresh> {
         match self {
-            Backend::S3 { refresh, .. } | Backend::AzureBlob { refresh, .. } => refresh.as_ref(),
+            Backend::S3 { refresh, .. }
+            | Backend::AzureBlob { refresh, .. }
+            | Backend::Hylla { refresh, .. } => refresh.as_ref(),
         }
     }
 }
