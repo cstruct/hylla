@@ -119,6 +119,7 @@ async fn logs_are_exported_over_otlp_with_trace_ids() {
                     path_prefix: "/".into(),
                     backend: "assets".into(),
                     rewrites: Vec::new(),
+                    writable: false,
                     auth: None,
                 }],
             },
@@ -141,6 +142,7 @@ async fn logs_are_exported_over_otlp_with_trace_ids() {
         },
         auth: HashMap::new(),
         telemetry: Default::default(),
+        control: None,
         serve_backends: None,
         cluster: None,
     };

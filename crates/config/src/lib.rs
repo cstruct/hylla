@@ -78,6 +78,12 @@ config_tree! {
                     /// `${name}`.
                     pub replace: String,
                 }>,
+                // r[impl config.mappings.writable]
+                /// Whether the control plane may change the mapping's objects: upload,
+                /// delete and move them, under its path prefix only. Public listeners never
+                /// write.
+                #[facet(default)]
+                pub writable: bool,
                 // r[impl config.auth.mappings]
                 /// Requires requests to carry a valid JWT. Without it, the mapping is public.
                 pub auth: Option<pub struct MappingAuth {
@@ -273,6 +279,25 @@ config_tree! {
                 /// `hylla.downstream`, so not every certificate the CA issued is a client.
                 pub client_name: String,
             },
+        }>,
+        // r[impl config.control]
+        /// The control plane: a web UI and JSON API showing the status of each backend and
+        /// browsing the mappings, changing the objects of writable ones. Optional.
+        pub control: Option<pub struct Control {
+            /// The address to listen on, such as `127.0.0.1:9090`. Keep it private.
+            pub listen: SocketAddr,
+            // r[impl config.control.users]
+            /// The users signing in, with HTTP Basic auth, by name.
+            #[facet(default)]
+            pub users: HashMap<String, pub struct ControlUser {
+                /// An argon2 hash of the user's password, as `hylla hash-password` prints
+                /// it, so only the secrets file can set it.
+                #[config(secret)]
+                pub password_hash: String,
+            }>,
+            /// The largest upload, in MiB.
+            #[facet(default = 256)]
+            pub max_upload_mib: u64,
         }>,
         // r[impl config.auth.verifiers]
         /// JWT verifiers by name, used by mappings' `auth`.

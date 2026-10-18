@@ -54,6 +54,14 @@ pub enum ValidationError {
     InvalidBackend { backend: String, reason: String },
     /// The settings of serving backends to other nodes are invalid.
     InvalidServeBackends { reason: String },
+    /// A mapping can't be writable.
+    InvalidWritable {
+        server: String,
+        mapping: usize,
+        reason: String,
+    },
+    /// The control plane's settings are invalid.
+    InvalidControl { reason: String },
     /// A cache size setting is out of range.
     InvalidCache { reason: String },
     /// Several servers answer to the same host name on the same address.
@@ -146,6 +154,15 @@ impl fmt::Display for ValidationError {
             Self::InvalidServeBackends { reason } => {
                 write!(f, "invalid serve_backends config: {reason}")
             }
+            Self::InvalidWritable {
+                server,
+                mapping,
+                reason,
+            } => write!(
+                f,
+                "mapping {mapping} of server `{server}` can't be writable: {reason}"
+            ),
+            Self::InvalidControl { reason } => write!(f, "invalid control config: {reason}"),
             Self::InvalidCache { reason } => write!(f, "invalid cache config: {reason}"),
             Self::DuplicateHost {
                 listen,
@@ -198,6 +215,27 @@ impl Config {
                     .push(name.clone());
             }
             for (index, mapping) in server.mappings.iter().enumerate() {
+                // r[impl config.validate.writable]
+                if mapping.writable {
+                    let mut error = |reason: &str| {
+                        errors.push(ValidationError::InvalidWritable {
+                            server: name.clone(),
+                            mapping: index,
+                            reason: reason.to_string(),
+                        })
+                    };
+                    if !mapping.rewrites.is_empty() {
+                        error(
+                            "it has rewrites, so its backend keys can't be mapped back to its paths",
+                        );
+                    }
+                    if matches!(
+                        self.backends.get(&mapping.backend),
+                        Some(crate::Backend::Hylla { .. })
+                    ) {
+                        error("its backend is another hylla node, which is read only");
+                    }
+                }
                 // r[impl config.validate.backend-refs]
                 if !self.backends.contains_key(&mapping.backend) {
                     errors.push(ValidationError::UnknownBackend {
@@ -265,6 +303,8 @@ impl Config {
         errors.extend(self.validate_hylla_backends());
         // r[impl config.validate.serve-backends]
         errors.extend(self.validate_serve_backends());
+        // r[impl config.validate.control]
+        errors.extend(self.validate_control());
 
         for ((listen, server_name), servers) in hosts {
             if servers.len() > 1 {
@@ -545,6 +585,62 @@ impl Config {
         reasons
             .into_iter()
             .map(|reason| ValidationError::InvalidServeBackends { reason })
+            .collect()
+    }
+}
+
+impl Config {
+    fn validate_control(&self) -> Vec<ValidationError> {
+        let Some(control) = &self.control else {
+            return Vec::new();
+        };
+        let mut reasons = Vec::new();
+        if control.users.is_empty() {
+            reasons.push("there are no `users`, so no one can sign in".to_string());
+        }
+        let mut users = control.users.iter().collect::<Vec<_>>();
+        users.sort_by_key(|(name, _)| *name);
+        for (name, user) in users {
+            if !user.password_hash.starts_with("$argon2") {
+                reasons.push(format!(
+                    "the `password_hash` of user `{name}` isn't an argon2 hash, as \
+                     `hylla hash-password` prints"
+                ));
+            }
+        }
+        if control.max_upload_mib == 0 {
+            reasons.push("`max_upload_mib` must be positive".to_string());
+        }
+        let mut servers = self
+            .servers
+            .iter()
+            .filter(|(_, server)| server.listen == control.listen)
+            .map(|(name, _)| format!("server `{name}`"))
+            .collect::<Vec<_>>();
+        servers.sort();
+        if self
+            .cluster
+            .as_ref()
+            .is_some_and(|cluster| cluster.listen == control.listen)
+        {
+            servers.push("the cluster".to_string());
+        }
+        if self
+            .serve_backends
+            .as_ref()
+            .is_some_and(|serve| serve.listen == control.listen)
+        {
+            servers.push("serve_backends".to_string());
+        }
+        for other in servers {
+            reasons.push(format!(
+                "`listen` is {}, which {other} listens on too",
+                control.listen
+            ));
+        }
+        reasons
+            .into_iter()
+            .map(|reason| ValidationError::InvalidControl { reason })
             .collect()
     }
 }

@@ -287,6 +287,64 @@ certificates for its `client_name`, by the CA each side trusts. Only the listed 
 served; others are refused. Refresh rules on the other nodes list through it. Certificates
 are read again when they change, as for a cluster.
 
+### Control plane
+
+The optional control plane is a web UI and JSON API for the people running hylla: the last
+request and the last failure of each backend, the mappings, and browsing their objects.
+Mappings marked `writable` can also have objects uploaded, deleted and moved there, under
+their path prefix only. Public listeners never write.
+
+```styx
+// config.styx
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com)
+    mappings (
+      {path_prefix /uploads, backend assets, writable true}
+      {path_prefix /, backend assets}
+    )
+  }
+}
+control {
+  listen 127.0.0.1:9090  // keep it private
+  max_upload_mib 256     // the default
+}
+```
+
+```styx
+// secrets.styx
+control {users {admin {password_hash "$argon2id$v=19$m=19456,t=2,p=1$..."}}}
+```
+
+Users sign in with HTTP Basic auth. Hash their passwords with:
+
+```bash
+hylla hash-password
+```
+
+which reads the password from stdin. Changes from other sites are refused, since browsers
+send Basic credentials along with them. Writable mappings can't have rewrites, since their
+backend keys must map back to their paths, and can't use a read-only `hylla` backend. After
+a change, the node forgets the object's cached metadata; other nodes of a cluster pick the
+change up when their metadata expires.
+
+The UI is built with [Leptos](https://leptos.dev) and rendered on the server, and works
+without JavaScript. Releases and the Docker image embed its hydration bundle, which
+`mise run ui` builds into `target/site/pkg` for local builds:
+
+```bash
+mise run ui
+```
+
+The JSON API, for scripts:
+
+```bash
+curl -u admin https://hylla-control.internal/v1/backends
+curl -u admin -T app.css https://hylla-control.internal/v1/mappings/public/0/objects/css/app.css
+curl -u admin -X DELETE https://hylla-control.internal/v1/mappings/public/0/objects/css/app.css
+```
+
 ### Docker
 
 Images for `linux/amd64` and `linux/arm64` are on Docker Hub as

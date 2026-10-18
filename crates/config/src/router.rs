@@ -134,6 +134,7 @@ mod tests {
                     replace: (*replace).into(),
                 })
                 .collect(),
+            writable: false,
             auth: None,
         }
     }

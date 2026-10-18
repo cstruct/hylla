@@ -84,6 +84,14 @@ replacing the first match of its pattern in the result of the previous one, givi
 path requested from the backend. A rewrite whose pattern doesn't match MUST leave the path
 as is.
 
+r[config.mappings.writable]
+A mapping MAY be `writable`, defaulting to not, letting the control plane change its
+objects under its path prefix.
+
+r[config.validate.writable]
+A writable mapping with rewrites, or whose backend is a `hylla` backend, MUST be reported as
+invalid.
+
 r[config.validate.backend-refs]
 A mapping using a backend that isn't configured MUST be reported as invalid.
 
@@ -212,6 +220,21 @@ r[config.validate.serve-backends]
 `serve_backends` without backends, naming a backend that isn't configured, listening on the
 address of a server or the cluster, with an empty TLS file, or with a `client_name` that
 isn't a DNS name MUST be reported as invalid.
+
+## Control plane
+
+r[config.control]
+An optional `control` section MUST configure the control plane: the `listen` address, the
+`users`, and `max_upload_mib`, the largest upload, defaulting to 256.
+
+r[config.control.users]
+`users` MUST map user names to their `password_hash`, an argon2 hash in PHC form, which is
+secret, so only the secrets file can set it.
+
+r[config.validate.control]
+A control plane without users, with a password hash that isn't an argon2 hash, a zero
+`max_upload_mib`, or listening on the address of a server, the cluster or `serve_backends`
+MUST be reported as invalid.
 
 ## Cluster
 

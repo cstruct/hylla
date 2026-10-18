@@ -74,6 +74,7 @@ async fn node_with_tls(
                     path_prefix: "/".into(),
                     backend: "assets".into(),
                     rewrites: Vec::new(),
+                    writable: false,
                     auth: None,
                 }],
             },
@@ -106,6 +107,7 @@ async fn node_with_tls(
         },
         auth: HashMap::new(),
         telemetry: Default::default(),
+        control: None,
         serve_backends: None,
         cluster: Some(Cluster {
             listen: addr,

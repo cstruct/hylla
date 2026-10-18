@@ -166,12 +166,14 @@ fn loads_servers_and_backends() {
                     pattern: "^/assets/(.*)$".into(),
                     replace: "/$1".into(),
                 }],
+                writable: false,
                 auth: None,
             },
             Mapping {
                 path_prefix: "/".into(),
                 backend: "archive".into(),
                 rewrites: Vec::new(),
+                writable: false,
                 auth: None,
             },
         ]
@@ -1106,7 +1108,7 @@ fn show_marks_the_missing_fields_of_a_config_that_does_not_load() {
         "    secret_access_key \"<missing>\"  // missing: required, but not set",
         "  key \"<missing>\"                 // missing: required, but not set",
         // Items of lists are marked on their line.
-        "      {path_prefix \"<missing>\", backend assets, rewrites ()}  // missing: path_prefix",
+        "      {path_prefix \"<missing>\", backend assets, rewrites (), writable false}  // missing: path_prefix",
         // Defaults are filled in, in the order a loaded config shows them.
         "  seeds ()                        // default\n  gossip_interval 1s",
     ] {

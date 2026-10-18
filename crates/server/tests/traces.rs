@@ -122,6 +122,7 @@ fn config(cluster: Option<Cluster>) -> Config {
                     path_prefix: "/".into(),
                     backend: "assets".into(),
                     rewrites: Vec::new(),
+                    writable: false,
                     auth: None,
                 }],
             },
@@ -154,6 +155,7 @@ fn config(cluster: Option<Cluster>) -> Config {
         },
         auth: HashMap::new(),
         telemetry: Default::default(),
+        control: None,
         serve_backends: None,
         cluster,
     }

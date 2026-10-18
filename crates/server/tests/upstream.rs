@@ -51,6 +51,7 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
                     path_prefix: "/".into(),
                     backend: "shield".into(),
                     rewrites: Vec::new(),
+                    writable: false,
                     auth: None,
                 }],
             },
@@ -64,6 +65,7 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
         auth: HashMap::new(),
         telemetry: Default::default(),
         cluster: None,
+        control: None,
         serve_backends: serve,
     }
 }

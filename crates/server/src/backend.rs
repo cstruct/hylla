@@ -89,6 +89,7 @@ mod tests {
             auth: HashMap::new(),
             telemetry: Default::default(),
             cluster: None,
+            control: None,
             serve_backends: None,
         }
     }

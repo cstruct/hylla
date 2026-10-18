@@ -45,6 +45,7 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)], auth: Option<MappingAut
                 replace: (*replace).into(),
             })
             .collect(),
+        writable: false,
         auth,
     }
 }
@@ -95,6 +96,7 @@ async fn app(mappings: Vec<Mapping>, verifiers: HashMap<String, Verifier>) -> Ar
         cache: Cache::default(),
         auth: verifiers,
         telemetry: Default::default(),
+        control: None,
         serve_backends: None,
         cluster: None,
     };
@@ -410,6 +412,7 @@ async fn invalid_public_keys_fail_at_startup() {
         cache: Cache::default(),
         auth: verifiers(broken),
         telemetry: Default::default(),
+        control: None,
         serve_backends: None,
         cluster: None,
     };
