@@ -4,9 +4,11 @@
 //! through seeds. Each refresh rule runs on one node, its owner by rendezvous hashing over
 //! the live nodes. Metadata a node fetches from a backend is pushed to the others, and what
 //! the owner of a rule preloads is announced to the others, which pull the chunks from it
-//! rather than from the backend. Everything between nodes is signed with the cluster key.
+//! rather than from the backend. Everything between nodes is signed with the cluster key,
+//! and, with TLS configured, sent over mutual TLS.
 
 mod sign;
+mod tls;
 
 use std::{
     collections::HashMap,
@@ -55,6 +57,10 @@ pub struct Cluster {
     share: ClusterShare,
     signer: Signer,
     client: reqwest::Client,
+    /// `https` with TLS configured, `http` otherwise.
+    scheme: &'static str,
+    /// The listener's TLS configuration, if TLS is configured.
+    tls: Option<Arc<rustls::ServerConfig>>,
     heartbeat: AtomicU64,
     /// The other nodes, by id.
     members: Mutex<HashMap<String, Member>>,
@@ -115,6 +121,14 @@ impl Cluster {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
+        let client = reqwest::Client::builder().connect_timeout(config.failure_timeout.duration());
+        let (client, tls) = match &config.tls {
+            Some(tls) => {
+                let tls = tls::Tls::new(tls).context("setting up cluster TLS")?;
+                (client.use_preconfigured_tls(tls.client), Some(tls.server))
+            }
+            None => (client, None),
+        };
         Ok(Self {
             // r[impl cluster.identity]
             // The start time makes a restarted node a new member, rather than one whose
@@ -127,9 +141,9 @@ impl Cluster {
             failure_timeout: config.failure_timeout.duration(),
             share: config.share.clone(),
             signer: Signer::new(&config.key),
-            client: reqwest::Client::builder()
-                .connect_timeout(config.failure_timeout.duration())
-                .build()?,
+            client: client.build()?,
+            scheme: if tls.is_some() { "https" } else { "http" },
+            tls,
             heartbeat: AtomicU64::new(0),
             members: Mutex::default(),
             pulls: Semaphore::new(4),
@@ -271,7 +285,7 @@ impl Cluster {
         let signature = self.signer.sign("POST", path, &body);
         let response = self
             .client
-            .post(format!("http://{addr}{path}"))
+            .post(format!("{}://{addr}{path}", self.scheme))
             .header(sign::HEADER, signature)
             .header("content-type", "application/json")
             .headers(spans::trace_headers())
@@ -301,7 +315,7 @@ impl Cluster {
         let signature = self.signer.sign("GET", &path_and_query, b"");
         let response = self
             .client
-            .get(format!("http://{addr}{path_and_query}"))
+            .get(format!("{}://{addr}{path_and_query}", self.scheme))
             .header(sign::HEADER, signature)
             .headers(spans::trace_headers())
             .timeout(Duration::from_secs(30))
@@ -454,12 +468,16 @@ pub async fn start(
 
     let gossiping = cluster.clone();
     let broadcasting = cluster.clone();
-    Ok(vec![
-        tokio::spawn(async move {
+    let serving = match &cluster.tls {
+        Some(tls) => tokio::spawn(serve_tls(listener, router, tls.clone())),
+        None => tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, router).await {
                 tracing::error!("cluster listener failed: {error}");
             }
         }),
+    };
+    Ok(vec![
+        serving,
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(gossiping.gossip_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -470,6 +488,55 @@ pub async fn start(
         }),
         tokio::spawn(async move { broadcasting.broadcast(events).await }),
     ])
+}
+
+// r[impl cluster.tls]
+/// Serves the cluster listener over TLS, requiring nodes' certificates.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    tls: Arc<rustls::ServerConfig>,
+) {
+    use hyper_util::{
+        rt::{TokioExecutor, TokioIo},
+        server::conn::auto,
+        service::TowerToHyperService,
+    };
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // Such as running out of file descriptors: wait for some to free up.
+                tracing::warn!("accepting a cluster connection failed: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            let handshake = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream));
+            let stream = match handshake.await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    tracing::warn!(%peer, "refused a cluster connection: {error}");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(%peer, "refused a cluster connection: the handshake timed out");
+                    return;
+                }
+            };
+            let served = auto::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router))
+                .await;
+            if let Err(error) = served {
+                tracing::debug!(%peer, "cluster connection failed: {error}");
+            }
+        });
+    }
 }
 
 /// Verifies a request's signature, answering 401 when it's missing or invalid.

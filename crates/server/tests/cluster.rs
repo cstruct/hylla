@@ -1,13 +1,22 @@
 mod common;
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::body::{Body, to_bytes};
 use common::Flaky;
 use http::{Request, StatusCode, header};
 use hylla_config::{
-    Backend, Cache, Cluster, ClusterShare, Config, Interval, Mapping, Refresh, RefreshMode,
-    RefreshRule, Server,
+    Backend, Cache, Cluster, ClusterShare, ClusterTls, Config, Interval, Mapping, Refresh,
+    RefreshMode, RefreshRule, Server,
 };
 use hylla_server::App;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
@@ -53,6 +62,15 @@ impl Drop for Node {
 }
 
 async fn node(memory: &Arc<InMemory>, seeds: Vec<String>, key: &str) -> Node {
+    node_with_tls(memory, seeds, key, None).await
+}
+
+async fn node_with_tls(
+    memory: &Arc<InMemory>,
+    seeds: Vec<String>,
+    key: &str,
+    tls: Option<ClusterTls>,
+) -> Node {
     let addr = free_addr();
     let store = Flaky::new(memory.clone());
     let config = Config {
@@ -104,6 +122,7 @@ async fn node(memory: &Arc<InMemory>, seeds: Vec<String>, key: &str) -> Node {
             gossip_interval: Interval(Duration::from_millis(50)),
             failure_timeout: Interval(Duration::from_millis(500)),
             key: key.into(),
+            tls,
             share: ClusterShare::default(),
         }),
     };
@@ -311,4 +330,141 @@ async fn nodes_joining_later_catch_up_on_the_next_preload() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(request(&b.app, "GET", "/app.css").await.1, content());
     assert_eq!(b.store.requests(), 0, "B pulled from A, not its backend");
+}
+
+/// The name the nodes' certificates are issued for.
+const SERVER_NAME: &str = "hylla.cluster";
+
+/// A CA for a cluster, issuing node certificates into a directory of its own.
+struct Pki {
+    dir: PathBuf,
+    ca: PathBuf,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+    issued: AtomicUsize,
+}
+
+impl Pki {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("hylla-pki-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("{name} CA"));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = dir.join("ca.crt");
+        std::fs::write(&ca, params.self_signed(&key).unwrap().pem()).unwrap();
+        Self {
+            dir,
+            ca,
+            issuer: rcgen::Issuer::new(params, key),
+            issued: AtomicUsize::new(0),
+        }
+    }
+
+    /// TLS settings for a node, with a certificate issued for `name`, for both serving and
+    /// connecting.
+    fn node(&self, name: &str) -> ClusterTls {
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &self.issuer).unwrap();
+        let issued = self.issued.fetch_add(1, Ordering::Relaxed);
+        let (cert_path, key_path) = (
+            self.dir.join(format!("node-{issued}.crt")),
+            self.dir.join(format!("node-{issued}.key")),
+        );
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        ClusterTls {
+            ca: self.ca.display().to_string(),
+            cert: cert_path.display().to_string(),
+            key: key_path.display().to_string(),
+            server_name: SERVER_NAME.into(),
+        }
+    }
+}
+
+impl Drop for Pki {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+// r[verify cluster.tls]
+// r[verify config.cluster.tls]
+#[tokio::test]
+async fn nodes_share_over_mutual_tls() {
+    let memory = backend().await;
+    let pki = Pki::new("share");
+    let a = node_with_tls(&memory, Vec::new(), KEY, Some(pki.node(SERVER_NAME))).await;
+    let b = node_with_tls(
+        &memory,
+        vec![a.addr.to_string()],
+        KEY,
+        Some(pki.node(SERVER_NAME)),
+    )
+    .await;
+    for node in [&a, &b] {
+        eventually("both nodes to join", async || {
+            node.app.cluster_members().len() == 2
+        })
+        .await;
+    }
+
+    // Preloads are announced and their chunks pulled over TLS too.
+    let (owner, other) = if a.app.owns_refresh_rule("assets", 0) {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    other.store.fail(true);
+    assert_eq!(owner.app.refresh("assets", 0).await.unwrap().preloaded, 1);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(request(&other.app, "GET", "/app.css").await.1, content());
+    assert_eq!(other.store.requests(), 0, "the chunks came from the owner");
+
+    // The listener doesn't speak plain HTTP.
+    let plain = reqwest::Client::new()
+        .post(format!("http://{}/cluster/gossip", a.addr))
+        .body(r#"{"members":[]}"#)
+        .send()
+        .await;
+    assert!(plain.is_err(), "{plain:?}");
+}
+
+// r[verify cluster.tls]
+#[tokio::test]
+async fn nodes_without_a_certificate_for_the_cluster_are_refused() {
+    let memory = backend().await;
+    let pki = Pki::new("refuse");
+    let other = Pki::new("refuse-other");
+    let a = node_with_tls(&memory, Vec::new(), KEY, Some(pki.node(SERVER_NAME))).await;
+    let seeds = vec![a.addr.to_string()];
+    let intruders = [
+        // Issued by another CA.
+        node_with_tls(&memory, seeds.clone(), KEY, Some(other.node(SERVER_NAME))).await,
+        // Issued by the cluster CA, but for something else: refused connecting, and refused
+        // when connected to.
+        node_with_tls(
+            &memory,
+            seeds.clone(),
+            KEY,
+            Some(pki.node("cache.example.com")),
+        )
+        .await,
+        // Without TLS.
+        node(&memory, seeds, KEY).await,
+    ];
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(a.app.cluster_members(), vec![a.addr]);
+    for intruder in &intruders {
+        assert_eq!(intruder.app.cluster_members(), vec![intruder.addr]);
+    }
 }

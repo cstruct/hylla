@@ -331,6 +331,7 @@ async fn traces_are_exported_over_otlp() {
                     gossip_interval: Interval(Duration::from_millis(50)),
                     failure_timeout: Interval(Duration::from_millis(500)),
                     key: KEY.into(),
+                    tls: None,
                     share: ClusterShare::default(),
                 })),
                 stores,

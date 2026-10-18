@@ -357,6 +357,21 @@ impl Config {
     }
 }
 
+/// Whether `name` is a DNS name, such as `hylla.cluster`: dot-separated labels of letters,
+/// digits and hyphens, not starting or ending with a hyphen, and not an address.
+fn is_dns_name(name: &str) -> bool {
+    let labels_valid = name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    });
+    labels_valid && name.len() <= 253 && name.parse::<std::net::IpAddr>().is_err()
+}
+
 impl Config {
     fn validate_cluster(&self) -> Vec<ValidationError> {
         let Some(cluster) = &self.cluster else {
@@ -378,6 +393,19 @@ impl Config {
         }
         if cluster.key.len() < 32 {
             reasons.push("`key` must be at least 32 characters".to_string());
+        }
+        if let Some(tls) = &cluster.tls {
+            for (field, path) in [("ca", &tls.ca), ("cert", &tls.cert), ("key", &tls.key)] {
+                if path.is_empty() {
+                    reasons.push(format!("`tls.{field}` must be a file"));
+                }
+            }
+            if !is_dns_name(&tls.server_name) {
+                reasons.push(format!(
+                    "`tls.server_name` is `{}`, which isn't a DNS name",
+                    tls.server_name
+                ));
+            }
         }
         for seed in &cluster.seeds {
             let valid = seed

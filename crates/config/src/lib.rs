@@ -218,6 +218,25 @@ config_tree! {
             /// least 32 characters.
             #[config(secret)]
             pub key: String,
+            // r[impl config.cluster.tls]
+            /// Mutual TLS between the nodes, encrypting what they send each other and
+            /// checking their certificates. Without it, nodes talk plain HTTP, though signed
+            /// with the key either way.
+            pub tls: Option<pub struct ClusterTls {
+                /// The PEM file of the CA certificates nodes' certificates must be issued
+                /// by. Use a CA for the cluster only: any certificate it issued for
+                /// `server_name` is a node. Read at startup.
+                pub ca: String,
+                /// The PEM file of this node's certificate chain, read again when it
+                /// changes, so certificates can be rotated without a restart.
+                pub cert: String,
+                /// The PEM file of this node's private key, read again when it changes.
+                pub key: String,
+                /// The DNS name every node's certificate is issued for, such as
+                /// `hylla.cluster`. Nodes reach each other by address, which changes as
+                /// nodes come and go, so certificates are checked for this name instead.
+                pub server_name: String,
+            }>,
             // r[impl config.cluster.share]
             /// What the nodes share.
             #[facet(default)]

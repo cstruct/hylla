@@ -205,14 +205,19 @@ DNS name.
 r[config.cluster.key]
 `key` MUST be the secret shared by the nodes, so only the secrets file can set it.
 
+r[config.cluster.tls]
+An optional `tls` section in `cluster` MUST turn on mutual TLS between the nodes, from the
+PEM files of the `ca` nodes' certificates must be issued by and of this node's `cert` and
+`key`, and the `server_name` every node's certificate is issued for.
+
 r[config.cluster.share]
 `share` MUST turn sharing `metadata` and `preload`s on or off, both defaulting to on.
 
 r[config.validate.cluster]
 A `listen` address of `0.0.0.0` or `[::]` without an `advertise` address, an unspecified
 `advertise` address, a key shorter than 32 characters, seeds that aren't `host:port`, a zero
-gossip interval and a failure timeout not longer than the gossip interval MUST be reported
-as invalid.
+gossip interval, a failure timeout not longer than the gossip interval, and TLS settings
+with an empty file or a `server_name` that isn't a DNS name MUST be reported as invalid.
 
 ## Telemetry
 

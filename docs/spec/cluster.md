@@ -22,6 +22,16 @@ Every request between nodes MUST be signed with the shared cluster key, covering
 path and query, a timestamp and its body, and requests with a missing, invalid or more than
 a minute old signature MUST be refused. The key itself MUST NOT be sent.
 
+r[cluster.tls]
+With TLS configured, the cluster listener MUST only accept TLS connections, and nodes MUST
+only accept each other, connecting or connected to, with a certificate issued by the
+cluster CA for the configured server name, whatever address they are at. Requests MUST be
+signed either way.
+
+r[cluster.tls.rotate]
+A node's certificate and key MUST be read again when their files change, for new
+connections, keeping the ones in use when the new files can't be read or don't match.
+
 ## Sharing
 
 r[cluster.ownership]

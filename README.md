@@ -223,6 +223,30 @@ rule runs on one node, metadata fetched from a backend is pushed to the other no
 others pull what a node preloads directly from it, so the backend serves it once per cluster.
 Everything between nodes is signed with the shared key.
 
+With `tls`, nodes also talk over mutual TLS, accepting only each other's certificates:
+
+```styx
+cluster {
+  listen 0.0.0.0:7946
+  advertise 10.0.0.5:7946
+  seeds (hylla-cluster.cache.svc.cluster.local:7946)
+  tls {
+    ca /etc/hylla/tls/ca.crt
+    cert /etc/hylla/tls/tls.crt
+    key /etc/hylla/tls/tls.key
+    server_name hylla.cluster
+  }
+}
+```
+
+Every node's certificate must be issued by the `ca` for `server_name` as a DNS name, with
+both the server and client auth usages, since a node is both. Nodes are reached by address,
+which changes as they come and go, so certificates are checked for `server_name`, not
+addresses. Use a CA for the cluster only. The certificate and key are read again when their
+files change, so tools like cert-manager can rotate them without a restart; the CA is read
+at startup. All nodes need `tls` on or off together, since a node with TLS doesn't talk to
+one without.
+
 ### Docker
 
 Images for `linux/amd64` and `linux/arm64` are on Docker Hub as

@@ -31,6 +31,12 @@ humantime = "2.4.0"
 object_store = { version = "0.14.2", features = ["aws", "azure"] }
 percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", default-features = false }
+# Mutual TLS between cluster nodes, with the aws-lc-rs provider the rest of the tree uses.
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+hyper-util = { version = "0.1.21", features = ["server-auto", "service", "tokio"] }
+# Checking nodes' client certificates for the cluster's server name, as rustls does for servers.
+webpki = { package = "rustls-webpki", version = "0.103.15", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_urlencoded = "0.7.1"
 tokio = { version = "1.53.3", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
@@ -45,3 +51,4 @@ prost = "0.14.4"
 base64 = "0.23.1"
 async-trait = "0.1.92"
 tower = { version = "0.5.3", features = ["util"] }
+rcgen = "0.14.10"

@@ -1227,3 +1227,63 @@ backends {assets {type s3, bucket assets, region eu-north-1}}
     let files = Files::new("one-mapping", MINIMAL, MINIMAL_SECRETS);
     files.load(&[]).unwrap();
 }
+
+// r[verify config.cluster.tls]
+// r[verify config.validate.cluster]
+#[test]
+fn cluster_tls_is_configured_with_files_and_a_server_name() {
+    let config = format!(
+        "{MINIMAL}cluster {{
+  listen 10.0.0.5:7946
+  tls {{
+    ca /etc/hylla/tls/ca.crt
+    cert /etc/hylla/tls/tls.crt
+    key /etc/hylla/tls/tls.key
+    server_name hylla.cluster
+  }}
+}}
+"
+    );
+    let secrets = format!(
+        "cluster {{key \"a cluster key of at least thirty-two characters\"}}\n{MINIMAL_SECRETS}"
+    );
+    let files = Files::new("cluster-tls", &config, &secrets);
+    let cluster = files.load(&[]).unwrap().into_config().cluster.unwrap();
+    assert_eq!(
+        cluster.tls,
+        Some(hylla_config::ClusterTls {
+            ca: "/etc/hylla/tls/ca.crt".into(),
+            cert: "/etc/hylla/tls/tls.crt".into(),
+            key: "/etc/hylla/tls/tls.key".into(),
+            server_name: "hylla.cluster".into(),
+        })
+    );
+
+    for (server_name, valid) in [
+        ("hylla", true),
+        ("hylla-0.hylla.cache.svc", true),
+        ("10.0.0.5", false),
+        ("-hylla.cluster", false),
+        ("hylla..cluster", false),
+        ("hylla_cluster", false),
+    ] {
+        let config = config
+            .replace(
+                "server_name hylla.cluster",
+                &format!("server_name {server_name}"),
+            )
+            .replace("key /etc/hylla/tls/tls.key", "key \"\"");
+        let files = Files::new("cluster-tls-invalid", &config, &secrets);
+        let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+            panic!("expected validation errors for `{server_name}`");
+        };
+        let mut expected = vec!["invalid cluster config: `tls.key` must be a file".to_string()];
+        if !valid {
+            expected.push(format!(
+                "invalid cluster config: `tls.server_name` is `{server_name}`, which isn't a DNS name"
+            ));
+        }
+        let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(errors, expected, "server name `{server_name}`");
+    }
+}
