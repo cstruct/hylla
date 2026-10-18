@@ -77,6 +77,7 @@ async fn writable_node(memory: &Arc<InMemory>, seeds: Vec<String>) -> Node {
             },
         )]),
         max_upload_mib: 1,
+        oidc: None,
     };
     node_with(memory, seeds, KEY, None, Some(control)).await
 }

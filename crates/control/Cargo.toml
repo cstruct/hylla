@@ -18,6 +18,7 @@ leptos_router = "0.8.16"
 serde = { version = "1.0.229", features = ["derive"] }
 
 async-trait = { version = "0.1.92", optional = true }
+http = { version = "1.5.0", optional = true }
 leptos_axum = { version = "0.8.10", optional = true }
 
 # Pinned to the wasm-bindgen CLI in mise.toml, which must match it exactly.
@@ -28,6 +29,7 @@ console_error_panic_hook = { version = "0.1.7", optional = true }
 # Rendering on the server, as hylla-server does.
 ssr = [
     "dep:async-trait",
+    "dep:http",
     "dep:leptos_axum",
     "leptos/ssr",
     "leptos_meta/ssr",

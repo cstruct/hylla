@@ -595,8 +595,28 @@ impl Config {
             return Vec::new();
         };
         let mut reasons = Vec::new();
-        if control.users.is_empty() {
-            reasons.push("there are no `users`, so no one can sign in".to_string());
+        if control.users.is_empty() && control.oidc.is_none() {
+            reasons.push("there are no `users` and no `oidc`, so no one can sign in".to_string());
+        }
+        if let Some(oidc) = &control.oidc {
+            for (field, url) in [("issuer", &oidc.issuer), ("url", &oidc.url)] {
+                let host = url
+                    .strip_prefix("https://")
+                    .or_else(|| url.strip_prefix("http://"))
+                    .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
+                if host.is_none_or(str::is_empty) {
+                    reasons.push(format!("`oidc.{field}` is `{url}`, which isn't a URL"));
+                }
+            }
+            if oidc.client_id.is_empty() {
+                reasons.push("`oidc.client_id` must be set".to_string());
+            }
+            if oidc.groups.is_empty() {
+                reasons.push("`oidc.groups` must allow at least one group in".to_string());
+            }
+            if oidc.session_ttl.duration().is_zero() {
+                reasons.push("`oidc.session_ttl` must be positive".to_string());
+            }
         }
         let mut users = control.users.iter().collect::<Vec<_>>();
         users.sort_by_key(|(name, _)| *name);

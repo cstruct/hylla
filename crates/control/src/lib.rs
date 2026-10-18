@@ -11,6 +11,16 @@ pub use app::{App, shell};
 
 use serde::{Deserialize, Serialize};
 
+/// Who's signed in to the control plane, as the server puts it in each request's
+/// extensions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Viewer {
+    /// Such as the user name, or the email or subject the provider vouches for.
+    pub name: String,
+    /// Whether they signed in through the OpenID provider, so they can sign out.
+    pub signed_in_with_provider: bool,
+}
+
 /// A backend and its last requests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackendInfo {

@@ -5,9 +5,47 @@ of each backend, the mappings, and browsing their objects, changing those of wri
 mappings. Public listeners never change objects.
 
 r[control.auth]
-Every request to the control plane MUST be authenticated with HTTP Basic auth, as a
-configured user whose password matches its argon2 hash, and refused with 401 and a
-`WWW-Authenticate` challenge otherwise.
+Every request to the control plane but signing in MUST be authenticated, with a session
+from signing in through the OpenID provider or with HTTP Basic auth as a configured user
+whose password matches its argon2 hash. Otherwise, a browser loading a page MUST be sent to
+sign in through the provider when one is configured, coming back to the page, and anything
+else MUST be refused with 401 and a `WWW-Authenticate` challenge.
+
+## Signing in through an OpenID provider
+
+r[control.oidc.login]
+`/auth/login` MUST redirect to the provider's authorization endpoint for the authorization
+code flow, with the client id, the redirect URI `{url}/auth/callback`, the `openid` scope
+and the configured ones, and a fresh state, nonce and S256 PKCE challenge. The state MUST
+be set in an HTTP-only cookie binding the sign-in to the browser, which MUST finish it
+within ten minutes.
+
+r[control.oidc.issuer]
+The provider's discovery document MUST name the configured issuer.
+
+r[control.oidc.callback]
+`/auth/callback` MUST refuse with 400 a state that isn't the browser's sign-in, and with 403
+an error from the provider. It MUST exchange the code with the PKCE verifier, with the client
+secret when one is configured, and start a session for an ID token that checks out,
+redirecting to the page the sign-in started from, if it's one of the control plane's.
+
+r[control.oidc.id-token]
+An ID token MUST be signed asymmetrically by one of the provider's keys, issued by the
+provider for the client id, current, and carry the sign-in's nonce.
+
+r[control.oidc.groups]
+Only users in one of the configured groups MUST get a session, by the configured claim of
+the ID token or, when the ID token has no such claim, of the provider's user info. Others
+MUST be refused with 403.
+
+r[control.oidc.session]
+A session MUST be named by a random HTTP-only, same-site cookie, secure when the control
+plane is reached over HTTPS, and last the configured time.
+
+r[control.oidc.logout]
+`POST /auth/logout` MUST end the session, clear its cookie, and redirect to the provider's
+end session endpoint, when it has one, with the ID token as a hint and `{url}/` to return
+to. Cross-site requests to it MUST be refused.
 
 r[control.same-origin]
 A request that changes anything, by any method but `GET`, `HEAD` and `OPTIONS`, MUST be

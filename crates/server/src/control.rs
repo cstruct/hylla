@@ -25,13 +25,19 @@ use axum::{
 use base64::Engine;
 use futures::TryStreamExt;
 use http::{HeaderMap, Method, StatusCode, header};
-use hylla_control::{BackendInfo, CallInfo, ControlPlane, Listing, MappingInfo, ObjectEntry};
+use hylla_control::{
+    BackendInfo, CallInfo, ControlPlane, Listing, MappingInfo, ObjectEntry, Viewer,
+};
 use leptos::prelude::{LeptosOptions, provide_context};
 use leptos_axum::{LeptosRoutes, generate_route_list, handle_server_fns_with_context};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use serde::Deserialize;
 
-use crate::{App, spans, status};
+use crate::{
+    App,
+    oidc::{self, Oidc, SignInError},
+    spans, status,
+};
 
 /// The UI's hydration bundle, as `mise run ui` builds it. Without it, the UI is served
 /// rendered on the server only, which works without JavaScript.
@@ -49,8 +55,10 @@ pub struct ControlSettings {
     /// The PHC strings of the users' argon2 password hashes, by user name.
     users: HashMap<String, String>,
     max_upload: usize,
-    /// The SHA-256 of `Authorization` headers verified, and when.
-    verified: Mutex<HashMap<Vec<u8>, Instant>>,
+    /// The SHA-256 of `Authorization` headers verified, when, and for which user.
+    verified: Mutex<HashMap<Vec<u8>, (Instant, String)>>,
+    /// Signing in through an OpenID provider, if configured.
+    oidc: Option<Oidc>,
 }
 
 impl ControlSettings {
@@ -70,38 +78,34 @@ impl ControlSettings {
             max_upload: usize::try_from(config.max_upload_mib.saturating_mul(1024 * 1024))
                 .unwrap_or(usize::MAX),
             verified: Mutex::default(),
+            oidc: config.oidc.as_ref().map(Oidc::new).transpose()?,
         })
     }
 
     // r[impl control.auth]
-    /// Whether an `Authorization` header holds a user's name and password.
-    fn check(&self, authorization: &str) -> bool {
+    /// The user whose name and password an `Authorization` header holds, if any.
+    fn check(&self, authorization: &str) -> Option<String> {
         let key = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, authorization.as_bytes())
             .as_ref()
             .to_vec();
         {
             let verified = self.verified.lock().expect("not poisoned");
-            if verified
+            if let Some((_, user)) = verified
                 .get(&key)
-                .is_some_and(|at| at.elapsed() < VERIFIED_FOR)
+                .filter(|(at, _)| at.elapsed() < VERIFIED_FOR)
             {
-                return true;
+                return Some(user.clone());
             }
         }
-        let Some(credentials) = authorization
+        let credentials = authorization
             .strip_prefix("Basic ")
             .and_then(|encoded| {
                 base64::engine::general_purpose::STANDARD
                     .decode(encoded.trim())
                     .ok()
             })
-            .and_then(|decoded| String::from_utf8(decoded).ok())
-        else {
-            return false;
-        };
-        let Some((user, password)) = credentials.split_once(':') else {
-            return false;
-        };
+            .and_then(|decoded| String::from_utf8(decoded).ok())?;
+        let (user, password) = credentials.split_once(':')?;
         let valid = self
             .users
             .get(user)
@@ -111,12 +115,13 @@ impl ControlSettings {
                     .verify_password(password.as_bytes(), &hash)
                     .is_ok()
             });
-        if valid {
-            let mut verified = self.verified.lock().expect("not poisoned");
-            verified.retain(|_, at| at.elapsed() < VERIFIED_FOR);
-            verified.insert(key, Instant::now());
+        if !valid {
+            return None;
         }
-        valid
+        let mut verified = self.verified.lock().expect("not poisoned");
+        verified.retain(|_, (at, _)| at.elapsed() < VERIFIED_FOR);
+        verified.insert(key, (Instant::now(), user.to_string()));
+        Some(user.to_string())
     }
 }
 
@@ -499,12 +504,161 @@ pub fn router(app: &Arc<App>, settings: &Arc<ControlSettings>) -> Router {
         .route("/v1/mappings/{server}/{index}/upload", post(upload_form))
         .layer(DefaultBodyLimit::max(settings.max_upload))
         .with_state(plane);
+    // Signing in through the provider needs no sign-in.
+    let auth = Router::new()
+        .route("/auth/login", get(login))
+        .route("/auth/callback", get(callback))
+        .route("/auth/logout", post(logout))
+        .with_state(settings.clone());
     ui.merge(api)
         .route("/pkg/{*file}", get(bundle_file))
         .layer(middleware::from_fn_with_state(
             settings.clone(),
             authenticate,
         ))
+        .merge(auth)
+}
+
+/// The value of a request's cookie.
+fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|pair| {
+            let (key, value) = pair.trim().split_once('=')?;
+            (key == name).then_some(value)
+        })
+}
+
+/// A `Set-Cookie` value, HTTP-only and same-site, secure when the control plane is reached
+/// over HTTPS.
+fn set_cookie(name: &str, value: &str, path: &str, max_age: Duration, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{name}={value}; Path={path}; Max-Age={}; HttpOnly; SameSite=Lax{secure}",
+        max_age.as_secs()
+    )
+}
+
+#[derive(Deserialize)]
+struct LoginQuery {
+    #[serde(default)]
+    return_to: String,
+}
+
+async fn login(
+    State(settings): State<Arc<ControlSettings>>,
+    Query(query): Query<LoginQuery>,
+) -> Response {
+    let Some(oidc) = &settings.oidc else {
+        return (
+            StatusCode::NOT_FOUND,
+            "signing in through a provider isn't configured\n",
+        )
+            .into_response();
+    };
+    match oidc.start(&query.return_to).await {
+        Ok((url, state)) => (
+            [(
+                header::SET_COOKIE,
+                set_cookie(
+                    oidc::LOGIN_COOKIE,
+                    &state,
+                    "/auth",
+                    Duration::from_secs(600),
+                    oidc.secure_cookies(),
+                ),
+            )],
+            Redirect::to(&url),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!("starting a sign-in failed: {error:#}");
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("the provider can't be reached: {error:#}\n"),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn callback(
+    State(settings): State<Arc<ControlSettings>>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(oidc) = &settings.oidc else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let secure = oidc.secure_cookies();
+    let forget_login = set_cookie(oidc::LOGIN_COOKIE, "", "/auth", Duration::ZERO, secure);
+    match oidc
+        .finish(&query, cookie(&headers, oidc::LOGIN_COOKIE))
+        .await
+    {
+        Ok((session, return_to)) => {
+            let ttl = oidc.session_ttl();
+            let mut response = Redirect::to(&return_to).into_response();
+            let cookies = response.headers_mut();
+            cookies.append(header::SET_COOKIE, header_value(&forget_login));
+            cookies.append(
+                header::SET_COOKIE,
+                header_value(&set_cookie(
+                    oidc::SESSION_COOKIE,
+                    &session,
+                    "/",
+                    ttl,
+                    secure,
+                )),
+            );
+            response
+        }
+        Err(error) => {
+            let status = match &error {
+                SignInError::UnknownState => StatusCode::BAD_REQUEST,
+                SignInError::Provider(_) | SignInError::NotAllowed(_) => StatusCode::FORBIDDEN,
+                SignInError::Failed(_) => StatusCode::BAD_GATEWAY,
+            };
+            tracing::warn!("a sign-in failed: {error}");
+            (
+                status,
+                [(header::SET_COOKIE, forget_login)],
+                format!("{error}\n"),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn logout(State(settings): State<Arc<ControlSettings>>, headers: HeaderMap) -> Response {
+    if cross_site(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-site requests are refused\n").into_response();
+    }
+    let Some(oidc) = &settings.oidc else {
+        return Redirect::to("/").into_response();
+    };
+    let to = oidc.end(cookie(&headers, oidc::SESSION_COOKIE)).await;
+    (
+        [(
+            header::SET_COOKIE,
+            set_cookie(
+                oidc::SESSION_COOKIE,
+                "",
+                "/",
+                Duration::ZERO,
+                oidc.secure_cookies(),
+            ),
+        )],
+        Redirect::to(&to),
+    )
+        .into_response()
+}
+
+fn header_value(value: &str) -> http::HeaderValue {
+    http::HeaderValue::from_str(value).expect("cookies are header values")
 }
 
 /// Starts the control plane's listener.
@@ -526,15 +680,46 @@ pub async fn start(
 
 async fn authenticate(
     State(settings): State<Arc<ControlSettings>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    let signed_in = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| settings.check(value));
-    if !signed_in {
+    // r[impl control.oidc.session]
+    let session = settings.oidc.as_ref().and_then(|oidc| {
+        let cookie = cookie(request.headers(), oidc::SESSION_COOKIE)?;
+        oidc.session(cookie)
+    });
+    let viewer = match session {
+        Some(session) => Some(Viewer {
+            name: session.name,
+            signed_in_with_provider: true,
+        }),
+        None => request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| settings.check(value))
+            .map(|name| Viewer {
+                name,
+                signed_in_with_provider: false,
+            }),
+    };
+    let Some(viewer) = viewer else {
+        // Browsers loading a page sign in through the provider; anything else, such as
+        // scripts, with Basic auth.
+        let page = request.method() == Method::GET
+            && request
+                .headers()
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|accept| accept.contains("text/html"));
+        if settings.oidc.is_some() && page {
+            let return_to = request
+                .uri()
+                .path_and_query()
+                .map_or("/", |path| path.as_str());
+            let query = serde_urlencoded::to_string([("return_to", return_to)]).unwrap_or_default();
+            return Redirect::to(&format!("/auth/login?{query}")).into_response();
+        }
         return (
             StatusCode::UNAUTHORIZED,
             [(
@@ -544,7 +729,8 @@ async fn authenticate(
             "sign in to the control plane\n",
         )
             .into_response();
-    }
+    };
+    request.extensions_mut().insert(viewer);
     let changes = !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS

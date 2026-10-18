@@ -317,7 +317,30 @@ control {
 control {users {admin {password_hash "$argon2id$v=19$m=19456,t=2,p=1$..."}}}
 ```
 
-Users sign in with HTTP Basic auth. Hash their passwords with:
+People can sign in through an OpenID provider, such as Konklav,
+with the authorization code flow and PKCE, if they're in one of the allowed groups:
+
+```styx
+control {
+  listen 127.0.0.1:9090
+  oidc {
+    issuer https://id.example.com
+    client_id hylla
+    url https://hylla-control.internal  // the provider redirects to {url}/auth/callback
+    groups (hylla-admin)                // from the `groups` claim, or `groups_claim`
+  }
+}
+// secrets.styx, for a confidential client
+control {oidc {client_secret "..."}}
+```
+
+Register the client with the redirect URI `{url}/auth/callback` and, to sign out at the
+provider too, the post-logout redirect URI `{url}/`. With Konklav, give the client the
+`openid`, `email` and `groups` scopes and `visible_groups` such as `hylla-*`, and the
+users the global role `hylla-admin`. Sessions are kept in memory, per node, for
+`session_ttl` (8 hours by default).
+
+Users in `users` sign in with HTTP Basic auth, as scripts do. Hash their passwords with:
 
 ```bash
 hylla hash-password

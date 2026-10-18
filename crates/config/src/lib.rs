@@ -298,6 +298,36 @@ config_tree! {
             /// The largest upload, in MiB.
             #[facet(default = 256)]
             pub max_upload_mib: u64,
+            // r[impl config.control.oidc]
+            /// Signing in through an OpenID provider, such as Konklav, with the
+            /// authorization code flow and PKCE. Basic auth keeps working for `users`.
+            pub oidc: Option<pub struct ControlOidc {
+                /// The provider's issuer, such as `https://id.example.com`. Its discovery
+                /// document is read from `{issuer}/.well-known/openid-configuration`.
+                pub issuer: String,
+                /// The client id hylla is registered with.
+                pub client_id: String,
+                /// The client's secret, for a confidential client. Without it, hylla signs
+                /// in as a public client, protected by PKCE alone.
+                #[config(secret)]
+                pub client_secret: Option<String>,
+                /// The control plane's own URL, as browsers reach it, such as
+                /// `https://hylla-control.internal`. The provider redirects back to
+                /// `{url}/auth/callback`, and to `{url}/` after signing out.
+                pub url: String,
+                /// The groups allowed in: a user must be in at least one.
+                pub groups: Vec<String>,
+                /// The claim of the ID token, or of the user info, listing the user's
+                /// groups.
+                #[facet(default = String::from("groups"))]
+                pub groups_claim: String,
+                /// The scopes asked for besides `openid`, such as `email` and `groups`.
+                #[facet(default = vec![String::from("email"), String::from("groups")])]
+                pub scopes: Vec<String>,
+                /// How long a sign-in lasts, such as `8h`.
+                #[facet(default = Interval::from_secs(8 * 60 * 60))]
+                pub session_ttl: Interval,
+            }>,
         }>,
         // r[impl config.auth.verifiers]
         /// JWT verifiers by name, used by mappings' `auth`.

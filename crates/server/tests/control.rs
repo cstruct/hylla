@@ -92,6 +92,7 @@ async fn node(backend: &str) -> (Arc<App>, Arc<InMemory>) {
                 },
             )]),
             max_upload_mib: 1,
+            oidc: None,
         }),
         serve_backends: None,
     };
@@ -488,6 +489,7 @@ fn writable_mappings_and_the_control_plane_are_validated() {
                 },
             )]),
             max_upload_mib: 0,
+            oidc: None,
         }),
         serve_backends: None,
     };
@@ -515,6 +517,36 @@ fn writable_mappings_and_the_control_plane_are_validated() {
     config.control.as_mut().unwrap().users.clear();
     let errors = config.validate().unwrap_err();
     assert!(errors.contains(&ValidationError::InvalidControl {
-        reason: "there are no `users`, so no one can sign in".into()
+        reason: "there are no `users` and no `oidc`, so no one can sign in".into()
     }));
+
+    // Signing in through a provider is enough, if it's configured properly.
+    config.control.as_mut().unwrap().oidc = Some(hylla_config::ControlOidc {
+        issuer: "id.example.com".into(),
+        client_id: String::new(),
+        client_secret: None,
+        url: "https://hylla-control.internal".into(),
+        groups: Vec::new(),
+        groups_claim: "groups".into(),
+        scopes: Vec::new(),
+        session_ttl: hylla_config::Interval::from_secs(0),
+    });
+    let errors = config
+        .validate()
+        .unwrap_err()
+        .into_iter()
+        .filter_map(|error| match error {
+            ValidationError::InvalidControl { reason } if reason.contains("oidc") => Some(reason),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            "`oidc.issuer` is `id.example.com`, which isn't a URL",
+            "`oidc.client_id` must be set",
+            "`oidc.groups` must allow at least one group in",
+            "`oidc.session_ttl` must be positive",
+        ]
+    );
 }

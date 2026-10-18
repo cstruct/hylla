@@ -231,10 +231,18 @@ r[config.control.users]
 `users` MUST map user names to their `password_hash`, an argon2 hash in PHC form, which is
 secret, so only the secrets file can set it.
 
+r[config.control.oidc]
+An optional `oidc` section in `control` MUST configure signing in through an OpenID
+provider: its `issuer`, the `client_id` and an optional secret `client_secret`, the control
+plane's own `url`, the `groups` allowed in, the `groups_claim` holding them, defaulting to
+`groups`, the `scopes` asked for besides `openid`, defaulting to `email` and `groups`, and
+the `session_ttl`, defaulting to `8h`.
+
 r[config.validate.control]
-A control plane without users, with a password hash that isn't an argon2 hash, a zero
-`max_upload_mib`, or listening on the address of a server, the cluster or `serve_backends`
-MUST be reported as invalid.
+A control plane without users or `oidc`, with a password hash that isn't an argon2 hash, a
+zero `max_upload_mib`, listening on the address of a server, the cluster or
+`serve_backends`, or with `oidc` whose `issuer` or `url` isn't a URL, without a client id or
+groups, or with a zero session lifetime MUST be reported as invalid.
 
 ## Cluster
 

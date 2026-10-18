@@ -6,7 +6,7 @@ use leptos_router::{
     path,
 };
 
-use crate::{BackendInfo, CallInfo, Listing, MappingInfo};
+use crate::{BackendInfo, CallInfo, Listing, MappingInfo, Viewer};
 
 const STYLE: &str = r#"
 :root { color-scheme: light dark; --muted: #6b7280; --error: #b91c1c; --ok: #15803d; --line: #e5e7eb; }
@@ -14,6 +14,7 @@ const STYLE: &str = r#"
 body { font: 15px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 64rem; padding: 1rem; }
 nav { display: flex; gap: 1rem; border-bottom: 1px solid var(--line); padding-bottom: .5rem; margin-bottom: 1rem; }
 nav strong { margin-right: auto; }
+nav > span:first-of-type { margin-left: 1rem; }
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -53,6 +54,7 @@ pub fn App() -> impl IntoView {
                 <strong>"hylla"</strong>
                 <A href="/">"Backends"</A>
                 <A href="/mappings">"Mappings"</A>
+                <SignedIn />
             </nav>
             <main>
                 <Routes fallback=|| view! { <p>"Not found."</p> }>
@@ -62,6 +64,32 @@ pub fn App() -> impl IntoView {
                 </Routes>
             </main>
         </Router>
+    }
+}
+
+#[server]
+pub async fn get_viewer() -> Result<Option<Viewer>, ServerFnError> {
+    Ok(use_context::<http::request::Parts>()
+        .and_then(|parts| parts.extensions.get::<Viewer>().cloned()))
+}
+
+/// Who's signed in, and signing out for those who signed in through the provider.
+#[component]
+fn SignedIn() -> impl IntoView {
+    let viewer = Resource::new(|| (), |_| get_viewer());
+    view! {
+        <Suspense fallback=|| ()>
+            {move || Suspend::new(async move {
+                viewer.await.ok().flatten().map(|viewer| view! {
+                    <span class="muted">{viewer.name}</span>
+                    {viewer.signed_in_with_provider.then(|| view! {
+                        <form method="post" action="/auth/logout" class="inline">
+                            <button type="submit">"Sign out"</button>
+                        </form>
+                    })}
+                })
+            })}
+        </Suspense>
     }
 }
 

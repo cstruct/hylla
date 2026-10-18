@@ -13,6 +13,7 @@ mod cluster;
 mod control;
 mod logs;
 mod metrics;
+mod oidc;
 mod range;
 mod refresh;
 mod spans;
