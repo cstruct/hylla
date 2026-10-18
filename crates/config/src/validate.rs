@@ -50,6 +50,10 @@ pub enum ValidationError {
     },
     /// The cluster settings are invalid.
     InvalidCluster { reason: String },
+    /// A backend's settings are invalid.
+    InvalidBackend { backend: String, reason: String },
+    /// The settings of serving backends to other nodes are invalid.
+    InvalidServeBackends { reason: String },
     /// A cache size setting is out of range.
     InvalidCache { reason: String },
     /// Several servers answer to the same host name on the same address.
@@ -136,6 +140,12 @@ impl fmt::Display for ValidationError {
                 reason,
             } => write!(f, "refresh of backend `{backend}` is invalid: {reason}"),
             Self::InvalidCluster { reason } => write!(f, "invalid cluster config: {reason}"),
+            Self::InvalidBackend { backend, reason } => {
+                write!(f, "backend `{backend}` is invalid: {reason}")
+            }
+            Self::InvalidServeBackends { reason } => {
+                write!(f, "invalid serve_backends config: {reason}")
+            }
             Self::InvalidCache { reason } => write!(f, "invalid cache config: {reason}"),
             Self::DuplicateHost {
                 listen,
@@ -251,6 +261,10 @@ impl Config {
         errors.extend(self.validate_refresh());
         // r[impl config.validate.cluster]
         errors.extend(self.validate_cluster());
+        // r[impl config.validate.hylla-backends]
+        errors.extend(self.validate_hylla_backends());
+        // r[impl config.validate.serve-backends]
+        errors.extend(self.validate_serve_backends());
 
         for ((listen, server_name), servers) in hosts {
             if servers.len() > 1 {
@@ -357,6 +371,15 @@ impl Config {
     }
 }
 
+/// Reasons TLS files are invalid: every one must be set.
+fn tls_file_reasons(files: [(&str, &str); 3]) -> Vec<String> {
+    files
+        .into_iter()
+        .filter(|(_, path)| path.is_empty())
+        .map(|(field, _)| format!("`tls.{field}` must be a file"))
+        .collect()
+}
+
 /// Whether `name` is a DNS name, such as `hylla.cluster`: dot-separated labels of letters,
 /// digits and hyphens, not starting or ending with a hyphen, and not an address.
 fn is_dns_name(name: &str) -> bool {
@@ -395,11 +418,11 @@ impl Config {
             reasons.push("`key` must be at least 32 characters".to_string());
         }
         if let Some(tls) = &cluster.tls {
-            for (field, path) in [("ca", &tls.ca), ("cert", &tls.cert), ("key", &tls.key)] {
-                if path.is_empty() {
-                    reasons.push(format!("`tls.{field}` must be a file"));
-                }
-            }
+            reasons.extend(tls_file_reasons([
+                ("ca", &tls.ca),
+                ("cert", &tls.cert),
+                ("key", &tls.key),
+            ]));
             if !is_dns_name(&tls.server_name) {
                 reasons.push(format!(
                     "`tls.server_name` is `{}`, which isn't a DNS name",
@@ -424,6 +447,104 @@ impl Config {
         reasons
             .into_iter()
             .map(|reason| ValidationError::InvalidCluster { reason })
+            .collect()
+    }
+}
+
+impl Config {
+    fn validate_hylla_backends(&self) -> Vec<ValidationError> {
+        let mut backends = self.backends.iter().collect::<Vec<_>>();
+        backends.sort_by_key(|(name, _)| *name);
+        let mut errors = Vec::new();
+        for (name, backend) in backends {
+            let crate::Backend::Hylla {
+                url,
+                backend: remote,
+                tls,
+                ..
+            } = backend
+            else {
+                continue;
+            };
+            let mut reasons = Vec::new();
+            let host = url
+                .strip_prefix("https://")
+                .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
+            if host.is_none_or(str::is_empty) {
+                reasons.push(format!(
+                    "`url` is `{url}`, which isn't an `https://` URL with a host"
+                ));
+            }
+            if remote.is_empty() {
+                reasons.push("`backend` must name a backend of the other node".to_string());
+            }
+            reasons.extend(tls_file_reasons([
+                ("ca", &tls.ca),
+                ("cert", &tls.cert),
+                ("key", &tls.key),
+            ]));
+            errors.extend(
+                reasons
+                    .into_iter()
+                    .map(|reason| ValidationError::InvalidBackend {
+                        backend: name.clone(),
+                        reason,
+                    }),
+            );
+        }
+        errors
+    }
+
+    fn validate_serve_backends(&self) -> Vec<ValidationError> {
+        let Some(serve) = &self.serve_backends else {
+            return Vec::new();
+        };
+        let mut reasons = Vec::new();
+        if serve.backends.is_empty() {
+            reasons.push("`backends` must name at least one backend to serve".to_string());
+        }
+        for backend in &serve.backends {
+            if !self.backends.contains_key(backend) {
+                reasons.push(format!("`backends` names unknown backend `{backend}`"));
+            }
+        }
+        let mut servers = self
+            .servers
+            .iter()
+            .filter(|(_, server)| server.listen == serve.listen)
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        servers.sort();
+        for server in servers {
+            reasons.push(format!(
+                "`listen` is {}, which server `{server}` listens on too",
+                serve.listen
+            ));
+        }
+        if self
+            .cluster
+            .as_ref()
+            .is_some_and(|cluster| cluster.listen == serve.listen)
+        {
+            reasons.push(format!(
+                "`listen` is {}, which the cluster listens on too",
+                serve.listen
+            ));
+        }
+        reasons.extend(tls_file_reasons([
+            ("ca", &serve.tls.ca),
+            ("cert", &serve.tls.cert),
+            ("key", &serve.tls.key),
+        ]));
+        if !is_dns_name(&serve.tls.client_name) {
+            reasons.push(format!(
+                "`tls.client_name` is `{}`, which isn't a DNS name",
+                serve.tls.client_name
+            ));
+        }
+        reasons
+            .into_iter()
+            .map(|reason| ValidationError::InvalidServeBackends { reason })
             .collect()
     }
 }

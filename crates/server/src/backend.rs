@@ -1,3 +1,5 @@
+mod hylla;
+
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Context;
@@ -10,7 +12,7 @@ pub type Stores = HashMap<String, Arc<dyn ObjectStore>>;
 // r[impl backend.s3]
 /// Creates an object store for every configured backend.
 ///
-/// S3 and Azure Blob Storage backends are supported.
+/// S3, Azure Blob Storage and other hylla nodes' backends are supported.
 pub fn stores(config: &Config) -> anyhow::Result<Stores> {
     config
         .backends
@@ -67,6 +69,9 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
             }
             Ok(Arc::new(builder.build()?))
         }
+        Backend::Hylla {
+            url, backend, tls, ..
+        } => Ok(Arc::new(hylla::HyllaStore::new(url, backend, tls)?)),
     }
 }
 
@@ -84,6 +89,7 @@ mod tests {
             auth: HashMap::new(),
             telemetry: Default::default(),
             cluster: None,
+            serve_backends: None,
         }
     }
 

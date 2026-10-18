@@ -16,6 +16,8 @@ mod range;
 mod refresh;
 mod spans;
 pub mod telemetry;
+mod tls;
+mod upstream;
 
 pub use app::App;
 pub use cache::ChunkKey;
@@ -49,6 +51,7 @@ pub async fn serve(
         }));
     }
     let mut background = app.start_cluster().await?;
+    background.extend(app.start_upstream().await?);
     background.extend(app.spawn_refresh());
     shutdown.await;
     for task in &background {

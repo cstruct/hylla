@@ -105,8 +105,17 @@ r[config.backends]
 Backends MUST be configured as a map from backend names to backends.
 
 r[config.backends.types]
-A backend MUST be one of `s3` or `azure_blob`, selected by its `type` field, with
+A backend MUST be one of `s3`, `azure_blob` or `hylla`, selected by its `type` field, with
 the fields of that type.
+
+r[config.backends.hylla]
+A `hylla` backend MUST configure the `url` of another hylla node serving backends, the name
+of the `backend` on that node, and `tls` with the PEM files of the `ca` its certificate
+must be issued by and of this node's `cert` and `key`.
+
+r[config.validate.hylla-backends]
+A `hylla` backend whose `url` isn't an `https://` URL with a host, with an empty `backend`,
+or with an empty TLS file MUST be reported as invalid.
 
 r[config.refresh]
 A backend MAY have a `refresh` section with `rules` and a `concurrency`, defaulting to 4,
@@ -190,6 +199,19 @@ a token's claim and `$$` is a literal `$`, such as `/tenant/${sub}`.
 r[config.validate.auth]
 A mapping's auth naming a verifier that isn't configured, or with a path template that
 doesn't parse, MUST be reported as invalid.
+
+## Serving backends
+
+r[config.serve-backends]
+An optional `serve_backends` section MUST configure serving backends to other hylla nodes:
+the `listen` address, the names of the `backends` served, and `tls` with the PEM files of
+the `ca` other nodes' certificates must be issued by and of this node's `cert` and `key`,
+and the `client_name` other nodes' certificates must be issued for.
+
+r[config.validate.serve-backends]
+`serve_backends` without backends, naming a backend that isn't configured, listening on the
+address of a server or the cluster, with an empty TLS file, or with a `client_name` that
+isn't a DNS name MUST be reported as invalid.
 
 ## Cluster
 

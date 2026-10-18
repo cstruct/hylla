@@ -211,6 +211,7 @@ async fn metrics_are_exported_over_otlp() {
         auth: HashMap::new(),
         telemetry: Default::default(),
         // A cluster that isn't started, of only this node.
+        serve_backends: None,
         cluster: Some(Cluster {
             listen: "127.0.0.1:7946".parse().unwrap(),
             advertise: None,

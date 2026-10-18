@@ -28,6 +28,7 @@ use crate::{
     metrics::{self, METRICS},
     range::{self, RequestedRange},
     refresh, spans, telemetry,
+    upstream::{self, Upstream},
 };
 
 /// The shared state of all listeners.
@@ -36,6 +37,8 @@ pub struct App {
     pub(crate) stores: Stores,
     /// The cluster this node shares with, if any.
     pub(crate) cluster: Option<Arc<Cluster>>,
+    /// The backends this node serves to other nodes, if any.
+    pub(crate) upstream: Option<Upstream>,
     /// The cache's events, until the cluster starts sharing them.
     cluster_events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<CacheEvent>>>,
     /// Observable instruments, kept alive while the app is.
@@ -115,6 +118,11 @@ impl App {
             }
             None => (None, None),
         };
+        let upstream = config
+            .serve_backends
+            .as_ref()
+            .map(Upstream::new)
+            .transpose()?;
         let mut gauges = Vec::new();
         if let Some(cluster) = &cluster {
             let cluster = Arc::downgrade(cluster);
@@ -135,6 +143,7 @@ impl App {
             stores,
             _gauges: gauges,
             cluster,
+            upstream,
             cluster_events: std::sync::Mutex::new(cluster_events),
             refresh,
             listeners,
@@ -228,6 +237,16 @@ impl App {
             .take()
             .context("the cluster was already started")?;
         cluster::start(self, cluster, events).await
+    }
+
+    /// Starts serving backends to other nodes, if configured.
+    pub async fn start_upstream(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+        match &self.upstream {
+            Some(serving) => Ok(vec![upstream::start(self, serving).await?]),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The addresses of the live nodes of the cluster, this one included, or none without a
@@ -443,7 +462,7 @@ fn mark_private(mut response: Response, private: bool) -> Response {
     response
 }
 
-async fn serve_object(
+pub(crate) async fn serve_object(
     app: &Arc<App>,
     backend: &str,
     store: &Arc<dyn object_store::ObjectStore>,
@@ -466,6 +485,19 @@ async fn serve_object(
         }
     };
     let mut headers = object_headers(&meta);
+
+    // r[impl server.if-match]
+    if let Some(if_match) = request_headers.get(header::IF_MATCH) {
+        let matches = if_match.to_str().is_ok_and(|value| {
+            value.split(',').any(|tag| {
+                let tag = tag.trim();
+                tag == "*" || meta.etag.as_deref() == Some(tag)
+            })
+        });
+        if !matches {
+            return (StatusCode::PRECONDITION_FAILED, headers).into_response();
+        }
+    }
 
     // r[impl server.conditional]
     if let (Some(etag), Some(if_none_match)) =

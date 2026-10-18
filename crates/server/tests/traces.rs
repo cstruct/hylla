@@ -154,6 +154,7 @@ fn config(cluster: Option<Cluster>) -> Config {
         },
         auth: HashMap::new(),
         telemetry: Default::default(),
+        serve_backends: None,
         cluster,
     }
 }

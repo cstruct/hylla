@@ -13,6 +13,9 @@ hylla MUST support Amazon S3 compatible object storage as a backend.
 r[backend.azure-blob]
 hylla MUST support Azure Blob Storage as a backend.
 
+r[backend.hylla]
+hylla MUST support another hylla node serving backends as a backend, read only.
+
 ## Cache
 
 r[cache.ram]

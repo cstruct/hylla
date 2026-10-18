@@ -1,19 +1,18 @@
-//! Mutual TLS between nodes.
+//! Mutual TLS between hylla nodes: between the nodes of a cluster, and between nodes and
+//! the nodes they use as backends.
 //!
-//! Every node presents its certificate and requires one from its peers, issued by the
-//! cluster CA for the cluster's server name, both when it connects and when it's connected
-//! to. Nodes reach each other by address, which changes as they come and go, so their
-//! certificates are checked for the server name instead of the address.
+//! Both sides present a certificate and require one from the other, issued by a CA they
+//! trust for an expected name. Certificates are read again when their files change, so they
+//! can be rotated without a restart.
 
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, bail};
-use hylla_config::ClusterTls;
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, RootCertStore,
     ServerConfig, SignatureScheme,
@@ -30,73 +29,146 @@ use rustls::{
     sign::CertifiedKey,
 };
 
-/// The TLS configurations of a node's cluster listener and client.
-pub struct Tls {
-    pub server: Arc<ServerConfig>,
-    pub client: ClientConfig,
+/// The PEM files of a node's certificate and key, and of the CA it trusts.
+pub struct Files<'a> {
+    pub ca: &'a str,
+    pub cert: &'a str,
+    pub key: &'a str,
 }
 
-// r[impl cluster.tls]
-impl Tls {
-    pub fn new(config: &ClusterTls) -> anyhow::Result<Self> {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let roots = Arc::new(roots(Path::new(&config.ca))?);
-        let server_name = ServerName::try_from(config.server_name.clone())
-            .with_context(|| format!("`{}` isn't a valid server name", config.server_name))?;
-        let credentials = Arc::new(Credentials::load(
-            config.cert.as_ref(),
-            config.key.as_ref(),
-            provider.clone(),
-        )?);
+fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
 
-        let client_verifier = NodeVerifier {
-            inner: WebPkiClientVerifier::builder_with_provider(roots.clone(), provider.clone())
-                .build()
-                .context("creating the verifier of nodes' certificates")?,
-            server_name: server_name.clone(),
-        };
-        let mut server = ServerConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()?
-            .with_client_cert_verifier(Arc::new(client_verifier))
-            .with_cert_resolver(credentials.clone());
-        server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+fn dns_name(name: &str) -> anyhow::Result<ServerName<'static>> {
+    ServerName::try_from(name.to_string()).with_context(|| format!("`{name}` isn't a valid name"))
+}
 
-        let server_verifier = PeerVerifier {
-            inner: WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
-                .build()
-                .context("creating the verifier of nodes' certificates")?,
-            server_name,
+/// The TLS configuration of a listener presenting `files`' certificate and requiring
+/// clients' certificates issued by its CA for `client_name`.
+pub fn server_config(files: &Files<'_>, client_name: &str) -> anyhow::Result<Arc<ServerConfig>> {
+    let provider = provider();
+    let roots = Arc::new(roots(Path::new(files.ca))?);
+    let credentials = Arc::new(Credentials::load(
+        files.cert.as_ref(),
+        files.key.as_ref(),
+        provider.clone(),
+    )?);
+    let client_verifier = NameVerifier {
+        inner: WebPkiClientVerifier::builder_with_provider(roots, provider.clone())
+            .build()
+            .context("creating the verifier of client certificates")?,
+        name: dns_name(client_name)?,
+    };
+    let mut server = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_client_cert_verifier(Arc::new(client_verifier))
+        .with_cert_resolver(credentials);
+    server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(server))
+}
+
+/// The TLS configuration of a client presenting `files`' certificate and requiring servers'
+/// certificates issued by its CA: for `server_name` whatever address the server was reached
+/// at, or without it, for the host connected to, as HTTPS clients do.
+pub fn client_config(files: &Files<'_>, server_name: Option<&str>) -> anyhow::Result<ClientConfig> {
+    let provider = provider();
+    let roots = Arc::new(roots(Path::new(files.ca))?);
+    let credentials = Arc::new(Credentials::load(
+        files.cert.as_ref(),
+        files.key.as_ref(),
+        provider.clone(),
+    )?);
+    let builder = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?;
+    let config = match server_name {
+        Some(server_name) => {
+            let verifier = PeerVerifier {
+                inner: WebPkiServerVerifier::builder_with_provider(roots, provider)
+                    .build()
+                    .context("creating the verifier of server certificates")?,
+                server_name: dns_name(server_name)?,
+            };
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_client_cert_resolver(credentials)
+        }
+        None => builder
+            .with_root_certificates(roots)
+            .with_client_cert_resolver(credentials),
+    };
+    Ok(config)
+}
+
+/// Serves `router` on `listener` over TLS, requiring clients' certificates as `tls` does.
+/// `what` names the listener in logs, such as `cluster`.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    tls: Arc<ServerConfig>,
+    what: &'static str,
+) {
+    use hyper_util::{
+        rt::{TokioExecutor, TokioIo},
+        server::conn::auto,
+        service::TowerToHyperService,
+    };
+
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                // Such as running out of file descriptors: wait for some to free up.
+                tracing::warn!("accepting a {what} connection failed: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
         };
-        let client = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(server_verifier))
-            .with_client_cert_resolver(credentials);
-        Ok(Self {
-            server: Arc::new(server),
-            client,
-        })
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            let handshake = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream));
+            let stream = match handshake.await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    tracing::warn!(%peer, "refused a {what} connection: {error}");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(%peer, "refused a {what} connection: the handshake timed out");
+                    return;
+                }
+            };
+            let served = auto::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router))
+                .await;
+            if let Err(error) = served {
+                tracing::debug!(%peer, "{what} connection failed: {error}");
+            }
+        });
     }
 }
 
 fn roots(path: &Path) -> anyhow::Result<RootCertStore> {
     let mut roots = RootCertStore::empty();
     let certs = CertificateDer::pem_file_iter(path)
-        .with_context(|| format!("reading the cluster CA `{}`", path.display()))?;
+        .with_context(|| format!("reading the CA `{}`", path.display()))?;
     for cert in certs {
-        let cert = cert.with_context(|| format!("reading the cluster CA `{}`", path.display()))?;
+        let cert = cert.with_context(|| format!("reading the CA `{}`", path.display()))?;
         roots
             .add(cert)
-            .with_context(|| format!("adding the cluster CA `{}`", path.display()))?;
+            .with_context(|| format!("adding the CA `{}`", path.display()))?;
     }
     if roots.is_empty() {
-        bail!("the cluster CA `{}` has no certificates", path.display());
+        bail!("the CA `{}` has no certificates", path.display());
     }
     Ok(roots)
 }
 
-/// Checks a node's certificate for the cluster's server name, whatever address it was
-/// reached at, and otherwise as WebPKI does.
+/// Checks a server's certificate for a fixed name, whatever address it was reached at, as
+/// nodes of a cluster are, and otherwise as WebPKI does.
 #[derive(Debug)]
 struct PeerVerifier {
     inner: Arc<WebPkiServerVerifier>,
@@ -144,16 +216,15 @@ impl ServerCertVerifier for PeerVerifier {
     }
 }
 
-/// Checks the certificate of a node connecting for the cluster's server name too, which
-/// WebPKI's client verification doesn't, so certificates the CA issued for anything else
-/// aren't nodes.
+/// Checks a client's certificate for a name too, which WebPKI's client verification
+/// doesn't, so certificates the CA issued for anything else are refused.
 #[derive(Debug)]
-struct NodeVerifier {
+struct NameVerifier {
     inner: Arc<dyn ClientCertVerifier>,
-    server_name: ServerName<'static>,
+    name: ServerName<'static>,
 }
 
-impl ClientCertVerifier for NodeVerifier {
+impl ClientCertVerifier for NameVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
         self.inner.root_hint_subjects()
     }
@@ -168,7 +239,7 @@ impl ClientCertVerifier for NodeVerifier {
             .inner
             .verify_client_cert(end_entity, intermediates, now)?;
         webpki::EndEntityCert::try_from(end_entity)
-            .and_then(|cert| cert.verify_is_valid_for_subject_name(&self.server_name))
+            .and_then(|cert| cert.verify_is_valid_for_subject_name(&self.name))
             .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::NotValidForName))?;
         Ok(verified)
     }
@@ -197,8 +268,8 @@ impl ClientCertVerifier for NodeVerifier {
 }
 
 // r[impl cluster.tls.rotate]
-/// This node's certificate and key, presented to nodes it connects to and that connect to
-/// it, read again for new connections when their files change.
+/// A node's certificate and key, presented to what it connects to and what connects to it,
+/// read again for new connections when their files change.
 #[derive(Debug)]
 struct Credentials {
     cert: PathBuf,
@@ -238,7 +309,7 @@ impl Credentials {
         if modified != current.modified {
             match read(&self.cert, &self.key, &self.provider) {
                 Ok(key) => {
-                    tracing::info!(cert = %self.cert.display(), "cluster certificate reloaded");
+                    tracing::info!(cert = %self.cert.display(), "certificate reloaded");
                     *current = Current {
                         key: Arc::new(key),
                         modified,
@@ -246,7 +317,7 @@ impl Credentials {
                 }
                 Err(error) => tracing::warn!(
                     cert = %self.cert.display(),
-                    "reloading the cluster certificate failed, keeping the one in use: {error:#}"
+                    "reloading the certificate failed, keeping the one in use: {error:#}"
                 ),
             }
         }
@@ -282,18 +353,15 @@ fn modified(path: &Path) -> Option<SystemTime> {
 fn read(cert: &Path, key: &Path, provider: &CryptoProvider) -> anyhow::Result<CertifiedKey> {
     let chain = CertificateDer::pem_file_iter(cert)
         .and_then(Iterator::collect::<Result<Vec<_>, _>>)
-        .with_context(|| format!("reading the cluster certificate `{}`", cert.display()))?;
+        .with_context(|| format!("reading the certificate `{}`", cert.display()))?;
     if chain.is_empty() {
-        bail!(
-            "the cluster certificate `{}` has no certificates",
-            cert.display()
-        );
+        bail!("the certificate `{}` has no certificates", cert.display());
     }
     let private_key = PrivateKeyDer::from_pem_file(key)
-        .with_context(|| format!("reading the cluster key `{}`", key.display()))?;
+        .with_context(|| format!("reading the key `{}`", key.display()))?;
     CertifiedKey::from_der(chain, private_key, provider).with_context(|| {
         format!(
-            "the cluster key `{}` doesn't match the certificate `{}`",
+            "the key `{}` doesn't match the certificate `{}`",
             key.display(),
             cert.display()
         )

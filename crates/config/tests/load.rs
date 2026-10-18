@@ -1287,3 +1287,125 @@ fn cluster_tls_is_configured_with_files_and_a_server_name() {
         assert_eq!(errors, expected, "server name `{server_name}`");
     }
 }
+
+const HYLLA_BACKEND: &str = "
+servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend shield})}}
+backends {
+  shield {
+    type hylla
+    url https://shield.internal:7947
+    backend assets
+    tls {
+      ca /etc/hylla/tls/ca.crt
+      cert /etc/hylla/tls/tls.crt
+      key /etc/hylla/tls/tls.key
+    }
+  }
+}
+";
+
+// r[verify config.backends.hylla]
+// r[verify config.backends.types]
+// r[verify config.validate.hylla-backends]
+#[test]
+fn hylla_backends_read_another_node_over_tls() {
+    let files = Files::new("hylla-backend", HYLLA_BACKEND, "");
+    let config = files.load(&[]).unwrap().into_config();
+    assert_eq!(
+        config.backends["shield"],
+        Backend::Hylla {
+            url: "https://shield.internal:7947".into(),
+            backend: "assets".into(),
+            tls: hylla_config::HyllaTls {
+                ca: "/etc/hylla/tls/ca.crt".into(),
+                cert: "/etc/hylla/tls/tls.crt".into(),
+                key: "/etc/hylla/tls/tls.key".into(),
+            },
+            refresh: None,
+        }
+    );
+
+    let invalid = HYLLA_BACKEND
+        .replace(
+            "url https://shield.internal:7947",
+            "url http://shield.internal:7947",
+        )
+        .replace("backend assets", "backend \"\"")
+        .replace("ca /etc/hylla/tls/ca.crt", "ca \"\"");
+    let files = Files::new("hylla-backend-invalid", &invalid, "");
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            "backend `shield` is invalid: `url` is `http://shield.internal:7947`, which isn't an \
+             `https://` URL with a host",
+            "backend `shield` is invalid: `backend` must name a backend of the other node",
+            "backend `shield` is invalid: `tls.ca` must be a file",
+        ]
+    );
+}
+
+// r[verify config.serve-backends]
+// r[verify config.validate.serve-backends]
+#[test]
+fn backends_are_served_to_other_nodes_over_tls() {
+    let serve = "serve_backends {
+  listen 0.0.0.0:7947
+  backends (assets)
+  tls {
+    ca /etc/hylla/tls/ca.crt
+    cert /etc/hylla/tls/tls.crt
+    key /etc/hylla/tls/tls.key
+    client_name hylla.downstream
+  }
+}
+";
+    let files = Files::new(
+        "serve-backends",
+        &format!("{MINIMAL}{serve}"),
+        MINIMAL_SECRETS,
+    );
+    let config = files.load(&[]).unwrap().into_config();
+    assert_eq!(
+        config.serve_backends,
+        Some(hylla_config::ServeBackends {
+            listen: "0.0.0.0:7947".parse().unwrap(),
+            backends: vec!["assets".into()],
+            tls: hylla_config::ServeTls {
+                ca: "/etc/hylla/tls/ca.crt".into(),
+                cert: "/etc/hylla/tls/tls.crt".into(),
+                key: "/etc/hylla/tls/tls.key".into(),
+                client_name: "hylla.downstream".into(),
+            },
+        })
+    );
+
+    let invalid = serve
+        .replace("listen 0.0.0.0:7947", "listen 0.0.0.0:8080")
+        .replace("backends (assets)", "backends (assets nope)")
+        .replace("key /etc/hylla/tls/tls.key", "key \"\"")
+        .replace("client_name hylla.downstream", "client_name 10.0.0.1");
+    let files = Files::new(
+        "serve-backends-invalid",
+        &format!("{MINIMAL}{invalid}"),
+        MINIMAL_SECRETS,
+    );
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            "invalid serve_backends config: `backends` names unknown backend `nope`",
+            "invalid serve_backends config: `listen` is 0.0.0.0:8080, which server `public` \
+             listens on too",
+            "invalid serve_backends config: `tls.key` must be a file",
+            "invalid serve_backends config: `tls.client_name` is `10.0.0.1`, which isn't a DNS \
+             name",
+        ]
+    );
+}

@@ -7,8 +7,8 @@
 
 # hylla
 
-A caching layer in front of object storage (S3 and Azure Blob Storage), with a
-hybrid RAM and disk cache. Configured with [ordna](https://github.com/cstruct/ordna).
+A caching layer in front of object storage (S3, Azure Blob Storage, or another hylla),
+with a hybrid RAM and disk cache. Configured with [ordna](https://github.com/cstruct/ordna).
 
 > **Note on LLM use:** large parts of this project were written with an LLM, under human
 > direction. The design and review are human.
@@ -246,6 +246,46 @@ addresses. Use a CA for the cluster only. The certificate and key are read again
 files change, so tools like cert-manager can rotate them without a restart; the CA is read
 at startup. All nodes need `tls` on or off together, since a node with TLS doesn't talk to
 one without.
+
+A node can also serve its backends to other hylla nodes, which use it as a `hylla` backend.
+It answers them through its cache, so it fetches each object from its own backend once for
+all of them, as an origin shield. They read from it as from object storage, without sharing
+their caches with it. This is always over mutual TLS:
+
+```styx
+// The shield, serving its `assets` backend.
+serve_backends {
+  listen 0.0.0.0:7947
+  backends (assets)
+  tls {
+    ca /etc/hylla/tls/ca.crt
+    cert /etc/hylla/tls/tls.crt  // issued for shield.internal
+    key /etc/hylla/tls/tls.key
+    client_name hylla.downstream
+  }
+}
+```
+
+```styx
+// A node using it.
+backends {
+  assets {
+    type hylla
+    url https://shield.internal:7947
+    backend assets
+    tls {
+      ca /etc/hylla/tls/ca.crt
+      cert /etc/hylla/tls/tls.crt  // issued for hylla.downstream
+      key /etc/hylla/tls/tls.key
+    }
+  }
+}
+```
+
+The serving node's certificate must be issued for the host in the URL, and the other nodes'
+certificates for its `client_name`, by the CA each side trusts. Only the listed backends are
+served; others are refused. Refresh rules on the other nodes list through it. Certificates
+are read again when they change, as for a cluster.
 
 ### Docker
 

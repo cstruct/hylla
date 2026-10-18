@@ -1,18 +1,9 @@
 mod common;
 
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::body::{Body, to_bytes};
-use common::Flaky;
+use common::{Flaky, Pki};
 use http::{Request, StatusCode, header};
 use hylla_config::{
     Backend, Cache, Cluster, ClusterShare, ClusterTls, Config, Interval, Mapping, Refresh,
@@ -115,6 +106,7 @@ async fn node_with_tls(
         },
         auth: HashMap::new(),
         telemetry: Default::default(),
+        serve_backends: None,
         cluster: Some(Cluster {
             listen: addr,
             advertise: None,
@@ -335,64 +327,14 @@ async fn nodes_joining_later_catch_up_on_the_next_preload() {
 /// The name the nodes' certificates are issued for.
 const SERVER_NAME: &str = "hylla.cluster";
 
-/// A CA for a cluster, issuing node certificates into a directory of its own.
-struct Pki {
-    dir: PathBuf,
-    ca: PathBuf,
-    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
-    issued: AtomicUsize,
-}
-
-impl Pki {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("hylla-pki-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, format!("{name} CA"));
-        let key = rcgen::KeyPair::generate().unwrap();
-        let ca = dir.join("ca.crt");
-        std::fs::write(&ca, params.self_signed(&key).unwrap().pem()).unwrap();
-        Self {
-            dir,
-            ca,
-            issuer: rcgen::Issuer::new(params, key),
-            issued: AtomicUsize::new(0),
-        }
-    }
-
-    /// TLS settings for a node, with a certificate issued for `name`, for both serving and
-    /// connecting.
-    fn node(&self, name: &str) -> ClusterTls {
-        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
-        params.extended_key_usages = vec![
-            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
-            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
-        ];
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, &self.issuer).unwrap();
-        let issued = self.issued.fetch_add(1, Ordering::Relaxed);
-        let (cert_path, key_path) = (
-            self.dir.join(format!("node-{issued}.crt")),
-            self.dir.join(format!("node-{issued}.key")),
-        );
-        std::fs::write(&cert_path, cert.pem()).unwrap();
-        std::fs::write(&key_path, key.serialize_pem()).unwrap();
-        ClusterTls {
-            ca: self.ca.display().to_string(),
-            cert: cert_path.display().to_string(),
-            key: key_path.display().to_string(),
-            server_name: SERVER_NAME.into(),
-        }
-    }
-}
-
-impl Drop for Pki {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+/// TLS settings for a node of a cluster with `pki`'s CA, with a certificate for `name`.
+fn cluster_tls(pki: &Pki, name: &str) -> ClusterTls {
+    let issued = pki.issue(name);
+    ClusterTls {
+        ca: pki.ca(),
+        cert: issued.cert,
+        key: issued.key,
+        server_name: SERVER_NAME.into(),
     }
 }
 
@@ -402,12 +344,18 @@ impl Drop for Pki {
 async fn nodes_share_over_mutual_tls() {
     let memory = backend().await;
     let pki = Pki::new("share");
-    let a = node_with_tls(&memory, Vec::new(), KEY, Some(pki.node(SERVER_NAME))).await;
+    let a = node_with_tls(
+        &memory,
+        Vec::new(),
+        KEY,
+        Some(cluster_tls(&pki, SERVER_NAME)),
+    )
+    .await;
     let b = node_with_tls(
         &memory,
         vec![a.addr.to_string()],
         KEY,
-        Some(pki.node(SERVER_NAME)),
+        Some(cluster_tls(&pki, SERVER_NAME)),
     )
     .await;
     for node in [&a, &b] {
@@ -444,18 +392,30 @@ async fn nodes_without_a_certificate_for_the_cluster_are_refused() {
     let memory = backend().await;
     let pki = Pki::new("refuse");
     let other = Pki::new("refuse-other");
-    let a = node_with_tls(&memory, Vec::new(), KEY, Some(pki.node(SERVER_NAME))).await;
+    let a = node_with_tls(
+        &memory,
+        Vec::new(),
+        KEY,
+        Some(cluster_tls(&pki, SERVER_NAME)),
+    )
+    .await;
     let seeds = vec![a.addr.to_string()];
     let intruders = [
         // Issued by another CA.
-        node_with_tls(&memory, seeds.clone(), KEY, Some(other.node(SERVER_NAME))).await,
+        node_with_tls(
+            &memory,
+            seeds.clone(),
+            KEY,
+            Some(cluster_tls(&other, SERVER_NAME)),
+        )
+        .await,
         // Issued by the cluster CA, but for something else: refused connecting, and refused
         // when connected to.
         node_with_tls(
             &memory,
             seeds.clone(),
             KEY,
-            Some(pki.node("cache.example.com")),
+            Some(cluster_tls(&pki, "cache.example.com")),
         )
         .await,
         // Without TLS.

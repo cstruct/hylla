@@ -251,6 +251,29 @@ config_tree! {
                 pub preload: bool,
             },
         }>,
+        // r[impl config.serve-backends]
+        /// Serving backends to other hylla nodes, which use them as `hylla` backends, over
+        /// mutual TLS. Optional.
+        pub serve_backends: Option<pub struct ServeBackends {
+            /// The address of the listener, such as `0.0.0.0:7947`.
+            pub listen: SocketAddr,
+            /// The names of the backends served. Requests for others are refused.
+            pub backends: Vec<String>,
+            /// The listener's certificate, and what other nodes' certificates must be.
+            pub tls: pub struct ServeTls {
+                /// The PEM file of the CA certificates other nodes' certificates must be
+                /// issued by. Read at startup.
+                pub ca: String,
+                /// The PEM file of this node's certificate chain, issued for the host other
+                /// nodes reach it at. Read again when it changes.
+                pub cert: String,
+                /// The PEM file of this node's private key, read again when it changes.
+                pub key: String,
+                /// The DNS name other nodes' certificates must be issued for, such as
+                /// `hylla.downstream`, so not every certificate the CA issued is a client.
+                pub client_name: String,
+            },
+        }>,
         // r[impl config.auth.verifiers]
         /// JWT verifiers by name, used by mappings' `auth`.
         #[facet(default)]
@@ -437,6 +460,34 @@ pub enum Backend {
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
+    // r[impl config.backends.hylla]
+    /// Another hylla node serving one of its backends with `serve_backends`, over mutual
+    /// TLS. Objects come through that node's cache, so it fetches them from its backend once
+    /// for every node using it.
+    Hylla {
+        /// The node's base URL, such as `https://shield.internal:7947`. Its certificate must
+        /// be issued for the URL's host.
+        url: String,
+        /// The name of the backend on that node.
+        backend: String,
+        tls: HyllaTls,
+        /// Background refresh of cached objects.
+        refresh: Option<Refresh>,
+    },
+}
+
+/// Mutual TLS with a `hylla` backend.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct HyllaTls {
+    /// The PEM file of the CA certificates the node's certificate must be issued by. Read at
+    /// startup.
+    pub ca: String,
+    /// The PEM file of this node's certificate chain, presented to the other node, issued for
+    /// its `client_name`. Read again when it changes.
+    pub cert: String,
+    /// The PEM file of this node's private key, read again when it changes.
+    pub key: String,
 }
 
 /// Checks JWTs: their signature against a public key, and their `exp` and `nbf` claims, and
@@ -548,7 +599,9 @@ impl Backend {
     /// The backend's background refresh, if any.
     pub fn refresh(&self) -> Option<&Refresh> {
         match self {
-            Backend::S3 { refresh, .. } | Backend::AzureBlob { refresh, .. } => refresh.as_ref(),
+            Backend::S3 { refresh, .. }
+            | Backend::AzureBlob { refresh, .. }
+            | Backend::Hylla { refresh, .. } => refresh.as_ref(),
         }
     }
 }

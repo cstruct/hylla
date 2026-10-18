@@ -8,7 +8,6 @@
 //! and, with TLS configured, sent over mutual TLS.
 
 mod sign;
-mod tls;
 
 use std::{
     collections::HashMap,
@@ -123,9 +122,20 @@ impl Cluster {
             .as_millis();
         let client = reqwest::Client::builder().connect_timeout(config.failure_timeout.duration());
         let (client, tls) = match &config.tls {
+            // r[impl cluster.tls]
             Some(tls) => {
-                let tls = tls::Tls::new(tls).context("setting up cluster TLS")?;
-                (client.use_preconfigured_tls(tls.client), Some(tls.server))
+                let files = crate::tls::Files {
+                    ca: &tls.ca,
+                    cert: &tls.cert,
+                    key: &tls.key,
+                };
+                let server = crate::tls::server_config(&files, &tls.server_name)
+                    .context("setting up cluster TLS")?;
+                let client = client.use_preconfigured_tls(
+                    crate::tls::client_config(&files, Some(&tls.server_name))
+                        .context("setting up cluster TLS")?,
+                );
+                (client, Some(server))
             }
             None => (client, None),
         };
@@ -469,7 +479,7 @@ pub async fn start(
     let gossiping = cluster.clone();
     let broadcasting = cluster.clone();
     let serving = match &cluster.tls {
-        Some(tls) => tokio::spawn(serve_tls(listener, router, tls.clone())),
+        Some(tls) => tokio::spawn(crate::tls::serve(listener, router, tls.clone(), "cluster")),
         None => tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, router).await {
                 tracing::error!("cluster listener failed: {error}");
@@ -488,55 +498,6 @@ pub async fn start(
         }),
         tokio::spawn(async move { broadcasting.broadcast(events).await }),
     ])
-}
-
-// r[impl cluster.tls]
-/// Serves the cluster listener over TLS, requiring nodes' certificates.
-async fn serve_tls(
-    listener: tokio::net::TcpListener,
-    router: Router,
-    tls: Arc<rustls::ServerConfig>,
-) {
-    use hyper_util::{
-        rt::{TokioExecutor, TokioIo},
-        server::conn::auto,
-        service::TowerToHyperService,
-    };
-
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                // Such as running out of file descriptors: wait for some to free up.
-                tracing::warn!("accepting a cluster connection failed: {error}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        let acceptor = acceptor.clone();
-        let router = router.clone();
-        tokio::spawn(async move {
-            let handshake = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream));
-            let stream = match handshake.await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    tracing::warn!(%peer, "refused a cluster connection: {error}");
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!(%peer, "refused a cluster connection: the handshake timed out");
-                    return;
-                }
-            };
-            let served = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router))
-                .await;
-            if let Err(error) = served {
-                tracing::debug!(%peer, "cluster connection failed: {error}");
-            }
-        });
-    }
 }
 
 /// Verifies a request's signature, answering 401 when it's missing or invalid.

@@ -77,6 +77,7 @@ fn config_with_refresh(cache: Cache, refresh: Option<Refresh>) -> Config {
         cache,
         auth: HashMap::new(),
         telemetry: Default::default(),
+        serve_backends: None,
         cluster: None,
     }
 }
