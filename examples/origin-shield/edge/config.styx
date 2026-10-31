@@ -1,0 +1,29 @@
+// An edge: near its clients, reading the bucket through the shield.
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cdn.example.com)
+    mappings ({path_prefix /, backend assets})
+  }
+}
+backends {
+  assets {
+    type hylla
+    url https://shield.internal:7947
+    // The backend's name on the shield.
+    backend assets
+    tls {
+      ca /etc/hylla/tls/ca.crt
+      // Issued for the shield's client_name: hylla.edge.
+      cert /etc/hylla/tls/tls.crt
+      key /etc/hylla/tls/tls.key
+    }
+    // Listed through the shield.
+    refresh {
+      rules ({prefix "", every 10m, mode revalidate})
+    }
+  }
+}
+cache {
+  memory {capacity_mib 1024}
+}

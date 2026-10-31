@@ -7,399 +7,146 @@
 
 # hylla
 
-A caching layer in front of object storage (S3, Azure Blob Storage, or another hylla),
-with a hybrid RAM and disk cache. Configured with [ordna](https://github.com/cstruct/ordna).
+A caching HTTP server in front of object storage: S3 and S3 compatible stores, Azure Blob
+Storage, or another hylla. Put it between your clients and a bucket to serve objects fast,
+fetch each one from the bucket rarely, and keep serving while the bucket is down.
+
+- **A hybrid cache** in memory and on disk, where it survives restarts, of objects in
+  chunks, so range requests read only what they need.
+- **Fresh by design**: objects are cached by ETag, so a changed object is never served
+  stale. Refresh rules check and preload objects in the background, so requests rarely wait
+  on the bucket.
+- **Routing** by host and path prefix, with regex rewrites from paths to bucket keys.
+- **JWT auth** per mapping, optionally limiting each token to keys built from its claims.
+- **Clusters** that share their work, so the bucket serves each object once per cluster,
+  and **origin shields** for nodes far from the bucket.
+- **A control plane** to see how backends are doing and change objects, with sign-in through
+  an OpenID provider.
+- **Metrics, traces and logs** over OTLP.
 
 > **Note on LLM use:** large parts of this project were written with an LLM, under human
 > direction. The design and review are human.
 
-## Configuration
+## How it works
 
-Configuration is written in [Styx](https://github.com/bearcove/styx). Servers accept
-requests and route them to backends by path prefix; the first matching mapping wins.
-Backend credentials are secret and go in a separate secrets file.
+```text
+client ──GET /assets/app.css, Host: cdn.example.com──▶ hylla
+                                                         │
+             server: the one whose server_names contain the Host
+             mapping: the first whose path_prefix matches, rewriting the path to a key
+             backend: the mapping's bucket
+                                                         │
+             cache hit ◀── memory, then disk ──▶ miss: fetch the chunks from the bucket
+```
+
+hylla answers `GET` and `HEAD`, with single byte ranges, `If-None-Match` and `If-Match`. It
+trusts an object's size and ETag for `metadata_ttl` (30 seconds by default), and checks them
+with the backend after that. Its chunks are cached until they're evicted.
+
+## Quickstart
+
+This runs hylla in front of [VersityGW](https://github.com/versity/versitygw), an S3
+compatible gateway serving a local directory, so it needs no cloud account. It takes about
+five minutes.
+
+1. **Get hylla.** Download it from the
+   [releases](https://github.com/cstruct/hylla/releases) and put `hylla` on your `PATH`, or
+   build it from this repository:
+
+   ```bash
+   cargo install --locked --path crates/server
+   ```
+
+2. **Start a local S3** with a bucket named `assets`. Get `versitygw` from its
+   [releases](https://github.com/versity/versitygw/releases), then:
+
+   ```bash
+   mkdir -p s3/assets
+   versitygw --access hylla --secret hylla-secret --port 127.0.0.1:7070 posix ./s3
+   ```
+
+3. **Upload an object**, in another terminal. curl can sign S3 requests:
+
+   ```bash
+   echo 'body { color: teal }' > app.css
+   curl --aws-sigv4 "aws:amz:us-east-1:s3" --user hylla:hylla-secret \
+     -T app.css http://127.0.0.1:7070/assets/app.css
+   ```
+
+4. **Start hylla** with [examples/minimal](examples/minimal), which serves `localhost:8080`
+   from that bucket:
+
+   ```bash
+   hylla --config examples/minimal/config.styx --secrets examples/minimal/secrets.styx
+   ```
+
+5. **Request the object** through hylla:
+
+   ```bash
+   curl -i http://localhost:8080/app.css
+   ```
+
+   Stop VersityGW and request it again: hylla still serves it from its cache.
+
+The [minimal config](examples/minimal/config.styx) is all it takes:
 
 ```styx
-// config.styx
 servers {
-  public {
-    listen 0.0.0.0:8080
-    server_names (cache.example.com cdn.example.com)
-    mappings (
-      {
-        path_prefix /assets
-        backend assets
-        // Regex replacements, applied in order: /assets/app.css is /app.css on the backend.
-        rewrites ({pattern "^/assets/(.*)$", replace /$1})
-      }
-      {
-        path_prefix /tenant
-        backend assets
-        // Optional: require a JWT.
-        auth {
-          verifier partners
-          // Optional: backend prefixes with claims filled in.
-          paths ("/tenant/${sub}")
-          // Cache-Control: private (the default).
-          private true
-        }
-      }
-      {path_prefix /, backend assets}
-    )
-  }
-}
-// Optional: export over OTLP.
-telemetry {
-  service_name hylla
-  resource ({key deployment.environment, value production})
-  otlp {
-    // Or the OTEL_EXPORTER_OTLP_* environment variables.
-    endpoint http://collector:4318
-    protocol http_protobuf  // or grpc
-  }
-  metrics {
-    enabled true
-    endpoint http://prometheus:9090/api/v1/otlp/v1/metrics  // optional, per signal
-    interval 30s
-  }
-  traces {
-    enabled true
-    endpoint http://quickwit:7280/api/v1/otlp/v1/traces  // optional, per signal
-    sample_ratio 0.1  // callers' sampled traces are always continued
-    record_paths false  // paths can be sensitive
-  }
-  logs {
-    level info  // or RUST_LOG
-    format json  // or text; JSON lines carry trace and span IDs
-    export true  // over OTLP too
-    endpoint http://quickwit:7280/api/v1/otlp/v1/logs  // optional, per signal
-  }
-}
-// Optional: share with other hylla nodes.
-cluster {
-  listen 0.0.0.0:7946  // private network only: gossip and data between nodes
-  advertise 10.0.0.5:7946  // how the others reach this node
-  seeds (hylla-headless.cache.svc.cluster.local:7946)  // addresses or DNS names
-  share {
-    metadata true  // push revalidated metadata to the other nodes
-    preload true  // one node runs each refresh rule; the others pull from it
-  }
-}
-// JWT verifiers, by name.
-auth {
-  partners {
-    algorithm ES256  // RS256..512, PS256..512, ES256, ES384 or EdDSA
-    public_key "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...\n-----END PUBLIC KEY-----\n"
-    audience hylla  // optional; required in tokens when set (so is issuer)
-    leeway 30s  // clock skew allowed for exp and nbf
+  local {
+    listen 127.0.0.1:8080
+    server_names (localhost)
+    mappings ({path_prefix /, backend assets})
   }
 }
 backends {
   assets {
-    type s3  // s3 or azure_blob
+    type s3
     bucket assets
-    region eu-north-1
-    endpoint http://localhost:9000  // optional, for S3 compatible stores
-    timeouts {connect 5s, request 30s}  // optional, these are the defaults
-    // Optional background refresh of this backend's objects.
-    refresh {
-      concurrency 4  // objects refreshed at the same time
-      rules (
-        // Backend keys: directory-like prefixes ("" for everything), or a single key.
-        // Modes: disabled, revalidate (the default), preload or both.
-        {prefix css/, every 15m, mode revalidate}
-        // Preloading needs max_objects and/or max_mib.
-        {key index.html, every 10m, mode both, max_objects 1}
-      )
-    }
-  }
-}
-// Optional: health checks for load balancers, on a listener of their own. /healthz
-// answers 200 while hylla runs, /readyz while it serves (503 once it's shutting down).
-health {
-  listen 0.0.0.0:8081
-}
-// Optional, every setting has a default. Applies to every listener.
-http {
-  header_read_timeout 10s  // to send a request's headers
-  idle_timeout 60s  // closes connections that send and receive nothing; 0s disables
-  max_connections 10000  // per listener; more wait to be accepted
-  // On SIGTERM, how long requests in flight may take to finish. Keep it below the time
-  // hylla gets to stop, such as terminationGracePeriodSeconds, so the cache is written.
-  shutdown_timeout 20s
-}
-// Optional, every setting has a default.
-cache {
-  chunk_size_kib 1024  // objects are cached in chunks of this size
-  metadata_ttl 30s  // how long size, ETag and content type are cached
-  // Past the TTL, keep serving this long while revalidating in the background, so
-  // requests don't wait; 0s disables.
-  stale_while_revalidate 0s
-  // Keep serving cached objects this long past their TTL while the backend fails; 0s
-  // disables.
-  stale_if_error 1d
-  write_policy on_eviction  // or on_insertion: when chunks are written to disk
-  memory {
-    capacity_mib 256
-  }
-  // Optional; without it only memory is used.
-  disk {
-    path /var/cache/hylla
-    capacity_mib 10240
-    block_size_mib 16  // foyer disk blocks; a chunk must fit in one
+    region us-east-1
+    endpoint http://127.0.0.1:7070
   }
 }
 ```
 
-```styx
-// secrets.styx
-cluster {
-  key replace-with-a-long-random-string  // shared by the nodes, at least 32 characters
-}
-backends {
-  assets {
-    access_key_id AKIA...
-    secret_access_key ...
-  }
-}
-```
-
-Any public value can be overridden with environment variables, such as
-`HYLLA__SERVERS__PUBLIC__LISTEN=0.0.0.0:9090`. See [crates/config](crates/config).
-
-## Running
-
-Download a binary for Linux (x86_64 or aarch64, glibc 2.35 or later) or macOS (Apple
-silicon) from the [releases](https://github.com/cstruct/hylla/releases), checked against
-their `SHA256SUMS`, or build it:
-
-```bash
-cargo run --release -p hylla-server -- --config config.styx --secrets secrets.styx
-```
-
-Without `--config`, hylla reads `config.styx` from the working directory if there is one,
-and otherwise runs on environment variables and flags alone. A file given with `--config`
-must exist.
-
-A few settings can be overridden for a single run with flags, which win over the config
-file and `HYLLA__...` environment variables. `hylla --help` lists them:
-
-```bash
-hylla --config config.styx --log-level debug --log-format json --metrics
-```
-
-To see the config hylla would run with, and where each value comes from:
-
-```bash
-hylla config show --config config.styx --secrets secrets.styx
-```
+with the credentials in a [secrets file](examples/minimal/secrets.styx), which is the only
+place they can come from:
 
 ```styx
-cache {
-  chunk_size_kib 1024              // config.styx
-  metadata_ttl 1m                  // env HYLLA__CACHE__METADATA_TTL, overriding config.styx
-  stale_if_error 1day              // default
+backends {assets {access_key_id hylla, secret_access_key hylla-secret}}
 ```
 
-`hylla config explain cache.metadata_ttl` shows one field's sources, highest precedence
-first, or those of every field in a section such as `cache`. Secrets are redacted in both.
+Requests are matched to a server by their `Host` header, so `http://127.0.0.1:8080` answers
+`404 unknown host`: that host isn't in `server_names`. To see the config hylla would run
+with, and where each value comes from, run `hylla config show` with the same flags.
 
-A config that doesn't load is shown as far as it got, with the required fields no source
-set marked, and the command then fails with what's wrong. Without `--secrets`, that shows
-everything but the credentials:
+## Next steps
 
-```styx
-backends {
-  assets {
-    type s3                        // config.styx
-    bucket assets                  // config.styx
-    region eu-north-1              // config.styx
-    access_key_id "<missing>"      // missing: required, but not set
-    secret_access_key "<missing>"  // missing: required, but not set
-```
+[examples/](examples) has configs for common setups:
 
-Requests are matched to a server by their `Host` header:
+| Example | |
+|---|---|
+| [cdn](examples/cdn) | A website's assets: rewrites, refresh rules, a disk cache, stale content while S3 is down, health checks and metrics |
+| [jwt-tenants](examples/jwt-tenants) | Files per tenant behind JWTs |
+| [control-plane](examples/control-plane) | The web UI and JSON API, with sign-in through Konklav |
+| [cluster-kubernetes](examples/cluster-kubernetes) | Three nodes sharing their work in Kubernetes |
+| [origin-shield](examples/origin-shield) | Edge nodes reading a bucket through a shield next to it |
+| [reference](examples/reference) | Most settings in one annotated config |
 
-```bash
-curl -H "Host: cache.example.com" http://localhost:8080/assets/app.css
-```
+The [guides](docs/guide) explain hylla in depth:
 
-GET and HEAD are supported, including single byte ranges and `If-None-Match`. Mappings
-with `auth` require an `Authorization: Bearer` JWT signed with the verifier's key, current
-by its `exp` and `nbf`, and with `paths`, under a prefix built from its claims. Refresh rules
-revalidate cached objects, so changes are picked up without requests waiting on the
-backend, and preload objects before anyone asks for them. The cache is a
-[foyer](https://github.com/foyer-rs/foyer) hybrid cache: objects are stored in chunks keyed
-by their ETag, in memory and, when configured, on disk, where they survive restarts.
+- [Configuration](docs/guide/configuration.md): files, environment variables and flags, and
+  every setting.
+- [Running in production](docs/guide/production.md): Docker, sizing, freshness, health
+  checks and shutdown.
+- [Clustering](docs/guide/clustering.md): clusters, mutual TLS and origin shields.
+- [Control plane](docs/guide/control-plane.md): the UI, the JSON API and signing in.
+- [Observability](docs/guide/observability.md): metrics, traces and logs.
+- [Troubleshooting](docs/guide/troubleshooting.md): what common errors mean.
 
-With a `cluster`, nodes find each other by gossip through their seeds; a DNS name
-returning every node, such as a Kubernetes headless service, works as a seed. Each refresh
-rule runs on one node, metadata fetched from a backend is pushed to the other nodes, and the
-others pull what a node preloads directly from it, so the backend serves it once per cluster.
-Objects changed through the control plane are forgotten by every node. Everything between
-nodes, requests and answers both, is signed with the shared key, so all nodes must run a
-version that signs answers.
-
-Signatures carry a timestamp and are refused a minute off, so keep the nodes' clocks in sync,
-such as with NTP; hylla warns when it refuses a node for its clock. Which node runs a refresh
-rule is best-effort, not a lock: while nodes join, leave or can't reach each other, a rule
-can run on more than one node, or on none until the failure timeout passes. That only costs
-backend requests, since refreshing is safe to repeat.
-
-With `tls`, nodes also talk over mutual TLS, accepting only each other's certificates:
-
-```styx
-cluster {
-  listen 0.0.0.0:7946
-  advertise 10.0.0.5:7946
-  seeds (hylla-cluster.cache.svc.cluster.local:7946)
-  tls {
-    ca /etc/hylla/tls/ca.crt
-    cert /etc/hylla/tls/tls.crt
-    key /etc/hylla/tls/tls.key
-    server_name hylla.cluster
-  }
-}
-```
-
-Every node's certificate must be issued by the `ca` for `server_name` as a DNS name, with
-both the server and client auth usages, since a node is both. Nodes are reached by address,
-which changes as they come and go, so certificates are checked for `server_name`, not
-addresses. Use a CA for the cluster only. The certificate and key are read again when their
-files change, so tools like cert-manager can rotate them without a restart; the CA is read
-at startup. All nodes need `tls` on or off together, since a node with TLS doesn't talk to
-one without.
-
-A node can also serve its backends to other hylla nodes, which use it as a `hylla` backend.
-It answers them through its cache, so it fetches each object from its own backend once for
-all of them, as an origin shield. They read from it as from object storage, without sharing
-their caches with it. This is always over mutual TLS:
-
-```styx
-// The shield, serving its `assets` backend.
-serve_backends {
-  listen 0.0.0.0:7947
-  backends (assets)
-  tls {
-    ca /etc/hylla/tls/ca.crt
-    cert /etc/hylla/tls/tls.crt  // issued for shield.internal
-    key /etc/hylla/tls/tls.key
-    client_name hylla.downstream
-  }
-}
-```
-
-```styx
-// A node using it.
-backends {
-  assets {
-    type hylla
-    url https://shield.internal:7947
-    backend assets
-    tls {
-      ca /etc/hylla/tls/ca.crt
-      cert /etc/hylla/tls/tls.crt  // issued for hylla.downstream
-      key /etc/hylla/tls/tls.key
-    }
-  }
-}
-```
-
-The serving node's certificate must be issued for the host in the URL, and the other nodes'
-certificates for its `client_name`, by the CA each side trusts. Only the listed backends are
-served; others are refused. Refresh rules on the other nodes list through it. Certificates
-are read again when they change, as for a cluster.
-
-### Control plane
-
-The optional control plane is a web UI and JSON API for the people running hylla: the last
-request and the last failure of each backend, the mappings, and browsing their objects.
-Mappings marked `writable` can also have objects uploaded, deleted and moved there, under
-their path prefix only. Public listeners never write.
-
-```styx
-// config.styx
-servers {
-  public {
-    listen 0.0.0.0:8080
-    server_names (cache.example.com)
-    mappings (
-      {path_prefix /uploads, backend assets, writable true}
-      {path_prefix /, backend assets}
-    )
-  }
-}
-control {
-  listen 127.0.0.1:9090  // keep it private
-  max_upload_mib 256     // the default
-}
-```
-
-```styx
-// secrets.styx
-control {users {admin {password_hash "$argon2id$v=19$m=19456,t=2,p=1$..."}}}
-```
-
-People can sign in through an OpenID provider, such as Konklav,
-with the authorization code flow and PKCE, if they're in one of the allowed groups:
-
-```styx
-control {
-  listen 127.0.0.1:9090
-  oidc {
-    issuer https://id.example.com
-    client_id hylla
-    url https://hylla-control.internal  // the provider redirects to {url}/auth/callback
-    groups (hylla-admin)                // from the `groups` claim, or `groups_claim`
-  }
-}
-// secrets.styx, for a confidential client
-control {oidc {client_secret "..."}}
-```
-
-Register the client with the redirect URI `{url}/auth/callback` and, to sign out at the
-provider too, the post-logout redirect URI `{url}/`. With Konklav, give the client the
-`openid`, `email` and `groups` scopes and `visible_groups` such as `hylla-*`, and the
-users the global role `hylla-admin`. Sessions are kept in memory, per node, for
-`session_ttl` (8 hours by default). With several nodes behind one control plane URL, the load
-balancer must send each browser to the same node (sticky sessions), or signing in ends up
-going in circles; a restart signs everyone out of that node.
-
-Users in `users` sign in with HTTP Basic auth, as scripts do. Hash their passwords with:
-
-```bash
-hylla hash-password
-```
-
-which reads the password from stdin. Changes from other sites are refused, since browsers
-send Basic credentials along with them. Writable mappings can't have rewrites, since their
-backend keys must map back to their paths, and can't use a read-only `hylla` backend. After
-a change, the node forgets the object's cached metadata, and tells the other live nodes of a
-cluster to forget it too. Every change, and every refused or failed one, is logged with the
-`hylla::audit` target, with who made it.
-
-The UI is built with [Leptos](https://leptos.dev) and rendered on the server, and works
-without JavaScript. Releases and the Docker image embed its hydration bundle, which
-`mise run ui` builds into `target/site/pkg` for local builds:
-
-```bash
-mise run ui
-```
-
-The JSON API, for scripts:
-
-```bash
-curl -u admin https://hylla-control.internal/v1/backends
-curl -u admin -T app.css https://hylla-control.internal/v1/mappings/public/0/objects/css/app.css
-curl -u admin -X DELETE https://hylla-control.internal/v1/mappings/public/0/objects/css/app.css
-```
-
-### Docker
+## Docker
 
 Images for `linux/amd64` and `linux/arm64` are on Docker Hub as
-[`cstruct/hylla`](https://hub.docker.com/r/cstruct/hylla): `latest` and versions such as
-`0.1.0` and `0.1`, pushed by releases only. The config is read from
-`/etc/hylla/config.styx`, and a disk cache at `/var/cache/hylla` can be kept on a volume:
+[`cstruct/hylla`](https://hub.docker.com/r/cstruct/hylla):
 
 ```bash
 docker run -p 8080:8080 \
@@ -409,60 +156,8 @@ docker run -p 8080:8080 \
   cstruct/hylla --config /etc/hylla/config.styx --secrets /etc/hylla/secrets.styx
 ```
 
-hylla runs as the distroless `nonroot` user (65532), so a directory mounted for the disk
-cache must be writable by it. A new named volume is.
+See [Running in production](docs/guide/production.md#docker).
 
-On SIGTERM, hylla stops accepting connections, reports itself not ready on `/readyz`, gives
-requests in flight `http.shutdown_timeout` to finish, and writes its cache to disk. In
-Kubernetes, point the readiness probe at `/readyz` and the liveness probe at `/healthz` on
-the `health` listener, and keep `terminationGracePeriodSeconds` above the shutdown timeout.
+## Contributing
 
-## Testing
-
-```bash
-cargo test
-```
-
-The end-to-end tests run the `hylla` binary against [VersityGW](https://github.com/versity/versitygw)
-(S3) and [Azurite](https://github.com/Azure/Azurite) (Azure Blob Storage), and three nodes
-sharing over a cluster. [mise](https://mise.jdx.dev) installs both tools, pinned in
-[mise.toml](mise.toml):
-
-```bash
-mise run e2e
-```
-
-The behaviour is specified in [docs/spec](docs/spec) and tracked with
-[tracey](https://github.com/bearcove/tracey).
-
-```bash
-tracey query status
-```
-
-## Developing with ordna
-
-hylla's config is built on [ordna](https://github.com/cstruct/ordna), taken from crates.io.
-To build against a checkout of ordna next to this one instead, while changing both, patch it
-in with [.cargo/ordna-local.toml](.cargo/ordna-local.toml):
-
-```bash
-ln -s ordna-local.toml .cargo/config.toml
-```
-
-`.cargo/config.toml` is ignored by git. While it's enabled, Cargo.lock records the local
-packages, so remove the link before committing changes to it.
-
-## Releasing
-
-hylla is versioned as one, by `version` in the workspace's [Cargo.toml](Cargo.toml). Bump
-it, then tag the commit with the version:
-
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-The [release workflow](.github/workflows/release.yml) checks the tag against the version
-and runs CI. It then builds the binaries, pushes the Docker image, and creates a GitHub
-release with the binaries, their checksums and notes generated from the pull requests
-merged since the last one.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers building, the tests, the spec, and releasing.

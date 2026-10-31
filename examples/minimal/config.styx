@@ -1,0 +1,20 @@
+// The smallest useful hylla: one server in front of one S3 compatible bucket, with a
+// memory cache of the default 256 MiB.
+servers {
+  local {
+    listen 127.0.0.1:8080
+    // Requests are matched to a server by their Host header, without the port.
+    server_names (localhost)
+    // Every path goes to the `assets` backend: /app.css is the key app.css.
+    mappings ({path_prefix /, backend assets})
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region us-east-1
+    // VersityGW on this machine, as the quickstart runs it. Leave it out for AWS S3.
+    endpoint http://127.0.0.1:7070
+  }
+}

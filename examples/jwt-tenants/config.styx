@@ -1,0 +1,42 @@
+// Files per tenant, readable only with a JWT from the tenant's identity provider, each
+// tenant under its own prefix. Shared, public files are served without a token.
+servers {
+  files {
+    listen 0.0.0.0:8080
+    server_names (files.example.com)
+    mappings (
+      {
+        path_prefix /tenants
+        backend files
+        auth {
+          verifier customers
+          // A token may only read keys under tenants/<its tenant_id claim>/, so
+          // /tenants/acme/report.pdf needs `"tenant_id": "acme"`.
+          paths ("/tenants/${tenant_id}")
+          // Responses are `Cache-Control: private`, the default, so shared caches in front
+          // of hylla don't hand them to other tenants.
+        }
+      }
+      {path_prefix /public, backend files}
+    )
+  }
+}
+// The verifier: the provider's public key and what its tokens must say.
+auth {
+  customers {
+    algorithm ES256
+    public_key "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEreplacewiththeprovidersownpublickeyreplacewiththeprovidersownpublickeyAA==\n-----END PUBLIC KEY-----\n"
+    issuer https://id.example.com
+    // Without an audience, any token the provider signs is accepted, also ones made for
+    // other services. hylla warns about it at startup.
+    audience files.example.com
+    leeway 30s
+  }
+}
+backends {
+  files {
+    type s3
+    bucket example-files
+    region eu-north-1
+  }
+}

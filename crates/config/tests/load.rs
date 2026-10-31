@@ -903,25 +903,57 @@ fn flags_override_the_config_file_and_environment() {
     assert_eq!(loaded.config().telemetry.logs.level, "info");
 }
 
-/// The ```styx block of the README starting with `first_line`.
-fn readme_block(first_line: &str) -> String {
-    let readme =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap();
-    let start = readme
-        .find(&format!("```styx\n{first_line}\n"))
-        .unwrap_or_else(|| panic!("no README block starting with `{first_line}`"))
-        + "```styx\n".len();
-    let end = start + readme[start..].find("```").unwrap();
-    readme[start..end].to_string()
+/// A file of the examples, by its path under `examples/`.
+fn example(path: &str) -> String {
+    let path = format!("{}/../../examples/{path}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
+}
+
+/// The directories under `examples/` with a `config.styx`, relative to it.
+fn example_dirs() -> Vec<String> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<String>) {
+        if dir.join("config.styx").exists() {
+            let relative = dir.strip_prefix(root).unwrap();
+            found.push(relative.to_string_lossy().into_owned());
+        }
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, found);
+            }
+        }
+    }
+    let root = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples"));
+    let mut found = Vec::new();
+    walk(&root, &root, &mut found);
+    found.sort();
+    found
 }
 
 // r[verify config.sources]
 #[test]
-fn the_readme_example_loads() {
+fn every_example_loads() {
+    let dirs = example_dirs();
+    assert!(dirs.len() >= 7, "{dirs:?}");
+    for dir in dirs {
+        let files = Files::new(
+            &format!("example-{}", dir.replace('/', "-")),
+            &example(&format!("{dir}/config.styx")),
+            &example(&format!("{dir}/secrets.styx")),
+        );
+        if let Err(error) = files.load(&[]) {
+            panic!("examples/{dir} doesn't load: {error}");
+        }
+    }
+}
+
+// r[verify config.sources]
+#[test]
+fn the_reference_example_loads() {
     let files = Files::new(
-        "readme",
-        &readme_block("// config.styx"),
-        &readme_block("// secrets.styx"),
+        "reference",
+        &example("reference/config.styx"),
+        &example("reference/secrets.styx"),
     );
     let config = files.load(&[]).unwrap().into_config();
     assert_eq!(config.servers["public"].mappings.len(), 3);
@@ -1061,11 +1093,11 @@ fn explain_shows_the_shadow_chain() {
 
 // r[verify config.show]
 #[test]
-fn the_readme_example_shows_as_styx() {
+fn the_reference_example_shows_as_styx() {
     let files = Files::new(
-        "readme-show",
-        &readme_block("// config.styx"),
-        &readme_block("// secrets.styx"),
+        "reference-show",
+        &example("reference/config.styx"),
+        &example("reference/secrets.styx"),
     );
     let shown = hylla_config::render(&files.load(&[]).unwrap().into());
     facet_styx::from_str::<facet_value::Value>(&shown).unwrap();

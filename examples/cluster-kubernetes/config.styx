@@ -1,0 +1,55 @@
+// Three hylla nodes in Kubernetes sharing a cluster: each refresh rule runs on one node,
+// metadata fetched from S3 is pushed to the others, and preloads are pulled from the node
+// that made them, so S3 serves each object once per cluster rather than once per node.
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cdn.example.com)
+    mappings ({path_prefix /, backend assets})
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+    refresh {
+      rules (
+        {prefix "", every 5m, mode revalidate}
+        {prefix css/, every 1h, mode preload, max_mib 256}
+      )
+    }
+  }
+}
+cluster {
+  // Gossip and data between the nodes: keep it inside the cluster.
+  listen 0.0.0.0:7946
+  // Each pod sets its own address with HYLLA__CLUSTER__ADVERTISE, see hylla.yaml.
+  advertise 10.0.0.1:7946
+  // The headless service returns every pod, so nodes find each other through it.
+  seeds (hylla-cluster.hylla.svc.cluster.local:7946)
+  // Mutual TLS, with a certificate cert-manager issues for every pod.
+  tls {
+    ca /etc/hylla/tls/ca.crt
+    cert /etc/hylla/tls/tls.crt
+    key /etc/hylla/tls/tls.key
+    server_name hylla.cluster
+  }
+}
+cache {
+  memory {capacity_mib 1024}
+  disk {
+    path /var/cache/hylla
+    capacity_mib 20480
+  }
+}
+health {
+  listen 0.0.0.0:8081
+}
+http {
+  // Below terminationGracePeriodSeconds in hylla.yaml, so the cache is written to disk.
+  shutdown_timeout 20s
+}
+telemetry {
+  logs {format json}
+}
