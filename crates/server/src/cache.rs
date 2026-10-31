@@ -182,7 +182,7 @@ pub struct ObjectCache {
     revalidations: Mutex<HashMap<(String, String), Revalidation>>,
     /// Where metadata fetched from backends, preloaded objects and objects changed through
     /// this node are reported, when they're shared with a cluster.
-    events: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<CacheEvent>>,
+    events: std::sync::OnceLock<tokio::sync::mpsc::Sender<CacheEvent>>,
 }
 
 /// Something worth telling other nodes about.
@@ -434,13 +434,34 @@ impl ObjectCache {
     }
 
     /// Reports events to `sender`, for sharing them with a cluster.
-    pub(crate) fn report_to(&self, sender: tokio::sync::mpsc::UnboundedSender<CacheEvent>) {
+    pub(crate) fn report_to(&self, sender: tokio::sync::mpsc::Sender<CacheEvent>) {
         let _ = self.events.set(sender);
     }
 
+    // r[impl cluster.queue]
+    /// Reports an event, dropping it when the queue of events to share is full, as when
+    /// other nodes are slow to take them.
     fn report(&self, event: impl FnOnce() -> CacheEvent) {
-        if let Some(events) = self.events.get() {
-            let _ = events.send(event());
+        let Some(events) = self.events.get() else {
+            return;
+        };
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(event)) = events.try_send(event()) {
+            let kind = match &event {
+                CacheEvent::Fetched(_) => "fetched",
+                CacheEvent::Preloaded(_) => "preloaded",
+                CacheEvent::Forgotten { backend, key } => {
+                    tracing::warn!(
+                        backend,
+                        key,
+                        "the queue of updates for other nodes is full: they won't forget the \
+                         object until its metadata expires"
+                    );
+                    "forgotten"
+                }
+            };
+            METRICS
+                .cluster_dropped
+                .add(1, &[KeyValue::new("hylla.kind", kind)]);
         }
     }
 
@@ -604,6 +625,11 @@ impl ObjectCache {
         path: &ObjectPath,
         meta: &ObjectMeta,
     ) -> Result<u64, ReadError> {
+        // r[impl cache.no-etag]
+        // Their chunks aren't cached, so there's nothing to preload.
+        if meta.etag.is_none() {
+            return Ok(0);
+        }
         let mut fetched = 0;
         for index in 0..meta.size.div_ceil(self.chunk_size) {
             let (bytes, was_fetched) = self
@@ -648,10 +674,40 @@ impl ObjectCache {
     ) -> Result<(Bytes, bool), ReadError> {
         let start = index * self.chunk_size;
         let end = (start + self.chunk_size).min(meta.size);
+        // r[impl cache.no-etag]
+        // Without an ETag, chunks of different versions would share keys, and a read
+        // couldn't be held to one version: such objects are read from the backend every
+        // time.
+        let Some(etag) = meta.etag.clone() else {
+            let options = GetOptions {
+                range: Some(GetRange::Bounded(start..end)),
+                ..Default::default()
+            };
+            let get = async { store.get_opts(path, options).await?.bytes().await };
+            let bytes = spans::backend_call(backend, "get", Some(path), get)
+                .await
+                .map_err(|error| match error {
+                    object_store::Error::NotFound { .. } => ReadError::NotFound,
+                    error => ReadError::Backend(anyhow::Error::new(error)),
+                })?;
+            Span::current().record("hylla.result", "uncacheable");
+            METRICS.chunks.add(
+                1,
+                &[
+                    KeyValue::new("hylla.backend", backend.to_string()),
+                    KeyValue::new("hylla.result", "uncacheable"),
+                ],
+            );
+            METRICS.backend_bytes.add(
+                bytes.len() as u64,
+                &[KeyValue::new("hylla.backend", backend.to_string())],
+            );
+            return Ok((bytes, true));
+        };
         let key = CacheKey::Chunk(ChunkKey {
             backend: backend.to_string(),
             key: path.to_string(),
-            etag: meta.etag.clone().unwrap_or_default(),
+            etag,
             index,
         });
         let options = GetOptions {
@@ -776,5 +832,26 @@ mod tests {
             };
             assert_eq!(StoredMeta::from_bytes(&stored.to_bytes()).unwrap(), stored);
         }
+    }
+
+    // r[verify cluster.queue]
+    #[tokio::test]
+    async fn events_beyond_the_queue_are_dropped() {
+        let cache = super::ObjectCache::new(&hylla_config::Cache::default())
+            .await
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        cache.report_to(sender);
+        for key in ["a", "b", "c"] {
+            cache.report(|| super::CacheEvent::Forgotten {
+                backend: "assets".into(),
+                key: key.into(),
+            });
+        }
+        let mut received = Vec::new();
+        while let Ok(super::CacheEvent::Forgotten { key, .. }) = receiver.try_recv() {
+            received.push(key);
+        }
+        assert_eq!(received, ["a", "b"]);
     }
 }

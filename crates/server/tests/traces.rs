@@ -135,6 +135,7 @@ fn config(cluster: Option<Cluster>) -> Config {
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
+                timeouts: Default::default(),
                 refresh: Some(Refresh {
                     concurrency: 1,
                     rules: vec![RefreshRule {
@@ -157,6 +158,8 @@ fn config(cluster: Option<Cluster>) -> Config {
         telemetry: Default::default(),
         control: None,
         serve_backends: None,
+        health: None,
+        http: Default::default(),
         cluster,
     }
 }

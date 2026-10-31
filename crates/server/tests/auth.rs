@@ -90,6 +90,7 @@ async fn app(mappings: Vec<Mapping>, verifiers: HashMap<String, Verifier>) -> Ar
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
+                timeouts: Default::default(),
                 refresh: None,
             },
         )]),
@@ -98,6 +99,8 @@ async fn app(mappings: Vec<Mapping>, verifiers: HashMap<String, Verifier>) -> Ar
         telemetry: Default::default(),
         control: None,
         serve_backends: None,
+        health: None,
+        http: Default::default(),
         cluster: None,
     };
     let stores = HashMap::from([("assets".to_string(), store as Arc<dyn ObjectStore>)]);
@@ -378,6 +381,58 @@ async fn dot_segments_are_refused() {
     }
 }
 
+// r[verify server.routes.decoded]
+#[tokio::test]
+async fn encoded_paths_are_routed_as_decoded() {
+    let app = app(
+        vec![
+            mapping("/tenant", &[], auth("partners", &["/tenant/${sub}"])),
+            mapping("/", &[], None),
+        ],
+        verifiers(verifier(None, None)),
+    )
+    .await;
+    // Each decodes to /tenant/acme/report.pdf, so it must reach the mapping with auth, not
+    // fall through to the public one.
+    for path in [
+        "/%74enant/acme/report.pdf",
+        "/%54ENANT/acme/report.pdf",
+        "/tenant%2Facme/report.pdf",
+        "/tenant%2facme%2freport.pdf",
+        "/public/..%2Ftenant/acme/report.pdf",
+        "/public/%2e%2e/tenant/acme/report.pdf",
+    ] {
+        let response = get(&app, path, None).await;
+        assert_ne!(response.status, StatusCode::OK, "{path}");
+        assert_ne!(response.body, b"tenant/acme/report.pdf", "{path}");
+    }
+    for path in ["/%74enant/acme/report.pdf", "/tenant%2Facme/report.pdf"] {
+        assert_eq!(
+            get(&app, path, None).await.status,
+            StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+        let other = valid(json!({ "sub": "other" }));
+        assert_eq!(
+            get_with(&app, path, &other).await.status,
+            StatusCode::FORBIDDEN,
+            "{path}"
+        );
+        let acme = valid(json!({ "sub": "acme" }));
+        let response = get_with(&app, path, &acme).await;
+        assert_eq!(response.status, StatusCode::OK, "{path}");
+        assert_eq!(response.body, b"tenant/acme/report.pdf");
+    }
+    // Encoded characters that aren't separators still reach public objects.
+    let response = get(&app, "/public/app%2Ecss", None).await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body, b"public/app.css");
+    assert_eq!(
+        get(&app, "/public/%FF.css", None).await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
 // r[verify auth.private]
 // r[verify config.auth.mappings]
 #[tokio::test]
@@ -414,6 +469,8 @@ async fn invalid_public_keys_fail_at_startup() {
         telemetry: Default::default(),
         control: None,
         serve_backends: None,
+        health: None,
+        http: Default::default(),
         cluster: None,
     };
     let error = App::new(&config, HashMap::new()).await.err().unwrap();

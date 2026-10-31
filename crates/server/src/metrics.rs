@@ -30,6 +30,7 @@ pub struct Metrics {
     pub cluster_updates: Counter<u64>,
     pub cluster_pulled_chunks: Counter<u64>,
     pub cluster_gossip_failures: Counter<u64>,
+    pub cluster_dropped: Counter<u64>,
 }
 
 // r[impl telemetry.metrics.instruments]
@@ -87,6 +88,12 @@ pub static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         cluster_gossip_failures: meter
             .u64_counter("hylla.cluster.gossip.failures")
             .with_description("Failed gossip exchanges with other nodes")
+            .build(),
+        cluster_dropped: meter
+            .u64_counter("hylla.cluster.dropped")
+            .with_description(
+                "Updates not shared and preloads not pulled because their queue was full, by kind",
+            )
             .build(),
     }
 });

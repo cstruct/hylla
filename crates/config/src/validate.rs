@@ -64,6 +64,10 @@ pub enum ValidationError {
     InvalidControl { reason: String },
     /// A cache size setting is out of range.
     InvalidCache { reason: String },
+    /// The listeners' limits are invalid.
+    InvalidHttp { reason: String },
+    /// The health checks' settings are invalid.
+    InvalidHealth { reason: String },
     /// Several servers answer to the same host name on the same address.
     DuplicateHost {
         listen: SocketAddr,
@@ -164,6 +168,8 @@ impl fmt::Display for ValidationError {
             ),
             Self::InvalidControl { reason } => write!(f, "invalid control config: {reason}"),
             Self::InvalidCache { reason } => write!(f, "invalid cache config: {reason}"),
+            Self::InvalidHttp { reason } => write!(f, "invalid http config: {reason}"),
+            Self::InvalidHealth { reason } => write!(f, "invalid health config: {reason}"),
             Self::DuplicateHost {
                 listen,
                 server_name,
@@ -305,6 +311,10 @@ impl Config {
         errors.extend(self.validate_serve_backends());
         // r[impl config.validate.control]
         errors.extend(self.validate_control());
+        // r[impl config.validate.http]
+        errors.extend(self.validate_http());
+        // r[impl config.validate.health]
+        errors.extend(self.validate_health());
 
         for ((listen, server_name), servers) in hosts {
             if servers.len() > 1 {
@@ -661,6 +671,91 @@ impl Config {
         reasons
             .into_iter()
             .map(|reason| ValidationError::InvalidControl { reason })
+            .collect()
+    }
+}
+
+impl Config {
+    fn validate_http(&self) -> Vec<ValidationError> {
+        let http = &self.http;
+        let mut reasons = Vec::new();
+        if http.header_read_timeout.duration().is_zero() {
+            reasons.push("`header_read_timeout` must be positive".to_string());
+        }
+        if http.max_connections == 0 {
+            reasons.push("`max_connections` must be positive".to_string());
+        }
+        let idle = http.idle_timeout.duration();
+        let mut errors = Vec::new();
+        let mut backends = self.backends.iter().collect::<Vec<_>>();
+        backends.sort_by_key(|(name, _)| *name);
+        for (name, backend) in backends {
+            let timeouts = backend.timeouts();
+            // r[impl config.validate.backend-timeouts]
+            for (field, timeout) in [("connect", timeouts.connect), ("request", timeouts.request)] {
+                if timeout.duration().is_zero() {
+                    errors.push(ValidationError::InvalidBackend {
+                        backend: name.clone(),
+                        reason: format!("`timeouts.{field}` must be positive"),
+                    });
+                }
+            }
+            // A request waiting on its backend sends nothing, so its connection would be
+            // closed as idle before the backend's timeout.
+            if !idle.is_zero() && idle <= timeouts.request.duration() {
+                reasons.push(format!(
+                    "`idle_timeout` ({}) must be longer than the request timeout of backend \
+                     `{name}` ({})",
+                    http.idle_timeout, timeouts.request
+                ));
+            }
+        }
+        errors.extend(
+            reasons
+                .into_iter()
+                .map(|reason| ValidationError::InvalidHttp { reason }),
+        );
+        errors
+    }
+
+    fn validate_health(&self) -> Vec<ValidationError> {
+        let Some(health) = &self.health else {
+            return Vec::new();
+        };
+        let mut others = self
+            .servers
+            .iter()
+            .filter(|(_, server)| server.listen == health.listen)
+            .map(|(name, _)| format!("server `{name}`"))
+            .collect::<Vec<_>>();
+        others.sort();
+        let listens = [
+            (
+                "the cluster",
+                self.cluster.as_ref().map(|cluster| cluster.listen),
+            ),
+            (
+                "serve_backends",
+                self.serve_backends.as_ref().map(|serve| serve.listen),
+            ),
+            (
+                "the control plane",
+                self.control.as_ref().map(|control| control.listen),
+            ),
+        ];
+        for (other, listen) in listens {
+            if listen == Some(health.listen) {
+                others.push(other.to_string());
+            }
+        }
+        others
+            .into_iter()
+            .map(|other| ValidationError::InvalidHealth {
+                reason: format!(
+                    "`listen` is {}, which {other} listens on too",
+                    health.listen
+                ),
+            })
             .collect()
     }
 }

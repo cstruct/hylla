@@ -132,6 +132,7 @@ async fn logs_are_exported_over_otlp_with_trace_ids() {
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
+                timeouts: Default::default(),
                 refresh: None,
             },
         )]),
@@ -144,6 +145,8 @@ async fn logs_are_exported_over_otlp_with_trace_ids() {
         telemetry: Default::default(),
         control: None,
         serve_backends: None,
+        health: None,
+        http: Default::default(),
         cluster: None,
     };
     let stores = HashMap::from([("assets".to_string(), store as Arc<dyn ObjectStore>)]);

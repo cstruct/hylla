@@ -72,6 +72,7 @@ fn config_with_refresh(cache: Cache, refresh: Option<Refresh>) -> Config {
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
+                timeouts: Default::default(),
                 refresh,
             },
         )]),
@@ -80,6 +81,8 @@ fn config_with_refresh(cache: Cache, refresh: Option<Refresh>) -> Config {
         telemetry: Default::default(),
         control: None,
         serve_backends: None,
+        health: None,
+        http: Default::default(),
         cluster: None,
     }
 }
@@ -603,6 +606,72 @@ async fn preloading_fills_the_cache_within_its_caps() {
     assert_eq!(get(&app, "/assets/b.css").await.body, content());
     assert_eq!(
         get(&app, "/assets/c.css").await.status,
+        StatusCode::BAD_GATEWAY
+    );
+}
+
+// r[verify refresh.list-batches]
+// r[verify refresh.caps]
+#[tokio::test]
+async fn large_listings_are_handled_in_batches_within_the_caps() {
+    let (memory, store) = flaky_store().await;
+    // With app.css, more objects than one batch holds, twice over.
+    for index in 0..2500 {
+        put(&memory, &format!("many/{index:04}"), vec![1; 10]).await;
+    }
+    let rules = vec![
+        RefreshRule {
+            max_objects: Some(1500),
+            ..rule(Some("many/"), None, RefreshMode::Preload)
+        },
+        rule(Some("many/"), None, RefreshMode::Revalidate),
+    ];
+    let app = refresh_app(small_cache(3600), store.clone(), rules).await;
+    let report = app.refresh("assets", 0).await.unwrap();
+    assert_eq!(
+        (report.listed, report.preloaded, report.skipped),
+        (2500, 1500, 1000)
+    );
+    let report = app.refresh("assets", 1).await.unwrap();
+    assert_eq!((report.listed, report.unchanged), (2500, 1500));
+
+    store.fail(true);
+    assert_eq!(get(&app, "/assets/many/1499").await.status, StatusCode::OK);
+    assert_eq!(
+        get(&app, "/assets/many/1500").await.status,
+        StatusCode::BAD_GATEWAY
+    );
+}
+
+// r[verify cache.no-etag]
+#[tokio::test]
+async fn objects_without_etags_are_never_served_from_cached_chunks() {
+    let (memory, store) = flaky_store().await;
+    store.strip_etags();
+    let app = refresh_app(
+        small_cache(3600),
+        store.clone(),
+        vec![RefreshRule {
+            max_objects: Some(10),
+            ..rule(Some(""), None, RefreshMode::Preload)
+        }],
+    )
+    .await;
+    let response = get(&app, "/assets/app.css").await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.body, content());
+    assert_eq!(response.headers.get(header::ETAG), None);
+
+    // Changed in place, with the same size: no stale chunks of the old version are mixed in.
+    let changed = content().into_iter().rev().collect::<Vec<_>>();
+    put(&memory, "app.css", changed.clone()).await;
+    assert_eq!(get(&app, "/assets/app.css").await.body, changed);
+
+    // Preloading caches nothing, so with the backend down there's nothing to serve.
+    app.refresh("assets", 0).await.unwrap();
+    store.fail(true);
+    assert_eq!(
+        get(&app, "/assets/app.css").await.status,
         StatusCode::BAD_GATEWAY
     );
 }

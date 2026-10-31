@@ -26,6 +26,7 @@ use crate::{
     cache::{ObjectCache, ObjectMeta, ReadError},
     cluster::{self, Cluster},
     control::{self, ControlSettings, MappingEntry},
+    listen,
     metrics::{self, METRICS},
     range::{self, RequestedRange},
     refresh, spans, telemetry,
@@ -47,13 +48,21 @@ pub struct App {
     /// The type of each backend, such as `s3`, by backend name.
     pub(crate) backend_kinds: BTreeMap<String, &'static str>,
     /// The cache's events, until the cluster starts sharing them.
-    cluster_events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<CacheEvent>>>,
+    cluster_events: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<CacheEvent>>>,
     /// Observable instruments, kept alive while the app is.
     _gauges: Vec<opentelemetry::metrics::ObservableGauge<u64>>,
     /// The refresh settings of the backends that have any, by backend name.
     refresh: BTreeMap<String, Refresh>,
     /// The servers of each listen address.
     listeners: BTreeMap<SocketAddr, Vec<Arc<Server>>>,
+    /// The limits of every listener.
+    pub(crate) limits: listen::Limits,
+    /// The address of the health checks' listener, if any.
+    pub(crate) health: Option<SocketAddr>,
+    /// Set once every listener is serving.
+    serving: std::sync::atomic::AtomicBool,
+    /// Set when shutdown starts, telling the listeners to finish.
+    stopping: tokio::sync::watch::Sender<bool>,
 }
 
 /// A configured server, with its mappings compiled.
@@ -119,7 +128,7 @@ impl App {
         let cache = Arc::new(ObjectCache::new(&config.cache).await?);
         let (cluster, cluster_events) = match &config.cluster {
             Some(cluster) => {
-                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                let (sender, receiver) = tokio::sync::mpsc::channel(cluster::QUEUE);
                 cache.report_to(sender);
                 (Some(Arc::new(Cluster::new(cluster)?)), Some(receiver))
             }
@@ -188,7 +197,35 @@ impl App {
             cluster_events: std::sync::Mutex::new(cluster_events),
             refresh,
             listeners,
+            limits: listen::Limits::new(&config.http),
+            health: config.health.as_ref().map(|health| health.listen),
+            serving: false.into(),
+            stopping: tokio::sync::watch::Sender::new(false),
         }))
+    }
+
+    /// Tells the listeners to stop.
+    pub(crate) fn shutdown(&self) -> listen::Shutdown {
+        listen::Shutdown::new(&self.stopping)
+    }
+
+    /// Starts shutting down: listeners stop accepting connections, finish the requests in
+    /// flight, and the node reports itself not ready.
+    pub fn stop(&self) {
+        self.stopping.send_replace(true);
+    }
+
+    /// Marks every listener as serving.
+    pub(crate) fn mark_serving(&self) {
+        self.serving
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // r[impl health.ready]
+    /// Whether the node serves requests: every listener started, and it isn't shutting
+    /// down.
+    pub fn ready(&self) -> bool {
+        self.serving.load(std::sync::atomic::Ordering::Relaxed) && !*self.stopping.borrow()
     }
 
     /// The addresses to listen on.
@@ -278,6 +315,11 @@ impl App {
             .take()
             .context("the cluster was already started")?;
         cluster::start(self, cluster, events).await
+    }
+
+    /// The health checks' service.
+    pub fn health_router(self: &Arc<Self>) -> axum::Router {
+        crate::health::router(self)
     }
 
     /// The control plane's service, if it's configured.
@@ -470,12 +512,18 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
         return (StatusCode::NOT_FOUND, "unknown host\n").into_response();
     };
     labels.server = Some(server.name.clone());
+    // r[impl server.routes.decoded]
+    // Decoded before routing, so `/%74enant` or `/tenant%2Fx` can't route past the mapping
+    // its key falls under, and its auth.
+    let Ok(path) = percent_decode_str(request.uri().path()).decode_utf8() else {
+        return (StatusCode::BAD_REQUEST, "path isn't UTF-8\n").into_response();
+    };
     // r[impl server.routes]
-    let Some(route) = server.router.route(request.uri().path()) else {
+    let Some(route) = server.router.route(&path) else {
         return (StatusCode::NOT_FOUND, "no mapping\n").into_response();
     };
     labels.mapping = server.prefixes.get(route.mapping).cloned();
-    let key = percent_decode_str(route.path.trim_start_matches('/')).decode_utf8_lossy();
+    let key = route.path.trim_start_matches('/');
 
     // r[impl auth.mappings]
     let auth = server.auth.get(route.mapping).and_then(Option::as_ref);
@@ -501,7 +549,7 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
         if key.is_empty() {
             return StatusCode::NOT_FOUND.into_response();
         }
-        let path = ObjectPath::from(key.as_ref());
+        let path = ObjectPath::from(key);
         serve_object(app, route.backend, store, path, request_headers, head).await
     }
     .await;

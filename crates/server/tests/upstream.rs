@@ -36,6 +36,7 @@ fn s3() -> Backend {
         endpoint: None,
         access_key_id: "test".into(),
         secret_access_key: "test".into(),
+        timeouts: Default::default(),
         refresh: None,
     }
 }
@@ -67,6 +68,8 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
         cluster: None,
         control: None,
         serve_backends: serve,
+        health: None,
+        http: Default::default(),
     }
 }
 
@@ -138,6 +141,7 @@ fn downstream_config(upstream: &Upstream, pki: &Pki, name: &str, backend: &str) 
             cert: issued.cert,
             key: issued.key,
         },
+        timeouts: Default::default(),
         refresh: Some(Refresh {
             concurrency: 2,
             rules: vec![RefreshRule {
@@ -328,4 +332,47 @@ async fn nodes_without_the_right_certificates_are_refused() {
         .send()
         .await;
     assert!(plain.is_err(), "{plain:?}");
+}
+
+// r[verify backend.timeouts]
+// r[verify config.backends.timeouts]
+#[tokio::test]
+async fn hung_hylla_backends_time_out() {
+    // Accepts connections, and never answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let pki = Pki::new("hung");
+    let issued = pki.issue(CLIENT_NAME);
+    let backend = Backend::Hylla {
+        url: format!("https://localhost:{}", addr.port()),
+        backend: "assets".into(),
+        tls: HyllaTls {
+            ca: pki.ca(),
+            cert: issued.cert,
+            key: issued.key,
+        },
+        timeouts: hylla_config::BackendTimeouts {
+            connect: Interval::from_secs(1),
+            request: Interval::from_secs(1),
+        },
+        refresh: None,
+    };
+    let config = config(HashMap::from([("shield".into(), backend)]), None);
+    let stores = hylla_server::backend::stores(&config).unwrap();
+    let started = std::time::Instant::now();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stores["shield"].head(&Path::from("app.css")),
+    )
+    .await
+    .expect("the request timed out on its own");
+    assert!(read.is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    hold.abort();
 }

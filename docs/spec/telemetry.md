@@ -41,7 +41,8 @@ The objects refresh runs handle MUST be counted by backend, rule and outcome.
 
 r[telemetry.metrics.cluster]
 The live members of the cluster MUST be reported, and updates sent and received, chunks pulled
-from other nodes or backends, and failed gossip exchanges counted.
+from other nodes or backends, failed gossip exchanges, and updates and pulls dropped because
+their queue was full counted.
 
 ## Traces
 

@@ -14,6 +14,12 @@ r[cluster.seeds]
 A node MUST gossip with its seeds as well as the live nodes, resolving seed names again on
 every round, so a DNS name returning every node lets nodes find each other.
 
+r[cluster.gossip-timeout]
+A node MUST advance its heartbeat every gossip round, and gossip with each node and resolve
+each seed on its own, within a timeout shorter than the failure timeout, so a node or seed
+that doesn't answer can't delay gossip with the others until they consider each other gone.
+A seed that doesn't resolve MUST keep the addresses it last resolved to.
+
 r[cluster.identity]
 A node's identity MUST include when it started, so a restarted node joins as a new member.
 
@@ -21,6 +27,16 @@ r[cluster.auth]
 Every request between nodes MUST be signed with the shared cluster key, covering its method,
 path and query, a timestamp and its body, and requests with a missing, invalid or more than
 a minute old signature MUST be refused. The key itself MUST NOT be sent.
+
+r[cluster.clock-skew]
+A request refused because its signature's timestamp is too far from now MUST be warned
+about, at most once a minute, naming how far the clocks are apart.
+
+r[cluster.auth.responses]
+Every answer to a request between nodes MUST be signed with the cluster key too, covering
+the request's signature, its status and its body, and answers with a missing or invalid
+signature MUST be refused, so no one on the network path can add members or serve chunks,
+with TLS or without.
 
 r[cluster.tls]
 With TLS configured, the cluster listener MUST only accept TLS connections, and nodes MUST
@@ -68,6 +84,11 @@ next run, pulling only the chunks they don't have.
 r[cluster.pull]
 A node MUST pull the chunks of an announced object from the node that preloaded it, falling
 back to the backend for what that node can't provide.
+
+r[cluster.queue]
+The updates waiting to be shared with other nodes, and the announced objects waiting to be
+pulled, MUST each be held in a queue of bounded size, dropping and counting what doesn't
+fit. An object MUST be queued for pulling once while it's queued or being pulled.
 
 r[cluster.chunks]
 A node MUST serve other nodes chunks from its cache only, never fetching them from a backend

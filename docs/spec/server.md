@@ -12,8 +12,13 @@ hosts MUST be answered with 404.
 
 r[server.routes]
 A request MUST be routed by the server's mappings to a backend and an object key: the
-rewritten path without its leading `/`, percent-decoded. Requests no mapping matches, and
-requests for missing objects, MUST be answered with 404.
+rewritten path without its leading `/`. Requests no mapping matches, and requests for
+missing objects, MUST be answered with 404.
+
+r[server.routes.decoded]
+A request's path MUST be percent-decoded before it is matched to a mapping, rewritten or
+checked against auth, so an encoded path such as `/%74enant` or `/tenant%2Fx` reaches the
+mapping its key falls under. Paths that don't decode to UTF-8 MUST be answered with 400.
 
 r[server.methods]
 Only `GET` and `HEAD` MUST be accepted; other methods MUST be answered with 405 and an
@@ -41,8 +46,26 @@ A request with an `If-Match` that contains neither the object's ETag nor `*` MUS
 answered with 412 and no body, so a reader can't mix parts of different versions.
 
 r[server.shutdown]
-On SIGINT or SIGTERM, hylla MUST stop accepting requests, finish those in flight, write the
+On SIGINT or SIGTERM, hylla MUST stop accepting connections and finish the requests in
+flight, closing the connections still open once the shutdown timeout passes, then write the
 memory tier of the cache to disk and exit successfully.
+
+r[server.limits]
+Every listener MUST close a connection whose request headers don't arrive within the header
+read timeout, or that sends and receives nothing for the idle timeout unless it's `0s`, and
+MUST have at most `max_connections` connections open, leaving further ones waiting to be
+accepted.
+
+## Health
+
+r[health.live]
+The health listener MUST answer `GET /healthz` with 200 while hylla runs, also while it
+shuts down.
+
+r[health.ready]
+The health listener MUST answer `GET /readyz` with 200 once every listener is serving, and
+with 503 before that and once shutdown started, so load balancers stop sending requests
+before connections are closed.
 
 ## Cache
 
@@ -50,6 +73,11 @@ r[cache.chunks]
 Objects MUST be cached in chunks of the configured size, keyed by backend, object key,
 ETag and chunk index, so a changed object misses instead of serving stale data. A chunk
 missing from the cache MUST be fetched with a range request matching the ETag.
+
+r[cache.no-etag]
+The chunks of an object its backend gives no ETag MUST NOT be cached, preloaded or pulled
+from other nodes, and MUST be read from the backend for every request, since chunks of its
+versions couldn't be told apart.
 
 r[cache.metadata]
 Object metadata (size, ETag, last modified and content type) MUST be cached with the
@@ -93,6 +121,10 @@ backend's `concurrency` objects at the same time, and report what it did.
 r[refresh.list]
 A prefix rule MUST list the backend once per run, comparing each listed object's ETag and
 size to its cached metadata, so unchanged objects need no further requests.
+
+r[refresh.list-batches]
+A run MUST handle what it lists a batch at a time as the listing arrives, rather than
+holding a whole listing in memory, with the preload caps applying across batches.
 
 r[refresh.revalidate]
 Revalidating MUST mark the metadata of unchanged cached objects as fetched now, and fetch

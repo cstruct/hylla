@@ -100,6 +100,7 @@ backends {
     bucket assets
     region eu-north-1
     endpoint http://localhost:9000  // optional, for S3 compatible stores
+    timeouts {connect 5s, request 30s}  // optional, these are the defaults
     // Optional background refresh of this backend's objects.
     refresh {
       concurrency 4  // objects refreshed at the same time
@@ -112,6 +113,20 @@ backends {
       )
     }
   }
+}
+// Optional: health checks for load balancers, on a listener of their own. /healthz
+// answers 200 while hylla runs, /readyz while it serves (503 once it's shutting down).
+health {
+  listen 0.0.0.0:8081
+}
+// Optional, every setting has a default. Applies to every listener.
+http {
+  header_read_timeout 10s  // to send a request's headers
+  idle_timeout 60s  // closes connections that send and receive nothing; 0s disables
+  max_connections 10000  // per listener; more wait to be accepted
+  // On SIGTERM, how long requests in flight may take to finish. Keep it below the time
+  // hylla gets to stop, such as terminationGracePeriodSeconds, so the cache is written.
+  shutdown_timeout 20s
 }
 // Optional, every setting has a default.
 cache {
@@ -221,7 +236,15 @@ With a `cluster`, nodes find each other by gossip through their seeds; a DNS nam
 returning every node, such as a Kubernetes headless service, works as a seed. Each refresh
 rule runs on one node, metadata fetched from a backend is pushed to the other nodes, and the
 others pull what a node preloads directly from it, so the backend serves it once per cluster.
-Objects changed through the control plane are forgotten by every node. Everything between nodes is signed with the shared key.
+Objects changed through the control plane are forgotten by every node. Everything between
+nodes, requests and answers both, is signed with the shared key, so all nodes must run a
+version that signs answers.
+
+Signatures carry a timestamp and are refused a minute off, so keep the nodes' clocks in sync,
+such as with NTP; hylla warns when it refuses a node for its clock. Which node runs a refresh
+rule is best-effort, not a lock: while nodes join, leave or can't reach each other, a rule
+can run on more than one node, or on none until the failure timeout passes. That only costs
+backend requests, since refreshing is safe to repeat.
 
 With `tls`, nodes also talk over mutual TLS, accepting only each other's certificates:
 
@@ -338,7 +361,9 @@ Register the client with the redirect URI `{url}/auth/callback` and, to sign out
 provider too, the post-logout redirect URI `{url}/`. With Konklav, give the client the
 `openid`, `email` and `groups` scopes and `visible_groups` such as `hylla-*`, and the
 users the global role `hylla-admin`. Sessions are kept in memory, per node, for
-`session_ttl` (8 hours by default).
+`session_ttl` (8 hours by default). With several nodes behind one control plane URL, the load
+balancer must send each browser to the same node (sticky sessions), or signing in ends up
+going in circles; a restart signs everyone out of that node.
 
 Users in `users` sign in with HTTP Basic auth, as scripts do. Hash their passwords with:
 
@@ -350,7 +375,8 @@ which reads the password from stdin. Changes from other sites are refused, since
 send Basic credentials along with them. Writable mappings can't have rewrites, since their
 backend keys must map back to their paths, and can't use a read-only `hylla` backend. After
 a change, the node forgets the object's cached metadata, and tells the other live nodes of a
-cluster to forget it too.
+cluster to forget it too. Every change, and every refused or failed one, is logged with the
+`hylla::audit` target, with who made it.
 
 The UI is built with [Leptos](https://leptos.dev) and rendered on the server, and works
 without JavaScript. Releases and the Docker image embed its hydration bundle, which
@@ -385,6 +411,11 @@ docker run -p 8080:8080 \
 
 hylla runs as the distroless `nonroot` user (65532), so a directory mounted for the disk
 cache must be writable by it. A new named volume is.
+
+On SIGTERM, hylla stops accepting connections, reports itself not ready on `/readyz`, gives
+requests in flight `http.shutdown_timeout` to finish, and writes its cache to disk. In
+Kubernetes, point the readiness probe at `/readyz` and the liveness probe at `/healthz` on
+the `health` listener, and keep `terminationGracePeriodSeconds` above the shutdown timeout.
 
 ## Testing
 

@@ -5,6 +5,9 @@ use aws_lc_rs::{digest, hmac};
 /// The header carrying a request's signature, as `<unix seconds>:<hex HMAC>`.
 pub const HEADER: &str = "x-hylla-signature";
 
+/// The header carrying a response's signature, as a hex HMAC.
+pub const RESPONSE_HEADER: &str = "x-hylla-response-signature";
+
 /// How far a signature's timestamp may be from now.
 const MAX_AGE_SECS: u64 = 60;
 
@@ -55,6 +58,49 @@ impl Signer {
     }
 }
 
+// r[impl cluster.clock-skew]
+/// How far the timestamp of `signature` is from now, in seconds, when that's beyond what's
+/// accepted: the clocks of the nodes differ, rather than the request being forged.
+pub fn skew(signature: &str) -> Option<u64> {
+    let timestamp = signature.split_once(':')?.0.parse::<u64>().ok()?;
+    let skew = now().abs_diff(timestamp);
+    (skew > MAX_AGE_SECS).then_some(skew)
+}
+
+impl Signer {
+    // r[impl cluster.auth.responses]
+    /// The signature header value for a response to the request signed `request`.
+    ///
+    /// It covers the request's signature, so it can't answer another request, and the
+    /// response's status and body.
+    pub fn sign_response(&self, request: &str, status: u16, body: &[u8]) -> String {
+        hex(hmac::sign(&self.key, &response_message(request, status, body)).as_ref())
+    }
+
+    /// Whether `signature` is valid for a response to the request signed `request`.
+    pub fn verify_response(
+        &self,
+        signature: &str,
+        request: &str,
+        status: u16,
+        body: &[u8],
+    ) -> bool {
+        let Some(tag) = unhex(signature) else {
+            return false;
+        };
+        hmac::verify(&self.key, &response_message(request, status, body), &tag).is_ok()
+    }
+}
+
+fn response_message(request: &str, status: u16, body: &[u8]) -> Vec<u8> {
+    let body_digest = digest::digest(&digest::SHA256, body);
+    format!(
+        "response\n{request}\n{status}\n{}",
+        hex(body_digest.as_ref())
+    )
+    .into_bytes()
+}
+
 fn message(timestamp: u64, method: &str, path_and_query: &str, body: &[u8]) -> Vec<u8> {
     let body_digest = digest::digest(&digest::SHA256, body);
     format!(
@@ -87,7 +133,20 @@ fn unhex(hex: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Signer, now};
+    use super::{Signer, now, skew};
+
+    // r[verify cluster.clock-skew]
+    #[test]
+    fn signatures_from_skewed_clocks_are_told_apart() {
+        let signer = Signer::new("a key of at least thirty-two characters");
+        let current = signer.sign("POST", "/cluster/gossip", b"{}");
+        assert_eq!(skew(&current), None);
+        let behind = signer.sign_at(now() - 300, "POST", "/cluster/gossip", b"{}");
+        assert!(skew(&behind).is_some_and(|skew| (299..=301).contains(&skew)));
+        let ahead = signer.sign_at(now() + 120, "POST", "/cluster/gossip", b"{}");
+        assert!(skew(&ahead).is_some());
+        assert_eq!(skew("garbage"), None);
+    }
 
     // r[verify cluster.auth]
     #[test]
@@ -107,5 +166,21 @@ mod tests {
         assert!(!signer.verify(&old, "POST", "/cluster/gossip", b"{}"));
         assert!(!signer.verify("garbage", "POST", "/cluster/gossip", b"{}"));
         assert!(!signer.verify("1:zz", "POST", "/cluster/gossip", b"{}"));
+    }
+
+    // r[verify cluster.auth.responses]
+    #[test]
+    fn response_signatures_cover_the_request_status_and_body() {
+        let signer = Signer::new("a key of at least thirty-two characters");
+        let request = signer.sign("POST", "/cluster/gossip", b"{}");
+        let signature = signer.sign_response(&request, 200, b"{\"members\":[]}");
+        assert!(signer.verify_response(&signature, &request, 200, b"{\"members\":[]}"));
+        assert!(!signer.verify_response(&signature, &request, 200, b"{}"));
+        assert!(!signer.verify_response(&signature, &request, 404, b"{\"members\":[]}"));
+        let other_request = signer.sign("POST", "/cluster/updates", b"{}");
+        assert!(!signer.verify_response(&signature, &other_request, 200, b"{\"members\":[]}"));
+        let other = Signer::new("another key of at least thirty-two characters");
+        assert!(!other.verify_response(&signature, &request, 200, b"{\"members\":[]}"));
+        assert!(!signer.verify_response("zz", &request, 200, b"{\"members\":[]}"));
     }
 }

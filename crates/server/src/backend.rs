@@ -4,7 +4,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Context;
 use hylla_config::{Backend, Config};
-use object_store::{ObjectStore, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder};
+use object_store::{
+    ClientOptions, ObjectStore, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
+};
 
 /// The object stores of the configured backends, by backend name.
 pub type Stores = HashMap<String, Arc<dyn ObjectStore>>;
@@ -25,6 +27,11 @@ pub fn stores(config: &Config) -> anyhow::Result<Stores> {
 }
 
 fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    // r[impl backend.timeouts]
+    let timeouts = backend.timeouts();
+    let client = ClientOptions::new()
+        .with_connect_timeout(timeouts.connect.duration())
+        .with_timeout(timeouts.request.duration());
     match backend {
         Backend::S3 {
             bucket,
@@ -38,7 +45,8 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
                 .with_bucket_name(bucket)
                 .with_region(region)
                 .with_access_key_id(access_key_id)
-                .with_secret_access_key(secret_access_key);
+                .with_secret_access_key(secret_access_key)
+                .with_client_options(client);
             if let Some(endpoint) = endpoint {
                 // S3 compatible stores are often reached over plain HTTP in development.
                 builder = builder
@@ -58,7 +66,8 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
             let mut builder = MicrosoftAzureBuilder::new()
                 .with_account(account)
                 .with_container_name(container)
-                .with_access_key(account_key);
+                .with_access_key(account_key)
+                .with_client_options(client);
             if let Some(endpoint) = endpoint {
                 // Such as Azurite's `http://127.0.0.1:10000/devstoreaccount1`: the endpoint
                 // is the account's URL, which blobs are addressed under as
@@ -71,7 +80,9 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
         }
         Backend::Hylla {
             url, backend, tls, ..
-        } => Ok(Arc::new(hylla::HyllaStore::new(url, backend, tls)?)),
+        } => Ok(Arc::new(hylla::HyllaStore::new(
+            url, backend, tls, timeouts,
+        )?)),
     }
 }
 
@@ -91,6 +102,8 @@ mod tests {
             cluster: None,
             control: None,
             serve_backends: None,
+            health: None,
+            http: Default::default(),
         }
     }
 
@@ -105,6 +118,7 @@ mod tests {
                 container: "assets".into(),
                 endpoint: endpoint.map(Into::into),
                 account_key: key.into(),
+                timeouts: Default::default(),
                 refresh: None,
             })
         };
@@ -124,6 +138,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".into()),
             access_key_id: "id".into(),
             secret_access_key: "secret".into(),
+            timeouts: Default::default(),
             refresh: None,
         });
         let stores = super::stores(&s3).unwrap();

@@ -211,6 +211,7 @@ fn loads_servers_and_backends() {
             endpoint: None,
             access_key_id: "AKIA123".into(),
             secret_access_key: "s3cr3t".into(),
+            timeouts: Default::default(),
             refresh: None,
         }
     );
@@ -221,6 +222,7 @@ fn loads_servers_and_backends() {
             container: "archive".into(),
             endpoint: None,
             account_key: "hunter2".into(),
+            timeouts: Default::default(),
             refresh: None,
         }
     );
@@ -1323,6 +1325,7 @@ fn hylla_backends_read_another_node_over_tls() {
                 cert: "/etc/hylla/tls/tls.crt".into(),
                 key: "/etc/hylla/tls/tls.key".into(),
             },
+            timeouts: Default::default(),
             refresh: None,
         }
     );
@@ -1410,4 +1413,102 @@ fn backends_are_served_to_other_nodes_over_tls() {
              name",
         ]
     );
+}
+
+// r[verify config.http]
+// r[verify config.health]
+// r[verify config.backends.timeouts]
+#[test]
+fn listener_limits_health_and_timeouts_default_when_left_out() {
+    let files = Files::new("http-defaults", MINIMAL, MINIMAL_SECRETS);
+    let config = files.load(&[]).unwrap().into_config();
+    assert_eq!(config.http, hylla_config::Http::default());
+    assert_eq!(config.http.header_read_timeout, Interval::from_secs(10));
+    assert_eq!(config.http.idle_timeout, Interval::from_secs(60));
+    assert_eq!(config.http.max_connections, 10000);
+    assert_eq!(config.http.shutdown_timeout, Interval::from_secs(20));
+    assert_eq!(config.health, None);
+    let timeouts = config.backends["assets"].timeouts();
+    assert_eq!(timeouts.connect, Interval::from_secs(5));
+    assert_eq!(timeouts.request, Interval::from_secs(30));
+
+    let config = "servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
+backends {assets {type s3, bucket assets, region eu-north-1, timeouts {connect 2s, request 1m}}}
+health {listen 0.0.0.0:8081}
+http {
+  header_read_timeout 5s
+  idle_timeout 2m
+  max_connections 100
+  shutdown_timeout 10s
+}
+";
+    let files = Files::new("http-settings", config, MINIMAL_SECRETS);
+    let config = files
+        .load(&[("HYLLA__HTTP__MAX_CONNECTIONS", "50")])
+        .unwrap()
+        .into_config();
+    assert_eq!(
+        config.http,
+        hylla_config::Http {
+            header_read_timeout: Interval::from_secs(5),
+            idle_timeout: Interval::from_secs(120),
+            max_connections: 50,
+            shutdown_timeout: Interval::from_secs(10),
+        }
+    );
+    assert_eq!(
+        config.health,
+        Some(hylla_config::Health {
+            listen: "0.0.0.0:8081".parse().unwrap()
+        })
+    );
+    let timeouts = config.backends["assets"].timeouts();
+    assert_eq!(timeouts.connect, Interval::from_secs(2));
+    assert_eq!(timeouts.request, Interval::from_secs(60));
+}
+
+// r[verify config.validate.http]
+// r[verify config.validate.health]
+// r[verify config.validate.backend-timeouts]
+#[test]
+fn listener_limits_health_and_timeouts_are_validated() {
+    let config = "servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
+backends {assets {type s3, bucket assets, region eu-north-1, timeouts {connect 0s, request 1m}}}
+health {listen 0.0.0.0:8080}
+http {
+  header_read_timeout 0s
+  max_connections 0
+}
+";
+    let files = Files::new("http-invalid", config, MINIMAL_SECRETS);
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let reasons = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(reasons.len(), 5, "{reasons:#?}");
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("`timeouts.connect` must be positive"))
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("`header_read_timeout` must be positive"))
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("`max_connections` must be positive"))
+    );
+    assert!(reasons.iter().any(|reason| {
+        reason.contains(
+            "`idle_timeout` (1m) must be longer than the request timeout of backend `assets` (1m)",
+        )
+    }));
+    assert!(reasons.iter().any(|reason| {
+        reason.contains(
+            "invalid health config: `listen` is 0.0.0.0:8080, which server `public` listens on too",
+        )
+    }));
 }

@@ -191,6 +191,7 @@ async fn metrics_are_exported_over_otlp() {
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
+                timeouts: Default::default(),
                 refresh: Some(Refresh {
                     concurrency: 1,
                     rules: vec![RefreshRule {
@@ -214,6 +215,8 @@ async fn metrics_are_exported_over_otlp() {
         // A cluster that isn't started, of only this node.
         control: None,
         serve_backends: None,
+        health: None,
+        http: Default::default(),
         cluster: Some(Cluster {
             listen: "127.0.0.1:7946".parse().unwrap(),
             advertise: None,

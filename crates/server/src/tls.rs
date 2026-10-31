@@ -9,7 +9,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 use anyhow::{Context, bail};
@@ -99,56 +99,6 @@ pub fn client_config(files: &Files<'_>, server_name: Option<&str>) -> anyhow::Re
             .with_client_cert_resolver(credentials),
     };
     Ok(config)
-}
-
-/// Serves `router` on `listener` over TLS, requiring clients' certificates as `tls` does.
-/// `what` names the listener in logs, such as `cluster`.
-pub async fn serve(
-    listener: tokio::net::TcpListener,
-    router: axum::Router,
-    tls: Arc<ServerConfig>,
-    what: &'static str,
-) {
-    use hyper_util::{
-        rt::{TokioExecutor, TokioIo},
-        server::conn::auto,
-        service::TowerToHyperService,
-    };
-
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                // Such as running out of file descriptors: wait for some to free up.
-                tracing::warn!("accepting a {what} connection failed: {error}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-        };
-        let acceptor = acceptor.clone();
-        let router = router.clone();
-        tokio::spawn(async move {
-            let handshake = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream));
-            let stream = match handshake.await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    tracing::warn!(%peer, "refused a {what} connection: {error}");
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!(%peer, "refused a {what} connection: the handshake timed out");
-                    return;
-                }
-            };
-            let served = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(stream), TowerToHyperService::new(router))
-                .await;
-            if let Err(error) = served {
-                tracing::debug!(%peer, "{what} connection failed: {error}");
-            }
-        });
-    }
 }
 
 fn roots(path: &Path) -> anyhow::Result<RootCertStore> {

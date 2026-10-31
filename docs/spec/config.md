@@ -125,6 +125,13 @@ r[config.validate.hylla-backends]
 A `hylla` backend whose `url` isn't an `https://` URL with a host, with an empty `backend`,
 or with an empty TLS file MUST be reported as invalid.
 
+r[config.backends.timeouts]
+A backend's optional `timeouts` MUST set how long `connect`ing may take, defaulting to `5s`,
+and a whole `request`, defaulting to `30s`.
+
+r[config.validate.backend-timeouts]
+A zero backend timeout MUST be reported as invalid.
+
 r[config.refresh]
 A backend MAY have a `refresh` section with `rules` and a `concurrency`, defaulting to 4,
 limiting how many objects are refreshed at the same time.
@@ -271,6 +278,25 @@ A `listen` address of `0.0.0.0` or `[::]` without an `advertise` address, an uns
 `advertise` address, a key shorter than 32 characters, seeds that aren't `host:port`, a zero
 gossip interval, a failure timeout not longer than the gossip interval, and TLS settings
 with an empty file or a `server_name` that isn't a DNS name MUST be reported as invalid.
+
+## Listeners
+
+r[config.http]
+An optional `http` section MUST set the limits of every listener: the
+`header_read_timeout`, defaulting to `10s`, the `idle_timeout`, defaulting to `60s`, where
+`0s` disables it, `max_connections` per listener, defaulting to 10000, and the
+`shutdown_timeout` requests in flight are given on shutdown, defaulting to `20s`.
+
+r[config.validate.http]
+A zero header read timeout or `max_connections`, and an idle timeout that isn't `0s` but
+isn't longer than the request timeout of every backend, MUST be reported as invalid.
+
+r[config.health]
+An optional `health` section MUST enable the health checks, on its `listen` address.
+
+r[config.validate.health]
+A health listener on the address of a server, the cluster, `serve_backends` or the control
+plane MUST be reported as invalid.
 
 ## Telemetry
 

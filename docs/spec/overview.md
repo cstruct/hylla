@@ -16,6 +16,11 @@ hylla MUST support Azure Blob Storage as a backend.
 r[backend.hylla]
 hylla MUST support another hylla node serving backends as a backend, read only.
 
+r[backend.timeouts]
+Requests to a backend MUST fail when connecting takes longer than the backend's connect
+timeout, or the whole request longer than its request timeout, so a backend that hangs can't
+hold requests or refresh runs forever.
+
 ## Cache
 
 r[cache.ram]

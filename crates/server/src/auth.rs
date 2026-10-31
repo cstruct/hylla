@@ -15,10 +15,34 @@ pub struct TokenVerifier {
     validation: Validation,
 }
 
+// r[impl auth.audience-warning]
+/// What's worth warning about in the verifiers: those without an audience accept tokens
+/// their issuer made for anything else, such as other services' or ID tokens.
+fn warnings(verifiers: &HashMap<String, Verifier>) -> Vec<String> {
+    let mut names = verifiers
+        .iter()
+        .filter(|(_, verifier)| verifier.audience.is_none())
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            format!(
+                "auth verifier `{name}` has no `audience`, so it accepts any token signed with \
+                 its key, also ones made for other services"
+            )
+        })
+        .collect()
+}
+
 impl Verifiers {
     // r[impl auth.keys]
     /// Parses the public keys of the verifiers, failing on keys that don't parse.
     pub fn new(verifiers: &HashMap<String, Verifier>) -> anyhow::Result<Self> {
+        for warning in warnings(verifiers) {
+            tracing::warn!("{warning}");
+        }
         verifiers
             .iter()
             .map(|(name, verifier)| {
@@ -196,4 +220,30 @@ pub fn refusal_response(refusal: &Refusal) -> (StatusCode, HeaderMap) {
         );
     }
     (status, headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use hylla_config::{Interval, JwtAlgorithm, Verifier};
+
+    // r[verify auth.audience-warning]
+    #[test]
+    fn verifiers_without_an_audience_are_warned_about() {
+        let verifier = |audience: Option<&str>| Verifier {
+            algorithm: JwtAlgorithm::Es256,
+            public_key: String::new(),
+            issuer: None,
+            audience: audience.map(Into::into),
+            leeway: Interval::from_secs(30),
+        };
+        let verifiers = HashMap::from([
+            ("open".to_string(), verifier(None)),
+            ("scoped".to_string(), verifier(Some("hylla"))),
+        ]);
+        let warnings = super::warnings(&verifiers);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("`open` has no `audience`"));
+    }
 }

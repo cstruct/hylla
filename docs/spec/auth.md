@@ -24,6 +24,10 @@ verifier's leeway. When the verifier has an issuer or audience, the token MUST h
 `iss` or `aud`. Other algorithms, including `none` and shared secret algorithms, MUST be
 refused.
 
+r[auth.audience-warning]
+A verifier without an audience MUST be warned about at startup, since it accepts tokens its
+issuer made for other services.
+
 ## Paths
 
 r[auth.paths]

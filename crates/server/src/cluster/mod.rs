@@ -11,7 +11,7 @@
 mod sign;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{
         Arc, Mutex,
@@ -46,6 +46,16 @@ use crate::{
 
 use self::sign::Signer;
 
+/// The most cache events waiting to be shared with other nodes. More are dropped and counted.
+pub(crate) const QUEUE: usize = 10_000;
+
+/// The most announced objects waiting to be pulled from other nodes. More are dropped and
+/// counted, and fetched from the backend when requested.
+const PULL_QUEUE: usize = 1_000;
+
+/// How many announced objects are pulled at once.
+const PULLS: usize = 4;
+
 /// This node's view of the cluster.
 pub struct Cluster {
     id: String,
@@ -54,6 +64,8 @@ pub struct Cluster {
     seeds: Vec<String>,
     gossip_interval: Duration,
     failure_timeout: Duration,
+    /// How long a gossip exchange or a seed lookup may take.
+    gossip_timeout: Duration,
     share: ClusterShare,
     signer: Signer,
     client: reqwest::Client,
@@ -62,10 +74,37 @@ pub struct Cluster {
     /// The listener's TLS configuration, if TLS is configured.
     tls: Option<Arc<rustls::ServerConfig>>,
     heartbeat: AtomicU64,
+    /// When requests refused for clock skew were last warned about, in Unix seconds.
+    skew_warned: AtomicU64,
     /// The other nodes, by id.
     members: Mutex<HashMap<String, Member>>,
-    /// Limits how many preloaded objects are pulled from other nodes at once.
-    pulls: Semaphore,
+    /// The nodes a gossip exchange is in flight with, so a slow one isn't asked again
+    /// before it answered.
+    gossiping: Mutex<HashSet<SocketAddr>>,
+    /// What each seed last resolved to, used while it doesn't resolve.
+    seed_addrs: Mutex<HashMap<String, Seed>>,
+    /// Announced objects waiting to be pulled, from the node that has them.
+    pulls: mpsc::Sender<Pull>,
+    pull_queue: Mutex<Option<mpsc::Receiver<Pull>>>,
+    /// The objects queued or being pulled, by backend, key and ETag, so each is pulled once.
+    pulling: Mutex<HashSet<(String, String, Option<String>)>>,
+}
+
+/// An announced object to pull from the node that has it.
+struct Pull {
+    origin: SocketAddr,
+    shared: SharedMeta,
+    /// The span of the updates announcing it, which its pull belongs to.
+    span: Span,
+}
+
+/// What a seed resolved to.
+#[derive(Default)]
+struct Seed {
+    /// The addresses it last resolved to.
+    addrs: Vec<SocketAddr>,
+    /// Whether it failed to resolve since, which is logged once.
+    failing: bool,
 }
 
 struct Member {
@@ -130,7 +169,14 @@ impl Cluster {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let client = reqwest::Client::builder().connect_timeout(config.failure_timeout.duration());
+        let gossip_interval = config.gossip_interval.duration();
+        let failure_timeout = config.failure_timeout.duration();
+        // Long enough for a busy node to answer, short enough for several exchanges to fail
+        // before the failure timeout, so one node that doesn't answer can't hold up the rest.
+        let gossip_timeout = (failure_timeout / 4)
+            .max(gossip_interval)
+            .min(failure_timeout / 2);
+        let client = reqwest::Client::builder().connect_timeout(gossip_timeout);
         let (client, tls) = match &config.tls {
             // r[impl cluster.tls]
             Some(tls) => {
@@ -149,6 +195,7 @@ impl Cluster {
             }
             None => (client, None),
         };
+        let (pulls, pull_queue) = mpsc::channel(PULL_QUEUE);
         Ok(Self {
             // r[impl cluster.identity]
             // The start time makes a restarted node a new member, rather than one whose
@@ -157,16 +204,22 @@ impl Cluster {
             addr,
             listen: config.listen,
             seeds: config.seeds.clone(),
-            gossip_interval: config.gossip_interval.duration(),
-            failure_timeout: config.failure_timeout.duration(),
+            gossip_interval,
+            failure_timeout,
+            gossip_timeout,
             share: config.share.clone(),
             signer: Signer::new(&config.key),
             client: client.build()?,
             scheme: if tls.is_some() { "https" } else { "http" },
             tls,
             heartbeat: AtomicU64::new(0),
+            skew_warned: AtomicU64::new(0),
             members: Mutex::default(),
-            pulls: Semaphore::new(4),
+            gossiping: Mutex::default(),
+            seed_addrs: Mutex::default(),
+            pulls,
+            pull_queue: Mutex::new(Some(pull_queue)),
+            pulling: Mutex::default(),
         })
     }
 
@@ -266,57 +319,136 @@ impl Cluster {
     }
 
     // r[impl cluster.seeds]
+    // r[impl cluster.gossip-timeout]
     /// Gossips with the live nodes and the seeds, resolving seed names again each time.
-    async fn gossip_round(&self) {
+    ///
+    /// The heartbeat advances every round, and each exchange runs on its own with a timeout,
+    /// so a node or seed that doesn't answer doesn't slow gossip with the others.
+    async fn gossip_round(self: &Arc<Self>) {
         self.heartbeat.fetch_add(1, Ordering::Relaxed);
         let mut targets = self
             .live_peers()
             .into_iter()
             .map(|(_, addr)| addr)
             .collect::<Vec<_>>();
-        for seed in &self.seeds {
-            match tokio::net::lookup_host(seed.as_str()).await {
-                Ok(addrs) => targets.extend(addrs),
-                Err(error) => tracing::debug!(seed, "resolving a seed: {error}"),
-            }
-        }
+        targets.extend(self.resolve_seeds().await);
         targets.sort();
         targets.dedup();
         targets.retain(|addr| *addr != self.addr && *addr != self.listen);
 
         let body = serde_json::to_vec(&self.view()).expect("serializable");
-        let responses = join_all(targets.into_iter().map(|addr| {
-            let body = body.clone();
-            async move { (addr, self.post(addr, "/cluster/gossip", body).await) }
-        }))
-        .await;
-        for (addr, response) in responses {
-            match response.and_then(|bytes| Ok(serde_json::from_slice::<Gossip>(&bytes)?)) {
-                Ok(gossip) => self.merge(gossip),
-                Err(error) => {
-                    METRICS.cluster_gossip_failures.add(1, &[]);
-                    tracing::debug!(%addr, "gossip failed: {error:#}");
-                }
+        for addr in targets {
+            if !self.gossiping.lock().expect("not poisoned").insert(addr) {
+                continue;
             }
+            let cluster = self.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let response = cluster
+                    .post(addr, "/cluster/gossip", body, cluster.gossip_timeout)
+                    .await;
+                cluster
+                    .gossiping
+                    .lock()
+                    .expect("not poisoned")
+                    .remove(&addr);
+                match response.and_then(|bytes| Ok(serde_json::from_slice::<Gossip>(&bytes)?)) {
+                    Ok(gossip) => cluster.merge(gossip),
+                    Err(error) => {
+                        METRICS.cluster_gossip_failures.add(1, &[]);
+                        tracing::debug!(%addr, "gossip failed: {error:#}");
+                    }
+                }
+            });
         }
     }
 
-    async fn post(&self, addr: SocketAddr, path: &str, body: Vec<u8>) -> anyhow::Result<Bytes> {
+    /// The seeds' addresses, resolved at the same time, each within the gossip timeout. A
+    /// seed that doesn't resolve keeps the addresses it last resolved to.
+    async fn resolve_seeds(&self) -> Vec<SocketAddr> {
+        let lookups = self.seeds.iter().map(|seed| async move {
+            let lookup =
+                tokio::time::timeout(self.gossip_timeout, tokio::net::lookup_host(seed.as_str()));
+            let resolved = match lookup.await {
+                Ok(Ok(addrs)) => Ok(addrs.collect::<Vec<_>>()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(_) => Err("timed out".to_string()),
+            };
+            (seed, resolved)
+        });
+        let resolved = join_all(lookups).await;
+        let mut seeds = self.seed_addrs.lock().expect("not poisoned");
+        let mut addrs = Vec::new();
+        for (seed, resolved) in resolved {
+            let state = seeds.entry(seed.clone()).or_default();
+            match resolved {
+                Ok(resolved) => {
+                    state.addrs = resolved;
+                    state.failing = false;
+                }
+                // Logged once until it resolves again, rather than every round.
+                Err(error) if !state.failing => {
+                    tracing::warn!(seed, "resolving a seed: {error}");
+                    state.failing = true;
+                }
+                Err(_) => {}
+            }
+            addrs.extend(state.addrs.iter().copied());
+        }
+        addrs
+    }
+
+    /// Posts `body` to another node, returning its answer once its signature is checked.
+    async fn post(
+        &self,
+        addr: SocketAddr,
+        path: &str,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> anyhow::Result<Bytes> {
         let signature = self.signer.sign("POST", path, &body);
         let response = self
             .client
             .post(format!("{}://{addr}{path}", self.scheme))
-            .header(sign::HEADER, signature)
+            .header(sign::HEADER, &signature)
             .header("content-type", "application/json")
             .headers(spans::trace_headers())
-            .timeout(self.failure_timeout)
+            .timeout(timeout)
             .body(body)
             .send()
             .await?;
-        if !response.status().is_success() {
-            bail!("{} answered {}", addr, response.status());
+        let status = response.status();
+        if !status.is_success() {
+            bail!("{} answered {}", addr, status);
         }
-        Ok(response.bytes().await?)
+        let response_signature = response
+            .headers()
+            .get(sign::RESPONSE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.bytes().await?;
+        self.check_response(addr, &signature, response_signature, status, &bytes)?;
+        Ok(bytes)
+    }
+
+    // r[impl cluster.auth.responses]
+    /// Checks the signature of another node's answer to the request signed `request`.
+    fn check_response(
+        &self,
+        addr: SocketAddr,
+        request: &str,
+        signature: Option<String>,
+        status: StatusCode,
+        body: &[u8],
+    ) -> anyhow::Result<()> {
+        let valid = signature.is_some_and(|signature| {
+            self.signer
+                .verify_response(&signature, request, status.as_u16(), body)
+        });
+        if !valid {
+            bail!("{addr} answered without a valid signature");
+        }
+        Ok(())
     }
 
     /// A chunk from another node's cache, if it has it.
@@ -336,23 +468,30 @@ impl Cluster {
         let response = self
             .client
             .get(format!("{}://{addr}{path_and_query}", self.scheme))
-            .header(sign::HEADER, signature)
+            .header(sign::HEADER, &signature)
             .headers(spans::trace_headers())
             .timeout(Duration::from_secs(30))
             .send()
             .await?;
-        match response.status() {
-            StatusCode::OK => Ok(Some(response.bytes().await?)),
-            StatusCode::NOT_FOUND => Ok(None),
-            status => bail!("{addr} answered {status}"),
+        let status = response.status();
+        if status != StatusCode::OK && status != StatusCode::NOT_FOUND {
+            bail!("{addr} answered {status}");
         }
+        let response_signature = response
+            .headers()
+            .get(sign::RESPONSE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.bytes().await?;
+        self.check_response(addr, &signature, response_signature, status, &bytes)?;
+        Ok((status == StatusCode::OK).then_some(bytes))
     }
 
     // r[impl cluster.share-metadata]
     // r[impl cluster.share-preload]
     // r[impl cluster.share-forgets]
     /// Pushes batches of cache events to the live nodes.
-    async fn broadcast(&self, mut events: mpsc::UnboundedReceiver<CacheEvent>) {
+    async fn broadcast(&self, mut events: mpsc::Receiver<CacheEvent>) {
         while let Some(event) = events.recv().await {
             let mut batch = vec![event];
             let deadline = tokio::time::sleep(Duration::from_millis(100));
@@ -411,7 +550,8 @@ impl Cluster {
             join_all(peers.into_iter().map(|(_, addr)| {
                 let body = body.clone();
                 async move {
-                    if let Err(error) = self.post(addr, "/cluster/updates", body).await {
+                    let timeout = self.failure_timeout / 2;
+                    if let Err(error) = self.post(addr, "/cluster/updates", body, timeout).await {
                         spans::record_error(&Span::current());
                         tracing::warn!(%addr, "sharing updates failed: {error:#}");
                     }
@@ -486,7 +626,7 @@ fn from_millis(millis: u64) -> SystemTime {
 pub async fn start(
     app: &Arc<App>,
     cluster: &Arc<Cluster>,
-    events: mpsc::UnboundedReceiver<CacheEvent>,
+    events: mpsc::Receiver<CacheEvent>,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let listener = tokio::net::TcpListener::bind(cluster.listen)
         .await
@@ -500,14 +640,20 @@ pub async fn start(
 
     let gossiping = cluster.clone();
     let broadcasting = cluster.clone();
-    let serving = match &cluster.tls {
-        Some(tls) => tokio::spawn(crate::tls::serve(listener, router, tls.clone(), "cluster")),
-        None => tokio::spawn(async move {
-            if let Err(error) = axum::serve(listener, router).await {
-                tracing::error!("cluster listener failed: {error}");
-            }
-        }),
-    };
+    let pull_queue = cluster
+        .pull_queue
+        .lock()
+        .expect("not poisoned")
+        .take()
+        .context("the cluster was already started")?;
+    let serving = tokio::spawn(crate::listen::serve(
+        listener,
+        router,
+        cluster.tls.clone(),
+        app.limits.clone(),
+        app.shutdown(),
+        "cluster",
+    ));
     Ok(vec![
         serving,
         tokio::spawn(async move {
@@ -519,35 +665,73 @@ pub async fn start(
             }
         }),
         tokio::spawn(async move { broadcasting.broadcast(events).await }),
+        tokio::spawn(pull_queued(app.clone(), cluster.clone(), pull_queue)),
     ])
 }
 
-/// Verifies a request's signature, answering 401 when it's missing or invalid.
 #[allow(
     clippy::result_large_err,
     reason = "the error is the response, as in axum"
 )]
+/// Verifies a request's signature, returning it, or answering 401 when it's missing or
+/// invalid.
 fn verify(
     cluster: &Cluster,
     method: &Method,
     uri: &Uri,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<(), Response> {
+) -> Result<String, Response> {
     let path_and_query = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
-    let valid = headers
+    let signature = headers
         .get(sign::HEADER)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|signature| {
-            cluster
-                .signer
-                .verify(signature, method.as_str(), path_and_query, body)
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED.into_response())
+        .and_then(|value| value.to_str().ok());
+    if let Some(signature) = signature
+        && cluster
+            .signer
+            .verify(signature, method.as_str(), path_and_query, body)
+    {
+        return Ok(signature.to_string());
     }
+    // r[impl cluster.clock-skew]
+    // Refused for a reason that's easy to miss otherwise: warned about, once a minute.
+    if let Some(skew) = signature.and_then(sign::skew) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = cluster.skew_warned.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 60
+            && cluster
+                .skew_warned
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                skew_secs = skew,
+                "refused a request from another node: its clock is {skew}s off this one's; \
+                 keep the nodes' clocks in sync, such as with NTP"
+            );
+        }
+    }
+    Err(StatusCode::UNAUTHORIZED.into_response())
+}
+
+// r[impl cluster.auth.responses]
+/// An answer to the request signed `request`, signed in turn.
+fn signed(cluster: &Cluster, request: &str, status: StatusCode, body: Bytes) -> Response {
+    let signature = cluster
+        .signer
+        .sign_response(request, status.as_u16(), &body);
+    (
+        status,
+        [
+            (sign::RESPONSE_HEADER, signature),
+            ("content-type", "application/json".to_string()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 #[allow(
@@ -571,15 +755,16 @@ async fn gossip(
         Ok(cluster) => cluster,
         Err(response) => return response,
     };
-    if let Err(response) = verify(cluster, &method, &uri, &headers, &body) {
-        return response;
-    }
+    let request = match verify(cluster, &method, &uri, &headers, &body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     match serde_json::from_slice::<Gossip>(&body) {
         Ok(gossip) => cluster.merge(gossip),
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     }
     let view = serde_json::to_vec(&cluster.view()).expect("serializable");
-    ([("content-type", "application/json")], view).into_response()
+    signed(cluster, &request, StatusCode::OK, view.into())
 }
 
 /// A span of a request from another node, continuing its trace.
@@ -618,9 +803,10 @@ async fn receive_updates(
         Ok(cluster) => cluster.clone(),
         Err(response) => return response,
     };
-    if let Err(response) = verify(&cluster, &method, &uri, &headers, &body) {
-        return response;
-    }
+    let request = match verify(&cluster, &method, &uri, &headers, &body) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     let Ok(mut updates) = serde_json::from_slice::<Updates>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -635,18 +821,7 @@ async fn receive_updates(
         for wire in updates.preloaded {
             let shared = SharedMeta::from(wire);
             app.cache.apply_metadata(shared.clone()).await;
-            let app = app.clone();
-            let cluster = cluster.clone();
-            let origin = updates.origin;
-            let span = tracing::info_span!(
-                "cluster.pull",
-                hylla.backend = shared.backend,
-                hylla.object = Empty,
-            );
-            spans::record_object(&span, &shared.key);
-            tokio::spawn(
-                async move { pull(&app, &cluster, origin, shared).await }.instrument(span),
-            );
+            cluster.queue_pull(updates.origin, shared);
         }
     }
     // r[impl cluster.apply-forgets]
@@ -655,17 +830,86 @@ async fn receive_updates(
         app.cache
             .forget(&wire.backend, &ObjectPath::from(wire.key.as_str()));
     }
-    StatusCode::NO_CONTENT.into_response()
+    signed(&cluster, &request, StatusCode::NO_CONTENT, Bytes::new())
+}
+
+impl Cluster {
+    // r[impl cluster.queue]
+    /// Queues pulling an announced object, unless it's queued or being pulled already, or
+    /// the queue is full.
+    fn queue_pull(&self, origin: SocketAddr, shared: SharedMeta) {
+        let id = (
+            shared.backend.clone(),
+            shared.key.clone(),
+            shared.meta.etag.clone(),
+        );
+        if !self
+            .pulling
+            .lock()
+            .expect("not poisoned")
+            .insert(id.clone())
+        {
+            return;
+        }
+        let pull = Pull {
+            origin,
+            shared,
+            span: Span::current(),
+        };
+        if self.pulls.try_send(pull).is_err() {
+            self.pulling.lock().expect("not poisoned").remove(&id);
+            METRICS
+                .cluster_dropped
+                .add(1, &[KeyValue::new("hylla.kind", "pull")]);
+        }
+    }
+}
+
+/// Pulls queued objects, a few at a time, until the queue closes.
+async fn pull_queued(app: Arc<App>, cluster: Arc<Cluster>, mut queue: mpsc::Receiver<Pull>) {
+    let pulls = Arc::new(Semaphore::new(PULLS));
+    while let Some(Pull {
+        origin,
+        shared,
+        span: parent,
+    }) = queue.recv().await
+    {
+        let Ok(permit) = pulls.clone().acquire_owned().await else {
+            return;
+        };
+        let app = app.clone();
+        let cluster = cluster.clone();
+        let span = tracing::info_span!(
+            parent: &parent,
+            "cluster.pull",
+            hylla.backend = shared.backend,
+            hylla.object = Empty,
+        );
+        spans::record_object(&span, &shared.key);
+        tokio::spawn(
+            async move {
+                let id = (
+                    shared.backend.clone(),
+                    shared.key.clone(),
+                    shared.meta.etag.clone(),
+                );
+                pull(&app, &cluster, origin, shared).await;
+                cluster.pulling.lock().expect("not poisoned").remove(&id);
+                drop(permit);
+            }
+            .instrument(span),
+        );
+    }
 }
 
 // r[impl cluster.pull]
 /// Pulls the chunks of an object another node preloaded from it, falling back to the
 /// backend for chunks it can't provide.
 async fn pull(app: &App, cluster: &Cluster, origin: SocketAddr, shared: SharedMeta) {
-    let Ok(_permit) = cluster.pulls.acquire().await else {
+    // r[impl cache.no-etag]
+    let Some(etag) = shared.meta.etag.clone() else {
         return;
     };
-    let etag = shared.meta.etag.clone().unwrap_or_default();
     for index in 0..app.cache.chunk_count(shared.meta.size) {
         let key = ChunkKey {
             backend: shared.backend.clone(),
@@ -729,9 +973,10 @@ async fn serve_chunk(app: Arc<App>, method: Method, uri: Uri, headers: HeaderMap
         Ok(cluster) => cluster,
         Err(response) => return response,
     };
-    if let Err(response) = verify(cluster, &method, &uri, &headers, b"") {
-        return response;
-    }
+    let request = match verify(cluster, &method, &uri, &headers, b"") {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
     let Ok(query) = serde_urlencoded::from_str::<ChunkQuery>(uri.query().unwrap_or_default())
     else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -749,7 +994,66 @@ async fn serve_chunk(app: Arc<App>, method: Method, uri: Uri, headers: HeaderMap
         if cached.is_some() { "hit" } else { "miss" },
     );
     match cached {
-        Some(bytes) => bytes.into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        Some(bytes) => signed(cluster, &request, StatusCode::OK, bytes),
+        None => signed(cluster, &request, StatusCode::NOT_FOUND, Bytes::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use hylla_config::{ClusterShare, Interval};
+
+    use super::{Cluster, PULL_QUEUE};
+    use crate::cache::{ObjectMeta, SharedMeta};
+
+    fn shared(key: &str, etag: &str) -> SharedMeta {
+        SharedMeta {
+            backend: "assets".into(),
+            key: key.into(),
+            meta: ObjectMeta {
+                size: 1,
+                etag: Some(etag.into()),
+                last_modified: SystemTime::UNIX_EPOCH,
+                content_type: None,
+            },
+            fetched: SystemTime::now(),
+        }
+    }
+
+    // r[verify cluster.queue]
+    #[test]
+    fn announced_objects_are_queued_once_and_within_the_limit() {
+        let cluster = Cluster::new(&hylla_config::Cluster {
+            listen: "127.0.0.1:7946".parse().unwrap(),
+            advertise: None,
+            seeds: Vec::new(),
+            gossip_interval: Interval::from_secs(1),
+            failure_timeout: Interval::from_secs(10),
+            key: "a cluster key of at least thirty-two characters".into(),
+            tls: None,
+            share: ClusterShare::default(),
+        })
+        .unwrap();
+        assert_eq!(cluster.gossip_timeout, Duration::from_millis(2500));
+        let origin = "127.0.0.1:7947".parse().unwrap();
+        cluster.queue_pull(origin, shared("a", "1"));
+        // The same version again is pulled once; another version is pulled too.
+        cluster.queue_pull(origin, shared("a", "1"));
+        cluster.queue_pull(origin, shared("a", "2"));
+        for index in 0..PULL_QUEUE {
+            cluster.queue_pull(origin, shared(&format!("more/{index}"), "1"));
+        }
+        let mut queue = cluster.pull_queue.lock().unwrap().take().unwrap();
+        let mut queued = Vec::new();
+        while let Ok(pull) = queue.try_recv() {
+            queued.push((pull.shared.key, pull.shared.meta.etag.unwrap()));
+        }
+        assert_eq!(queued.len(), PULL_QUEUE);
+        assert_eq!(queued[0], ("a".to_string(), "1".to_string()));
+        assert_eq!(queued[1], ("a".to_string(), "2".to_string()));
+        // What didn't fit isn't marked as being pulled, so a later announcement queues it.
+        assert_eq!(cluster.pulling.lock().unwrap().len(), PULL_QUEUE);
     }
 }

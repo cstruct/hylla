@@ -329,6 +329,37 @@ config_tree! {
                 pub session_ttl: Interval,
             }>,
         }>,
+        // r[impl config.health]
+        /// Health checks for load balancers and orchestrators, on a listener of their own:
+        /// `/healthz` while the process runs, `/readyz` while it serves. Optional.
+        pub health: Option<pub struct Health {
+            /// The address to listen on, such as `0.0.0.0:8081`.
+            pub listen: SocketAddr,
+        }>,
+        // r[impl config.http]
+        /// Limits of every listener: the servers', the control plane's, the cluster's,
+        /// `serve_backends`' and the health checks'. Optional; every setting has a default.
+        #[facet(default)]
+        pub http: pub struct Http {
+            /// How long a client may take to send a request's headers, such as `10s`.
+            #[facet(default = Interval::from_secs(10))]
+            pub header_read_timeout: Interval,
+            /// How long a connection may go without sending or receiving anything, idle
+            /// between requests or stalled, before it's closed, such as `60s`. `0s` disables
+            /// it.
+            #[facet(default = Interval::from_secs(60))]
+            pub idle_timeout: Interval,
+            /// The most connections each listener has open at a time. Further ones wait to
+            /// be accepted.
+            #[facet(default = 10000)]
+            pub max_connections: u32,
+            /// On SIGTERM, how long requests in flight may take to finish before their
+            /// connections are closed, such as `20s`. Keep it below the time hylla is given
+            /// to stop, such as Kubernetes' `terminationGracePeriodSeconds`, so the cache is
+            /// written to disk before hylla is killed.
+            #[facet(default = Interval::from_secs(20))]
+            pub shutdown_timeout: Interval,
+        },
         // r[impl config.auth.verifiers]
         /// JWT verifiers by name, used by mappings' `auth`.
         #[facet(default)]
@@ -469,6 +500,26 @@ impl Default for ClusterShare {
     }
 }
 
+impl Default for Http {
+    fn default() -> Self {
+        Self {
+            header_read_timeout: Interval::from_secs(10),
+            idle_timeout: Interval::from_secs(60),
+            max_connections: 10000,
+            shutdown_timeout: Interval::from_secs(20),
+        }
+    }
+}
+
+impl Default for BackendTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Interval::from_secs(5),
+            request: Interval::from_secs(30),
+        }
+    }
+}
+
 impl Default for MemoryCache {
     fn default() -> Self {
         Self { capacity_mib: 256 }
@@ -499,6 +550,9 @@ pub enum Backend {
         access_key_id: String,
         #[config(secret)]
         secret_access_key: String,
+        /// How long requests to the backend may take.
+        #[facet(default)]
+        timeouts: BackendTimeouts,
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
@@ -512,6 +566,9 @@ pub enum Backend {
         endpoint: Option<String>,
         #[config(secret)]
         account_key: String,
+        /// How long requests to the backend may take.
+        #[facet(default)]
+        timeouts: BackendTimeouts,
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
@@ -526,9 +583,27 @@ pub enum Backend {
         /// The name of the backend on that node.
         backend: String,
         tls: HyllaTls,
+        /// How long requests to the backend may take.
+        #[facet(default)]
+        timeouts: BackendTimeouts,
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
+}
+
+// r[impl config.backends.timeouts]
+/// How long requests to a backend may take.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendTimeouts {
+    /// Connecting, such as `5s`.
+    #[facet(default = Interval::from_secs(5))]
+    pub connect: Interval,
+    /// A whole request, from sending it to reading the last byte of the response, such as
+    /// `30s`. A chunk must be fetched within it, and so must a listing for a refresh rule
+    /// from a `hylla` backend, which comes as one response.
+    #[facet(default = Interval::from_secs(30))]
+    pub request: Interval,
 }
 
 /// Mutual TLS with a `hylla` backend.
@@ -651,6 +726,15 @@ impl RefreshMode {
 }
 
 impl Backend {
+    /// How long requests to the backend may take.
+    pub fn timeouts(&self) -> &BackendTimeouts {
+        match self {
+            Backend::S3 { timeouts, .. }
+            | Backend::AzureBlob { timeouts, .. }
+            | Backend::Hylla { timeouts, .. } => timeouts,
+        }
+    }
+
     /// The backend's background refresh, if any.
     pub fn refresh(&self) -> Option<&Refresh> {
         match self {
