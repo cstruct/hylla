@@ -7,7 +7,7 @@
   against the release's `SHA256SUMS`.
 - **Docker images** for `linux/amd64` and `linux/arm64` are on Docker Hub as
   [`cstruct/hylla`](https://hub.docker.com/r/cstruct/hylla), tagged `latest` and by version,
-  such as `0.1.0` and `0.1`.
+  such as `1.0.0` and `1.0`.
 - **From source**: `cargo build --release -p hylla-server` builds `target/release/hylla`.
   Run `mise run ui` first to embed the control plane UI's hydration bundle, which the
   releases and images have.
