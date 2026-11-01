@@ -97,7 +97,11 @@ sessions), or signing in goes in circles. A restart signs everyone out of that n
 - Uploads larger than `max_upload_mib` are refused with 413. Uploads are passed on to the
   backend as they arrive, in parts once they're large, rather than held in memory.
 - Every change, and every refused or failed one, is logged with the `hylla::audit` target:
-  who made it, how they signed in, the path, the size of uploads and the outcome.
+  who made it, how they signed in, the path, the size of uploads and the outcome. So is
+  every failed sign-in.
+- An address with 10 failed sign-ins within a minute gets 429 until the minute has passed.
+  Passwords are checked a few at a time, away from the threads serving requests, so
+  guessing them can't slow down the public listeners.
 - After a change, the node forgets the object's cached metadata, and tells the other live
   nodes of a cluster to forget it too.
 

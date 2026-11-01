@@ -18,7 +18,7 @@ The image runs `hylla --config /etc/hylla/config.styx` as the distroless `nonroo
 (65532), without a shell:
 
 ```bash
-docker run -p 8080:8080 -p 8081:8081 \
+docker run --stop-timeout 30 -p 8080:8080 -p 8081:8081 \
   -v ./config.styx:/etc/hylla/config.styx:ro \
   -v ./secrets.styx:/etc/hylla/secrets.styx:ro \
   -v hylla-cache:/var/cache/hylla \
@@ -26,6 +26,10 @@ docker run -p 8080:8080 -p 8081:8081 \
 ```
 
 A disk cache at `/var/cache/hylla` must be writable by user 65532. A new named volume is.
+
+`--stop-timeout 30` gives hylla longer to stop than its `http.shutdown_timeout` of 20
+seconds, so it writes its memory cache to disk before Docker kills it, which it does after 10
+seconds by default. With Compose, set `stop_grace_period: 30s`.
 
 ## Sizing the cache
 
@@ -49,7 +53,16 @@ so a changed object is fetched again rather than served stale.
 
 - `stale_while_revalidate` serves past the TTL without waiting, checking in the background.
 - `stale_if_error` keeps serving cached objects past the TTL while the backend fails, for a
-  day by default.
+  day by default. A failed request to the backend is retried `timeouts.retries` times (2),
+  within `timeouts.request` (30 seconds), before the cached object is served. For a second
+  after that, or the metadata TTL if longer, the cached object is served without asking the
+  backend again.
+- Requests for the same object waiting on the backend share one request to it.
+- Missing objects are remembered for `not_found_ttl` (10 seconds), so requests for them
+  don't all reach the backend.
+- Objects keep the `Cache-Control`, `Content-Encoding`, `Content-Disposition` and
+  `Content-Language` they were stored with. A mapping's `cache_control` sets
+  `Cache-Control` for objects without one, and responses carry an `Age`.
 - Refresh rules check cached objects on a schedule, so they rarely need checking when
   they're requested, and preload objects before anyone asks for them.
 
@@ -73,9 +86,8 @@ The `http` section applies to every listener:
 
 - `header_read_timeout` (10 seconds) closes connections that don't send their headers in
   time.
-- `idle_timeout` (60 seconds) closes connections that send and receive nothing. It must be
-  longer than every backend's `timeouts.request`, since a request waiting on its backend
-  sends nothing.
+- `idle_timeout` (60 seconds) closes connections that send and receive nothing, while no
+  request on them is in flight.
 - `max_connections` (10000 per listener) leaves further connections waiting to be accepted.
 
 Backends' `timeouts` (5 seconds to connect, 30 seconds per request) keep a backend that

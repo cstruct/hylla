@@ -58,6 +58,7 @@ impl Node {
                         backend: "assets".into(),
                         rewrites: Vec::new(),
                         writable: false,
+                        cache_control: None,
                         auth: None,
                     }],
                 },
@@ -218,6 +219,22 @@ async fn headers_must_arrive_within_the_timeout() {
         response(&mut stream).await,
         Some((200, b"body {}".to_vec()))
     );
+}
+
+// r[verify server.limits]
+#[tokio::test]
+async fn requests_waiting_on_the_backend_are_not_idle() {
+    let node = Node::start(Http {
+        idle_timeout: Interval::from_secs(1),
+        ..http()
+    })
+    .await;
+    node.backend.delay(Duration::from_millis(2500));
+    let mut stream = node.connect().await;
+    stream.write_all(get("/app.css").as_bytes()).await.unwrap();
+    let (status, body) = response(&mut stream).await.expect("not closed as idle");
+    assert_eq!(status, 200);
+    assert_eq!(body, b"body {}");
 }
 
 // r[verify server.limits]

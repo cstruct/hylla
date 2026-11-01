@@ -51,6 +51,11 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
 
+      # Security advisories, licenses and sources of the dependencies, by deny.toml.
+      - name: Check dependencies
+        if: runner.os == 'Linux'
+        run: cargo deny --locked check
+
       - name: Lint
         if: runner.os == 'Linux'
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings

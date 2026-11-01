@@ -40,6 +40,7 @@ async fn node() -> Arc<App> {
         backend: "assets".into(),
         rewrites: Vec::new(),
         writable,
+        cache_control: None,
         auth: None,
     };
     let config = Config {

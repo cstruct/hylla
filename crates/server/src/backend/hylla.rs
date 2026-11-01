@@ -219,8 +219,16 @@ impl ObjectStore for HyllaStore {
             version: None,
         };
         let mut attributes = Attributes::new();
-        if let Some(content_type) = text(header::CONTENT_TYPE) {
-            attributes.insert(Attribute::ContentType, content_type.to_string().into());
+        for (name, attribute) in [
+            (header::CONTENT_TYPE, Attribute::ContentType),
+            (header::CACHE_CONTROL, Attribute::CacheControl),
+            (header::CONTENT_ENCODING, Attribute::ContentEncoding),
+            (header::CONTENT_DISPOSITION, Attribute::ContentDisposition),
+            (header::CONTENT_LANGUAGE, Attribute::ContentLanguage),
+        ] {
+            if let Some(value) = text(name) {
+                attributes.insert(attribute, value.to_string().into());
+            }
         }
         let payload = if options.head {
             stream::empty().boxed()

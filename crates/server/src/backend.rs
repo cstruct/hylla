@@ -5,7 +5,8 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Context;
 use hylla_config::{Backend, Config};
 use object_store::{
-    ClientOptions, ObjectStore, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
+    BackoffConfig, ClientOptions, ObjectStore, RetryConfig, aws::AmazonS3Builder,
+    azure::MicrosoftAzureBuilder,
 };
 
 /// The object stores of the configured backends, by backend name.
@@ -32,6 +33,14 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
     let client = ClientOptions::new()
         .with_connect_timeout(timeouts.connect.duration())
         .with_timeout(timeouts.request.duration());
+    // r[impl backend.retries]
+    // Few retries, within the request timeout: object_store's own default retries for three
+    // minutes, which clients would wait through before getting a stale object.
+    let retry = RetryConfig {
+        backoff: BackoffConfig::default(),
+        max_retries: timeouts.retries as usize,
+        retry_timeout: timeouts.request.duration(),
+    };
     match backend {
         Backend::S3 {
             bucket,
@@ -46,7 +55,8 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
                 .with_region(region)
                 .with_access_key_id(access_key_id)
                 .with_secret_access_key(secret_access_key)
-                .with_client_options(client);
+                .with_client_options(client)
+                .with_retry(retry);
             if let Some(endpoint) = endpoint {
                 // S3 compatible stores are often reached over plain HTTP in development.
                 builder = builder
@@ -67,7 +77,8 @@ fn store(backend: &Backend) -> anyhow::Result<Arc<dyn ObjectStore>> {
                 .with_account(account)
                 .with_container_name(container)
                 .with_access_key(account_key)
-                .with_client_options(client);
+                .with_client_options(client)
+                .with_retry(retry);
             if let Some(endpoint) = endpoint {
                 // Such as Azurite's `http://127.0.0.1:10000/devstoreaccount1`: the endpoint
                 // is the account's URL, which blobs are addressed under as

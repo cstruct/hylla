@@ -26,24 +26,29 @@ enum Keys {
 }
 
 // r[impl auth.audience-warning]
+// r[impl auth.issuer-warning]
 /// What's worth warning about in the verifiers: those without an audience accept tokens
-/// their issuer made for anything else, such as other services' or ID tokens.
+/// their issuer made for anything else, such as other services' or ID tokens, and those
+/// reading a key set without an issuer accept tokens from anyone sharing it.
 fn warnings(verifiers: &HashMap<String, Verifier>) -> Vec<String> {
-    let mut names = verifiers
-        .iter()
-        .filter(|(_, verifier)| verifier.audience.is_none())
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>();
-    names.sort();
-    names
-        .into_iter()
-        .map(|name| {
-            format!(
+    let mut verifiers = verifiers.iter().collect::<Vec<_>>();
+    verifiers.sort_by_key(|(name, _)| *name);
+    let mut warnings = Vec::new();
+    for (name, verifier) in verifiers {
+        if verifier.audience.is_none() {
+            warnings.push(format!(
                 "auth verifier `{name}` has no `audience`, so it accepts any token signed with \
                  its key, also ones made for other services"
-            )
-        })
-        .collect()
+            ));
+        }
+        if verifier.public_key.is_none() && verifier.issuer.is_none() {
+            warnings.push(format!(
+                "auth verifier `{name}` has no `issuer`, so it accepts tokens from every issuer \
+                 signing with the keys at its `jwks_uri`"
+            ));
+        }
+    }
+    warnings
 }
 
 impl Verifiers {
@@ -319,5 +324,28 @@ mod tests {
         let warnings = super::warnings(&verifiers);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("`open` has no `audience`"));
+    }
+
+    // r[verify auth.issuer-warning]
+    #[test]
+    fn key_sets_without_an_issuer_are_warned_about() {
+        let verifier = |issuer: Option<&str>| Verifier {
+            algorithm: JwtAlgorithm::Es256,
+            public_key: None,
+            jwks_uri: Some("https://id.example.com/jwks".into()),
+            issuer: issuer.map(Into::into),
+            audience: Some("hylla".into()),
+            leeway: Interval::from_secs(30),
+        };
+        let verifiers = HashMap::from([
+            ("shared".to_string(), verifier(None)),
+            (
+                "scoped".to_string(),
+                verifier(Some("https://id.example.com")),
+            ),
+        ]);
+        let warnings = super::warnings(&verifiers);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("`shared` has no `issuer`"));
     }
 }

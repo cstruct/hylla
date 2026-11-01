@@ -45,8 +45,10 @@ pub(crate) fn record_paths() -> bool {
 /// Must run within a Tokio runtime, which gRPC exporters need, and before the app is built,
 /// so its instruments use the installed meter provider.
 pub fn init(config: &hylla_config::Telemetry) -> anyhow::Result<Telemetry> {
+    // r[impl telemetry.version]
     let resource = Resource::builder()
         .with_service_name(config.service_name.clone())
+        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
         .with_attributes(
             config
                 .resource
@@ -96,7 +98,8 @@ pub fn init(config: &hylla_config::Telemetry) -> anyhow::Result<Telemetry> {
     };
 
     // r[impl telemetry.logs]
-    let level = std::env::var("RUST_LOG").unwrap_or_else(|_| config.logs.level.clone());
+    let level =
+        log_directives(&std::env::var("RUST_LOG").unwrap_or_else(|_| config.logs.level.clone()));
     let filter = || {
         EnvFilter::builder()
             .parse(&level)
@@ -307,6 +310,19 @@ fn metadata(
     Ok(opentelemetry_otlp::tonic_types::metadata::MetadataMap::from_headers(map))
 }
 
+/// The log filter for a level: the level, keeping audit events at `info` unless it names
+/// their target itself, since a quieter level mustn't drop the record of changes.
+fn log_directives(level: &str) -> String {
+    if level.contains(crate::control::AUDIT_TARGET) {
+        level.to_string()
+    } else {
+        format!(
+            "{},{level}",
+            format_args!("{}=info", crate::control::AUDIT_TARGET)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use hylla_config::{Otlp, OtlpProtocol};
@@ -317,7 +333,21 @@ mod tests {
     };
     use opentelemetry_sdk::trace::{SamplingDecision, ShouldSample};
 
-    use super::{endpoint, sampler};
+    use super::{endpoint, log_directives, sampler};
+
+    // r[verify telemetry.logs]
+    #[test]
+    fn audit_events_are_kept_at_quieter_levels() {
+        assert_eq!(log_directives("warn"), "hylla::audit=info,warn");
+        assert_eq!(
+            log_directives("warn,hylla::audit=off"),
+            "warn,hylla::audit=off"
+        );
+        let filter = tracing_subscriber::EnvFilter::builder()
+            .parse(log_directives("error"))
+            .unwrap();
+        assert!(filter.to_string().contains("hylla::audit=info"));
+    }
 
     // r[verify telemetry.traces.sampling]
     #[test]

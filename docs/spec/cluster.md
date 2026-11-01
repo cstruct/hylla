@@ -8,7 +8,10 @@ split the cache between them.
 
 r[cluster.membership]
 Nodes MUST gossip their member lists, with a heartbeat per node, over the cluster listener.
-A node whose heartbeat hasn't advanced for the failure timeout MUST be considered gone.
+A node whose heartbeat hasn't advanced for the failure timeout MUST be considered gone,
+counting from when the node it was learned from last saw it advance, not from when it was
+learned of. Members at this node's address, or at another member's address with an earlier
+start, MUST be dropped as earlier runs.
 
 r[cluster.seeds]
 A node MUST gossip with its seeds as well as the live nodes, resolving seed names again on
@@ -37,6 +40,10 @@ Every answer to a request between nodes MUST be signed with the cluster key too,
 the request's signature, its status and its body, and answers with a missing or invalid
 signature MUST be refused, so no one on the network path can add members or serve chunks,
 with TLS or without.
+
+r[cluster.connection-limits]
+The cluster listener MUST accept at most 64 connections from one address at a time,
+refusing more, so one client can't take the connections the nodes need.
 
 r[cluster.tls]
 With TLS configured, the cluster listener MUST only accept TLS connections, and nodes MUST
@@ -76,6 +83,15 @@ whatever sharing is turned off, so they forget their metadata too.
 r[cluster.apply-forgets]
 A node MUST forget the metadata of objects another node announces as changed, after applying
 the metadata in the same update, so metadata fetched before the change doesn't stay.
+
+r[cluster.forget-tombstones]
+A node MUST remember when it last forgot an object's metadata, and MUST NOT apply metadata
+from another node fetched before then, so a slow or replayed update can't bring back a
+changed or deleted object.
+
+r[cluster.forget-retries]
+Forgets that fail to reach a live node MUST be sent to it again, up to three attempts in all,
+with backoff.
 
 r[cluster.reannounce]
 Preload runs MUST announce unchanged objects too, so nodes that joined later catch up on the

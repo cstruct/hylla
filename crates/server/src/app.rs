@@ -37,6 +37,8 @@ use crate::{
 pub struct App {
     pub(crate) cache: Arc<ObjectCache>,
     pub(crate) stores: Stores,
+    /// Whether public requests continue their callers' traces.
+    follow_callers: bool,
     /// The cluster this node shares with, if any.
     pub(crate) cluster: Option<Arc<Cluster>>,
     /// The backends this node serves to other nodes, if any.
@@ -71,6 +73,8 @@ struct Server {
     name: String,
     /// The path prefix of each mapping, by mapping index, for metrics.
     prefixes: Vec<String>,
+    /// The `Cache-Control` of each mapping's objects without one, by mapping index.
+    cache_controls: Vec<Option<String>>,
     names: Vec<String>,
     router: MappingRouter,
     /// The auth of each mapping, by mapping index.
@@ -110,6 +114,11 @@ impl App {
                         .mappings
                         .iter()
                         .map(|mapping| mapping.path_prefix.clone())
+                        .collect(),
+                    cache_controls: server
+                        .mappings
+                        .iter()
+                        .map(|mapping| mapping.cache_control.clone())
                         .collect(),
                     names: server
                         .server_names
@@ -188,6 +197,7 @@ impl App {
         Ok(Arc::new(Self {
             cache,
             stores,
+            follow_callers: config.telemetry.traces.follow_callers,
             _gauges: gauges,
             cluster,
             upstream,
@@ -416,8 +426,12 @@ impl App {
     }
 
     // r[impl server.hosts]
-    fn server(&self, listen: SocketAddr, headers: &HeaderMap) -> Option<&Server> {
-        let host = headers.get(header::HOST)?.to_str().ok()?;
+    fn server(&self, listen: SocketAddr, request: &Request) -> Option<&Server> {
+        // HTTP/2 requests carry their host in `:authority`, which ends up in the URI.
+        let host = match request.headers().get(header::HOST) {
+            Some(host) => host.to_str().ok()?,
+            None => request.uri().host()?,
+        };
         // Strip the port, keeping bracketed IPv6 addresses intact.
         let host = match host.rsplit_once(':') {
             Some((name, port)) if !port.contains(']') => name,
@@ -449,20 +463,28 @@ struct RequestLabels {
 // r[impl telemetry.traces.requests]
 async fn handle(State(listener): State<Listener>, request: Request) -> Response {
     let started = std::time::Instant::now();
-    let method = request.method().clone();
+    // Anyone can make up methods, so other ones share one name and series.
+    let method = match *request.method() {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        _ => "_OTHER",
+    };
     // The span lasts until the body is sent, which holds it.
     let span = tracing::info_span!(
         "request",
-        otel.name = method.as_str(),
+        otel.name = method,
         otel.kind = "server",
         otel.status_code = Empty,
-        http.request.method = method.as_str(),
+        http.request.method = method,
         http.response.status_code = Empty,
         url.path = Empty,
         hylla.server = Empty,
         hylla.mapping = Empty,
     );
-    spans::continue_trace(&span, request.headers());
+    // r[impl telemetry.traces.propagation]
+    if listener.app.follow_callers {
+        spans::continue_trace(&span, request.headers());
+    }
     if telemetry::record_paths() {
         span.record("url.path", request.uri().path());
     }
@@ -476,7 +498,7 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
         spans::record_error(&span);
     }
     let mut attributes = vec![
-        KeyValue::new("http.request.method", method.to_string()),
+        KeyValue::new("http.request.method", method),
         KeyValue::new("http.response.status_code", i64::from(status.as_u16())),
     ];
     if let Some(server) = labels.server {
@@ -488,10 +510,31 @@ async fn handle(State(listener): State<Listener>, request: Request) -> Response 
         span.record("hylla.mapping", mapping.as_str());
         attributes.push(KeyValue::new("hylla.mapping", mapping));
     }
-    METRICS
-        .requests
-        .record(metrics::seconds(started.elapsed()), &attributes);
-    response
+    // Recorded once the body is sent, or dropped, as when the client goes away.
+    let recorded = Recorded {
+        started,
+        attributes,
+    };
+    response.map(|body| {
+        Body::from_stream(body.into_data_stream().map(move |chunk| {
+            let _recorded = &recorded;
+            chunk
+        }))
+    })
+}
+
+/// Records a request's duration when dropped, with its body.
+struct Recorded {
+    started: std::time::Instant,
+    attributes: Vec<KeyValue>,
+}
+
+impl Drop for Recorded {
+    fn drop(&mut self) {
+        METRICS
+            .requests
+            .record(metrics::seconds(self.started.elapsed()), &self.attributes);
+    }
 }
 
 async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabels) -> Response {
@@ -508,7 +551,7 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
         }
     };
     let app = &listener.app;
-    let Some(server) = app.server(listener.listen, request.headers()) else {
+    let Some(server) = app.server(listener.listen, &request) else {
         return (StatusCode::NOT_FOUND, "unknown host\n").into_response();
     };
     labels.server = Some(server.name.clone());
@@ -556,7 +599,20 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
             return StatusCode::NOT_FOUND.into_response();
         }
         let path = ObjectPath::from(key);
-        serve_object(app, route.backend, store, path, request_headers, head).await
+        let cache_control = server
+            .cache_controls
+            .get(route.mapping)
+            .and_then(Option::as_deref);
+        serve_object(
+            app,
+            route.backend,
+            store,
+            path,
+            request_headers,
+            head,
+            cache_control,
+        )
+        .await
     }
     .await;
     mark_private(response, private)
@@ -567,9 +623,30 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
 /// to others.
 fn mark_private(mut response: Response, private: bool) -> Response {
     if private {
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("private"));
+        let headers = response.headers_mut();
+        // The object's other directives still hold, such as how long it may be kept.
+        let others = headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|directive| {
+                        !directive.is_empty()
+                            && !directive.eq_ignore_ascii_case("public")
+                            && !directive.eq_ignore_ascii_case("private")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let value = if others.is_empty() {
+            "private".to_string()
+        } else {
+            format!("private, {others}")
+        };
+        headers.insert(header::CACHE_CONTROL, header_value(&value));
     }
     response
 }
@@ -581,7 +658,44 @@ pub(crate) async fn serve_object(
     path: ObjectPath,
     request_headers: &HeaderMap,
     head: bool,
+    cache_control: Option<&str>,
 ) -> Response {
+    let serve = || {
+        serve_version(
+            app,
+            backend,
+            store,
+            path.clone(),
+            request_headers,
+            head,
+            cache_control,
+        )
+    };
+    match serve().await {
+        Ok(response) => response,
+        // r[impl server.changed]
+        // Its metadata is forgotten, so it's fetched anew.
+        Err(changed) => {
+            tracing::debug!(backend, %path, "the object changed, serving it again: {changed:#}");
+            serve().await.unwrap_or_else(|error| {
+                tracing::warn!(backend, %path, "the object keeps changing: {error:#}");
+                StatusCode::BAD_GATEWAY.into_response()
+            })
+        }
+    }
+}
+
+/// Serves the version of an object whose metadata is cached, or fails when it changed
+/// before anything was sent.
+async fn serve_version(
+    app: &Arc<App>,
+    backend: &str,
+    store: &Arc<dyn object_store::ObjectStore>,
+    path: ObjectPath,
+    request_headers: &HeaderMap,
+    head: bool,
+    cache_control: Option<&str>,
+) -> Result<Response, anyhow::Error> {
     let route_backend = backend;
 
     let meta = match app
@@ -589,14 +703,22 @@ pub(crate) async fn serve_object(
         .metadata(route_backend, store.clone(), &path)
         .await
     {
-        Ok(meta) => meta,
-        Err(ReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
-        Err(ReadError::Backend(error)) => {
+        Ok(found) => found,
+        Err(ReadError::NotFound) => return Ok(StatusCode::NOT_FOUND.into_response()),
+        Err(ReadError::Backend(error) | ReadError::Changed(error)) => {
             tracing::warn!(backend = route_backend, %path, "metadata: {error:#}");
-            return StatusCode::BAD_GATEWAY.into_response();
+            return Ok(StatusCode::BAD_GATEWAY.into_response());
         }
     };
+    let (meta, age) = meta;
     let mut headers = object_headers(&meta);
+    // r[impl server.cache-control]
+    if !headers.contains_key(header::CACHE_CONTROL)
+        && let Some(cache_control) = cache_control
+    {
+        headers.insert(header::CACHE_CONTROL, header_value(cache_control));
+    }
+    headers.insert(header::AGE, HeaderValue::from(age.as_secs()));
 
     // r[impl server.if-match]
     if let Some(if_match) = request_headers.get(header::IF_MATCH) {
@@ -607,7 +729,7 @@ pub(crate) async fn serve_object(
             })
         });
         if !matches {
-            return (StatusCode::PRECONDITION_FAILED, headers).into_response();
+            return Ok((StatusCode::PRECONDITION_FAILED, headers).into_response());
         }
     }
 
@@ -620,12 +742,28 @@ pub(crate) async fn serve_object(
                 .any(|tag| tag.trim() == etag || tag.trim() == "*")
         })
     {
-        return (StatusCode::NOT_MODIFIED, headers).into_response();
+        return Ok((StatusCode::NOT_MODIFIED, headers).into_response());
     }
 
+    // r[impl server.if-range]
+    let if_range_matches = request_headers
+        .get(header::IF_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|if_range| {
+            let if_range = if_range.trim();
+            if if_range.starts_with('"') || if_range.starts_with("W/") {
+                // Strong comparison: weak ETags never match.
+                !if_range.starts_with("W/") && meta.etag.as_deref() == Some(if_range)
+            } else {
+                headers
+                    .get(header::LAST_MODIFIED)
+                    .is_some_and(|modified| modified.as_bytes() == if_range.as_bytes())
+            }
+        });
     let range = range::parse(
         request_headers
             .get(header::RANGE)
+            .filter(|_| if_range_matches)
             .and_then(|value| value.to_str().ok()),
         meta.size,
     );
@@ -641,7 +779,7 @@ pub(crate) async fn serve_object(
                 header::CONTENT_RANGE,
                 header_value(&format!("bytes */{}", meta.size)),
             );
-            return (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response();
+            return Ok((StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response());
         }
     };
     headers.insert(
@@ -650,7 +788,7 @@ pub(crate) async fn serve_object(
     );
     // r[impl server.head]
     if head || range.is_empty() {
-        return (status, headers).into_response();
+        return Ok((status, headers).into_response());
     }
 
     // r[impl server.get]
@@ -675,21 +813,31 @@ pub(crate) async fn serve_object(
     // Read the first chunk before answering, so failures can still be reported as 502.
     let first_bytes = match read.clone()(first).await {
         Ok(bytes) => bytes,
-        Err(ReadError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(ReadError::NotFound) => return Ok(StatusCode::NOT_FOUND.into_response()),
+        Err(ReadError::Changed(error)) => return Err(error),
         Err(ReadError::Backend(error)) => {
             tracing::warn!(backend = route_backend, %path, "chunk {first}: {error:#}");
-            return StatusCode::BAD_GATEWAY.into_response();
+            return Ok(StatusCode::BAD_GATEWAY.into_response());
         }
     };
-    let rest = stream::iter(chunks.skip(1)).then(read).map(|chunk| {
-        chunk.map_err(|error| match error {
-            ReadError::NotFound => std::io::Error::other("object disappeared"),
-            ReadError::Backend(error) => std::io::Error::other(format!("{error:#}")),
-        })
-    });
+    // r[impl server.read-ahead]
+    let rest = stream::iter(chunks.skip(1))
+        .map(read)
+        .buffered(READ_AHEAD)
+        .map(|chunk| {
+            chunk.map_err(|error| match error {
+                ReadError::NotFound => std::io::Error::other("object disappeared"),
+                ReadError::Backend(error) | ReadError::Changed(error) => {
+                    std::io::Error::other(format!("{error:#}"))
+                }
+            })
+        });
     let body = stream::once(async move { Ok(first_bytes) }).chain(rest);
-    (status, headers, Body::from_stream(body)).into_response()
+    Ok((status, headers, Body::from_stream(body)).into_response())
 }
+
+/// How many chunks after the one being sent are read at the same time.
+const READ_AHEAD: usize = 4;
 
 /// Reads the chunks of a response, trimmed to the requested range.
 struct ChunkReader {
@@ -742,6 +890,20 @@ fn object_headers(meta: &ObjectMeta) -> HeaderMap {
         .as_deref()
         .unwrap_or("application/octet-stream");
     headers.insert(header::CONTENT_TYPE, header_value(content_type));
+    let stored = &meta.headers;
+    for (name, value) in [
+        (header::CACHE_CONTROL, &stored.cache_control),
+        (header::CONTENT_ENCODING, &stored.content_encoding),
+        (header::CONTENT_DISPOSITION, &stored.content_disposition),
+        (header::CONTENT_LANGUAGE, &stored.content_language),
+    ] {
+        if let Some(value) = value
+            .as_deref()
+            .and_then(|value| HeaderValue::from_str(value).ok())
+        {
+            headers.insert(name, value);
+        }
+    }
     headers
 }
 

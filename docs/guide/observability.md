@@ -18,6 +18,8 @@ telemetry {
 }
 ```
 
+Every signal carries hylla's version as `service.version`, which it also logs at startup.
+
 Over HTTP, the signal's path, such as `/v1/metrics`, is added to `otlp.endpoint`. Each
 signal can go elsewhere with its own `endpoint`, used as is, such as Prometheus' OTLP
 receiver at `http://prometheus:9090/api/v1/otlp/v1/metrics`. API keys go in `otlp.headers`,
@@ -32,7 +34,7 @@ Attributes never include object keys or request paths, so cardinality stays low.
 
 | Metric | Attributes | |
 |---|---|---|
-| `http.server.request.duration` | method, status code, `hylla.server`, `hylla.mapping` (its prefix) | Every request, until its body is sent |
+| `http.server.request.duration` | method (`_OTHER` for other than `GET` and `HEAD`), status code, `hylla.server`, `hylla.mapping` (its prefix) | Every request, until its body is sent |
 | `hylla.served.bytes` | `hylla.backend` | Object bytes sent to clients |
 | `hylla.cache.chunks` | `hylla.backend`, `hylla.result`: `hit`, `miss`, `error`, `uncacheable` | Chunk lookups |
 | `hylla.cache.metadata` | `hylla.backend`, `hylla.result`: `fresh`, `fetched`, `stale_while_revalidate`, `stale_if_error`, `not_found`, `error` | Metadata lookups |
@@ -65,8 +67,10 @@ lookups, and a client span for every backend request. Refresh runs, background
 revalidations, and sharing between cluster nodes are traced too, across nodes. Gossip
 isn't.
 
-- Requests with a W3C `traceparent` header continue the caller's trace, and follow its
-  sampling decision. Of the traces hylla starts, `sample_ratio` are sampled.
+- With `follow_callers`, requests with a W3C `traceparent` header continue the caller's
+  trace, and follow its sampling decision. It's off by default, since anyone can send one.
+  Requests between nodes continue their traces either way. Of the traces hylla starts,
+  `sample_ratio` are sampled.
 - Paths aren't recorded in spans unless `record_paths` is on, since they can tell more than
   they should, such as who a tenant is.
 
@@ -78,7 +82,8 @@ with the trace and span IDs when it's traced. With `export`, logs are sent over 
 
 Targets worth knowing:
 
-- `hylla::audit`: changes made through the control plane, see
-  [Control plane](control-plane.md#safety).
+- `hylla::audit`: changes made through the control plane, and failed sign-ins, see
+  [Control plane](control-plane.md#safety). They're kept at `info` whatever `logs.level`
+  says, unless it names the target, such as `warn,hylla::audit=off`.
 - `hylla_server`: everything else hylla logs: listeners starting, backend failures, refresh
   runs, cluster problems.

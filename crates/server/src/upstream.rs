@@ -151,6 +151,7 @@ async fn object(
             path,
             &headers,
             method == Method::HEAD,
+            None,
         )
         .await
     }

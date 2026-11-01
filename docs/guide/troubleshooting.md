@@ -99,4 +99,5 @@ In the Docker image, hylla runs as user 65532, which must be able to write
 hylla gives requests `http.shutdown_timeout` to finish before writing its cache to disk.
 If whatever stops it, such as Kubernetes, kills it sooner, the memory cache isn't written.
 Give it longer than the shutdown timeout, such as `terminationGracePeriodSeconds: 30` for
-the default 20 seconds.
+the default 20 seconds, or `docker run --stop-timeout 30`: Docker kills containers after 10
+seconds by default.

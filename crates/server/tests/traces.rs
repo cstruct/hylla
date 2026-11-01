@@ -31,6 +31,8 @@ use tower::ServiceExt;
 const KEY: &str = "a cluster key of at least thirty-two characters";
 const TRACE_ID: &str = "0af7651916cd43dd8448eb211c80319c";
 const PARENT_ID: &str = "b7ad6b7169203331";
+/// A trace a caller names to a node that doesn't follow callers.
+const IGNORED_TRACE_ID: &str = "1bf7651916cd43dd8448eb211c80319d";
 
 #[derive(Clone, Default)]
 struct Collector {
@@ -123,6 +125,7 @@ fn config(cluster: Option<Cluster>) -> Config {
                     backend: "assets".into(),
                     rewrites: Vec::new(),
                     writable: false,
+                    cache_control: None,
                     auth: None,
                 }],
             },
@@ -155,7 +158,13 @@ fn config(cluster: Option<Cluster>) -> Config {
             ..Cache::default()
         },
         auth: HashMap::new(),
-        telemetry: Default::default(),
+        telemetry: Telemetry {
+            traces: TracesExport {
+                follow_callers: true,
+                ..TracesExport::default()
+            },
+            ..Telemetry::default()
+        },
         control: None,
         serve_backends: None,
         health: None,
@@ -211,6 +220,7 @@ async fn traces_are_exported_over_otlp() {
             traces: TracesExport {
                 enabled: true,
                 record_paths: true,
+                follow_callers: true,
                 ..TracesExport::default()
             },
             ..Telemetry::default()
@@ -229,8 +239,31 @@ async fn traces_are_exported_over_otlp() {
         StatusCode::OK
     );
 
+    // r[verify telemetry.traces.propagation]
+    // A node that doesn't follow callers starts traces of its own.
+    let mut ignoring = config(None);
+    ignoring.telemetry.traces.follow_callers = false;
+    let stores = HashMap::from([("assets".to_string(), store.clone() as Arc<dyn ObjectStore>)]);
+    let ignoring = App::new(&ignoring, stores).await.unwrap();
+    let ignored = format!("00-{IGNORED_TRACE_ID}-{PARENT_ID}-01");
+    assert_eq!(
+        request(&ignoring, "/app.css", Some(&ignored)).await,
+        StatusCode::OK
+    );
+
     let spans = spans(&telemetry, &collector).await;
-    let requests = named(&spans, "GET /");
+    let all_requests = named(&spans, "GET /");
+    assert_eq!(all_requests.len(), 2);
+    let own = all_requests
+        .iter()
+        .find(|span| hex(&span.trace_id) != TRACE_ID)
+        .unwrap();
+    assert_ne!(hex(&own.trace_id), IGNORED_TRACE_ID);
+    assert!(own.parent_span_id.is_empty());
+    let requests = all_requests
+        .into_iter()
+        .filter(|span| hex(&span.trace_id) == TRACE_ID)
+        .collect::<Vec<_>>();
     assert_eq!(
         requests.len(),
         1,

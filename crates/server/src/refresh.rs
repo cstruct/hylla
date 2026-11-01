@@ -224,7 +224,9 @@ async fn handle(
                         match cache.fetch_metadata(backend, store.as_ref(), &path).await {
                             Ok(_) => Outcome::Changed,
                             Err(ReadError::NotFound) => Outcome::Removed,
-                            Err(ReadError::Backend(error)) => Outcome::Failed(path, error),
+                            Err(ReadError::Backend(error) | ReadError::Changed(error)) => {
+                                Outcome::Failed(path, error)
+                            }
                         }
                     }
                     Action::Preload => {
@@ -232,7 +234,9 @@ async fn handle(
                         {
                             Ok(meta) => meta,
                             Err(ReadError::NotFound) => return Outcome::Removed,
-                            Err(ReadError::Backend(error)) => return Outcome::Failed(path, error),
+                            Err(ReadError::Backend(error) | ReadError::Changed(error)) => {
+                                return Outcome::Failed(path, error);
+                            }
                         };
                         match cache.preload(backend, store, &path, &meta).await {
                             Ok(bytes) => {
@@ -240,7 +244,9 @@ async fn handle(
                                 Outcome::Preloaded(bytes)
                             }
                             Err(ReadError::NotFound) => Outcome::Removed,
-                            Err(ReadError::Backend(error)) => Outcome::Failed(path, error),
+                            Err(ReadError::Backend(error) | ReadError::Changed(error)) => {
+                                Outcome::Failed(path, error)
+                            }
                         }
                     }
                 }

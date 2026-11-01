@@ -75,8 +75,11 @@ impl Provider {
     pub fn new(source: Source) -> anyhow::Result<Self> {
         Ok(Self {
             source,
+            // r[impl auth.provider-https]
+            // Redirects could lead anywhere, such as to plain HTTP.
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             said: RwLock::default(),
             tried: Mutex::default(),
@@ -186,6 +189,9 @@ impl Provider {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
+        if !hylla_config::is_secure_url(url) {
+            bail!("{url} isn't an HTTPS URL, or an HTTP one to this host");
+        }
         let response = self.client.get(url).send().await?;
         let status = response.status();
         if !status.is_success() {

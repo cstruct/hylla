@@ -53,6 +53,7 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)], auth: Option<MappingAut
             })
             .collect(),
         writable: false,
+        cache_control: None,
         auth,
     }
 }
@@ -555,6 +556,8 @@ impl SigningKey {
 struct KeysState {
     /// The issuer the discovery document says.
     issuer: String,
+    /// The `jwks_uri` the discovery document says, instead of the provider's own.
+    jwks_uri: Option<String>,
     keys: Vec<Value>,
     down: bool,
     discovery_reads: usize,
@@ -578,10 +581,13 @@ impl Keys {
             if state.down {
                 return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
-            Ok(Json(json!({
-                "issuer": state.issuer,
-                "jwks_uri": format!("{}/jwks", state.issuer),
-            })))
+            let jwks_uri = state
+                .jwks_uri
+                .clone()
+                .unwrap_or_else(|| format!("{}/jwks", state.issuer));
+            Ok(Json(
+                json!({ "issuer": state.issuer, "jwks_uri": jwks_uri }),
+            ))
         }
         async fn jwks(
             State(state): State<Arc<Mutex<KeysState>>>,
@@ -608,6 +614,10 @@ impl Keys {
         let router = Router::new()
             .route("/.well-known/openid-configuration", route_get(discovery))
             .route("/jwks", route_get(jwks))
+            .route(
+                "/moved",
+                route_get(|| async { axum::response::Redirect::temporary("/jwks") }),
+            )
             .with_state(state.clone());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         Self {
@@ -789,4 +799,50 @@ async fn tokens_are_checked_with_the_key_they_name() {
     let claims = json!({ "sub": "acme", "aud": "hylla", "iss": keys.url });
     let response = get_with(&app, "/tenant/acme/report.pdf", &a.sign(None, claims)).await;
     assert_eq!(response.status, StatusCode::OK);
+}
+
+// r[verify auth.private]
+#[tokio::test]
+async fn private_responses_keep_the_other_cache_directives() {
+    let mut mapping = mapping("/", &[], auth("partners", &[]));
+    mapping.cache_control = Some("public, max-age=60".into());
+    let app = app(vec![mapping], verifiers(verifier(None, None))).await;
+    let response = get_with(&app, "/public/app.css", &valid(json!({}))).await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        header(&response, header::CACHE_CONTROL),
+        Some("private, max-age=60")
+    );
+}
+
+// r[verify auth.provider-https]
+#[tokio::test]
+async fn keys_are_only_read_over_https_without_redirects() {
+    let key = SigningKey::new("a");
+    let claims = |keys: &Keys| json!({ "sub": "acme", "aud": "hylla", "iss": keys.url });
+
+    // A discovery document pointing at keys over plain HTTP elsewhere.
+    let keys = Keys::start(vec![key.jwk.clone()]).await;
+    keys.state.lock().unwrap().jwks_uri = Some("http://keys.example.com/jwks".into());
+    let app = provider_app(keys.verifier()).await;
+    let token = key.sign(Some("a"), claims(&keys));
+    assert_eq!(
+        get_with(&app, "/tenant/acme/report.pdf", &token)
+            .await
+            .status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // Keys behind a redirect.
+    let keys = Keys::start(vec![key.jwk.clone()]).await;
+    keys.state.lock().unwrap().jwks_uri = Some(format!("{}/moved", keys.url));
+    let app = provider_app(keys.verifier()).await;
+    let token = key.sign(Some("a"), claims(&keys));
+    assert_eq!(
+        get_with(&app, "/tenant/acme/report.pdf", &token)
+            .await
+            .status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(keys.reads(), (1, 0));
 }

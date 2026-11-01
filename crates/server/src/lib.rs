@@ -47,6 +47,8 @@ pub async fn serve(
         let shutdown = listen::Shutdown::new(&stopping);
         (stopping, shutdown)
     };
+    // r[impl telemetry.version]
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting hylla");
     let mut background = Vec::new();
     if let Some(listen) = app.health {
         let listener = TcpListener::bind(listen)

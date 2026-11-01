@@ -6,6 +6,8 @@ rust = { version = "1.99.0", components = "rustfmt,clippy", targets = "wasm32-un
 # Binds the control plane UI's WASM bundle, see `mise run ui`. It must match the
 # wasm-bindgen crate in crates/control exactly.
 "github:wasm-bindgen/wasm-bindgen" = "0.2.128"
+# Checks the dependencies for security advisories, licenses and sources, see deny.toml.
+"github:EmbarkStudios/cargo-deny" = "0.19.9"
 
 # Tools for the end-to-end tests, see `mise run e2e`.
 # An S3 compatible gateway serving a local directory, from its GitHub releases.
@@ -14,6 +16,10 @@ rust = { version = "1.99.0", components = "rustfmt,clippy", targets = "wasm32-un
 # package, so it's installed with mise's npm backend.
 node = "24"
 "npm:azurite" = "3.37.0"
+
+[tasks.deny]
+description = "Check the dependencies for security advisories, licenses and sources"
+run = "cargo deny --locked check"
 
 [tasks.e2e]
 description = "Run the end-to-end tests against VersityGW and Azurite"

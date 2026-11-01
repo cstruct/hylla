@@ -113,6 +113,7 @@ async fn node_with(
                     backend: "assets".into(),
                     rewrites: Vec::new(),
                     writable: control.is_some(),
+                    cache_control: None,
                     auth: None,
                 }],
             },

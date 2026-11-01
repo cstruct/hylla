@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -17,7 +17,7 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{any, get, post, put},
@@ -34,6 +34,7 @@ use object_store::{
     ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart, path::Path as ObjectPath,
 };
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
 use crate::{
     App,
@@ -50,6 +51,15 @@ struct Bundle;
 
 /// How long a verified password is remembered, so argon2 doesn't run for every request.
 const VERIFIED_FOR: Duration = Duration::from_secs(600);
+/// The log target of audit events.
+pub(crate) const AUDIT_TARGET: &str = "hylla::audit";
+/// How many failed sign-ins a client address may have within `FAILURE_WINDOW`.
+const MAX_FAILURES: u32 = 10;
+const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// How many client addresses' failures are remembered.
+const MAX_FAILING_CLIENTS: usize = 10_000;
+/// How many passwords are checked at a time, each with argon2's memory.
+const HASHING: usize = 4;
 
 /// The control plane's settings, with its users' password hashes checked.
 pub struct ControlSettings {
@@ -61,6 +71,18 @@ pub struct ControlSettings {
     verified: Mutex<HashMap<Vec<u8>, (Instant, String)>>,
     /// Signing in through an OpenID provider, if configured.
     oidc: Option<Oidc>,
+    /// Failed sign-ins by client address: since when, and how many.
+    failures: Mutex<HashMap<Option<IpAddr>, (Instant, u32)>>,
+    /// Held while checking a password.
+    hashing: Semaphore,
+}
+
+/// What checking an `Authorization` header found.
+enum Checked {
+    User(String),
+    Refused,
+    /// Too many failed sign-ins from the client: try again after this long.
+    Limited(Duration),
 }
 
 impl ControlSettings {
@@ -81,12 +103,51 @@ impl ControlSettings {
                 .unwrap_or(usize::MAX),
             verified: Mutex::default(),
             oidc: config.oidc.as_ref().map(Oidc::new).transpose()?,
+            failures: Mutex::default(),
+            hashing: Semaphore::new(HASHING),
         })
+    }
+
+    // r[impl control.auth-limits]
+    /// Checks an `Authorization` header from `client`, unless the client failed too often.
+    async fn check(&self, authorization: &str, client: Option<IpAddr>) -> Checked {
+        let limited = {
+            let failures = self.failures.lock().expect("not poisoned");
+            failures.get(&client).and_then(|(since, count)| {
+                let left = FAILURE_WINDOW.checked_sub(since.elapsed())?;
+                (*count >= MAX_FAILURES).then_some(left)
+            })
+        };
+        if let Some(left) = limited {
+            return Checked::Limited(left);
+        }
+        if let Some(user) = self.verify(authorization).await {
+            return Checked::User(user);
+        }
+        let user = basic_user(authorization).unwrap_or_default();
+        tracing::warn!(
+            target: AUDIT_TARGET,
+            user,
+            client = client.map(|client| client.to_string()),
+            "refused a sign-in: wrong user name or password"
+        );
+        let mut failures = self.failures.lock().expect("not poisoned");
+        if failures.len() >= MAX_FAILING_CLIENTS {
+            failures.retain(|_, (since, _)| since.elapsed() < FAILURE_WINDOW);
+        }
+        if failures.len() < MAX_FAILING_CLIENTS {
+            let entry = failures.entry(client).or_insert((Instant::now(), 0));
+            if entry.0.elapsed() >= FAILURE_WINDOW {
+                *entry = (Instant::now(), 0);
+            }
+            entry.1 += 1;
+        }
+        Checked::Refused
     }
 
     // r[impl control.auth]
     /// The user whose name and password an `Authorization` header holds, if any.
-    fn check(&self, authorization: &str) -> Option<String> {
+    async fn verify(&self, authorization: &str) -> Option<String> {
         let key = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, authorization.as_bytes())
             .as_ref()
             .to_vec();
@@ -108,15 +169,20 @@ impl ControlSettings {
             })
             .and_then(|decoded| String::from_utf8(decoded).ok())?;
         let (user, password) = credentials.split_once(':')?;
-        let valid = self
-            .users
-            .get(user)
-            .and_then(|hash| PasswordHash::new(hash).ok())
-            .is_some_and(|hash| {
+        let hash = self.users.get(user)?.clone();
+        let password = password.to_string();
+        // argon2 takes a while and much memory: on blocking threads, a few at a time, so
+        // guessing passwords can't stall the threads serving requests.
+        let _hashing = self.hashing.acquire().await.ok()?;
+        let valid = tokio::task::spawn_blocking(move || {
+            PasswordHash::new(&hash).is_ok_and(|hash| {
                 Argon2::default()
                     .verify_password(password.as_bytes(), &hash)
                     .is_ok()
-            });
+            })
+        })
+        .await
+        .unwrap_or(false);
         if !valid {
             return None;
         }
@@ -125,6 +191,15 @@ impl ControlSettings {
         verified.insert(key, (Instant::now(), user.to_string()));
         Some(user.to_string())
     }
+}
+
+/// The user name in a Basic `Authorization` header, for logging.
+fn basic_user(authorization: &str) -> Option<String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(authorization.strip_prefix("Basic ")?.trim())
+        .ok()?;
+    let credentials = String::from_utf8(decoded).ok()?;
+    Some(credentials.split_once(':')?.0.to_string())
 }
 
 /// A mapping of a server, for the control plane.
@@ -271,7 +346,7 @@ fn audit(
         .unwrap_or_else(|_| (String::new(), "none"));
     match result {
         Ok(()) => tracing::info!(
-            target: "hylla::audit",
+            target: AUDIT_TARGET,
             action,
             user,
             signed_in_with,
@@ -283,7 +358,7 @@ fn audit(
             "changed an object"
         ),
         Err(error) => tracing::warn!(
-            target: "hylla::audit",
+            target: AUDIT_TARGET,
             action,
             user,
             signed_in_with,
@@ -887,15 +962,34 @@ async fn authenticate(
             name: session.name,
             signed_in_with_provider: true,
         }),
-        None => request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| settings.check(value))
-            .map(|name| Viewer {
-                name,
-                signed_in_with_provider: false,
-            }),
+        None => {
+            let authorization = request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+            let client = request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| addr.ip());
+            match authorization {
+                Some(authorization) => match settings.check(authorization, client).await {
+                    Checked::User(name) => Some(Viewer {
+                        name,
+                        signed_in_with_provider: false,
+                    }),
+                    Checked::Refused => None,
+                    Checked::Limited(left) => {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(header::RETRY_AFTER, (left.as_secs() + 1).to_string())],
+                            "too many failed sign-ins, try again later\n",
+                        )
+                            .into_response();
+                    }
+                },
+                None => None,
+            }
+        }
     };
     let Some(viewer) = viewer else {
         // Browsers loading a page sign in through the provider; anything else, such as

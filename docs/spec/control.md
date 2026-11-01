@@ -11,6 +11,12 @@ whose password matches its argon2 hash. Otherwise, a browser loading a page MUST
 sign in through the provider when one is configured, coming back to the page, and anything
 else MUST be refused with 401 and a `WWW-Authenticate` challenge.
 
+r[control.auth-limits]
+Passwords MUST be checked on threads other than those serving requests, a few at a time. A
+client address with 10 failed sign-ins within a minute MUST be answered with 429 and a
+`Retry-After` until the minute has passed, also with the right password, and every failed
+sign-in MUST be logged with the `hylla::audit` target.
+
 ## Signing in through an OpenID provider
 
 r[control.oidc.login]

@@ -84,6 +84,9 @@ replacing the first match of its pattern in the result of the previous one, givi
 path requested from the backend. A rewrite whose pattern doesn't match MUST leave the path
 as is.
 
+r[config.mappings.cache-control]
+A mapping MAY have a `cache_control`, the `Cache-Control` of objects without their own.
+
 r[config.mappings.writable]
 A mapping MAY be `writable`, defaulting to not, letting the control plane change its
 objects under its path prefix.
@@ -127,7 +130,8 @@ or with an empty TLS file MUST be reported as invalid.
 
 r[config.backends.timeouts]
 A backend's optional `timeouts` MUST set how long `connect`ing may take, defaulting to `5s`,
-and a whole `request`, defaulting to `30s`.
+a whole `request`, defaulting to `30s`, and how many times failed requests are retried,
+`retries`, defaulting to 2.
 
 r[config.validate.backend-timeouts]
 A zero backend timeout MUST be reported as invalid.
@@ -172,6 +176,10 @@ r[config.cache.metadata-ttl]
 r[config.cache.stale-while-revalidate]
 `stale_while_revalidate` MUST set how long past its TTL cached metadata is still served
 while it is revalidated in the background, defaulting to `0s`, which disables it.
+
+r[config.cache.not-found-ttl]
+`not_found_ttl` MUST set how long an object found missing is remembered as missing,
+defaulting to `10s`. `0s` MUST disable it.
 
 r[config.cache.stale-if-error]
 `stale_if_error` MUST set how long past its TTL cached metadata may still be used when the
@@ -218,7 +226,7 @@ doesn't parse, MUST be reported as invalid.
 r[config.validate.verifiers]
 A verifier with both a `public_key` and a `jwks_uri`, or with none of `public_key`,
 `jwks_uri` and `issuer`, or whose `jwks_uri`, or `issuer` it reads its keys through, isn't
-an HTTP or HTTPS URL, MUST be reported as invalid.
+an HTTPS URL, or an HTTP one to a loopback address, MUST be reported as invalid.
 
 ## Serving backends
 
@@ -293,8 +301,7 @@ An optional `http` section MUST set the limits of every listener: the
 `shutdown_timeout` requests in flight are given on shutdown, defaulting to `20s`.
 
 r[config.validate.http]
-A zero header read timeout or `max_connections`, and an idle timeout that isn't `0s` but
-isn't longer than the request timeout of every backend, MUST be reported as invalid.
+A zero header read timeout or `max_connections` MUST be reported as invalid.
 
 r[config.health]
 An optional `health` section MUST enable the health checks, on its `listen` address.

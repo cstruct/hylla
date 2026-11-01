@@ -3,16 +3,19 @@
 //! on shutdown, a deadline for the requests in flight.
 
 use std::{
+    convert::Infallible,
     io,
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
+use axum::body::Body;
+use futures::StreamExt;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto,
@@ -24,6 +27,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{Semaphore, watch},
 };
+use tower::ServiceExt;
 
 /// The limits of a listener, from the `http` config.
 #[derive(Debug, Clone)]
@@ -32,6 +36,8 @@ pub struct Limits {
     idle_timeout: Option<Duration>,
     max_connections: u32,
     shutdown_timeout: Duration,
+    /// The most connections from one address, if limited.
+    per_client: Option<usize>,
 }
 
 impl Limits {
@@ -42,6 +48,51 @@ impl Limits {
             idle_timeout: (!idle.is_zero()).then_some(idle),
             max_connections: http.max_connections.max(1),
             shutdown_timeout: http.shutdown_timeout.duration(),
+            per_client: None,
+        }
+    }
+
+    /// Limits connections from one address to `max`, refusing more, for listeners only other
+    /// nodes need, so one client can't take the connections they need.
+    pub fn per_client(mut self, max: usize) -> Self {
+        self.per_client = Some(max);
+        self
+    }
+}
+
+/// The open connections by client address, for `Limits::per_client`.
+type Clients = Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>;
+
+/// A connection counted against its client's limit, until dropped.
+struct Counted {
+    clients: Clients,
+    client: std::net::IpAddr,
+}
+
+impl Counted {
+    /// Counts a connection from `client`, unless it has `max` open already.
+    fn new(clients: &Clients, client: std::net::IpAddr, max: usize) -> Option<Self> {
+        let mut open = clients.lock().expect("not poisoned");
+        let count = open.entry(client).or_default();
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            clients: clients.clone(),
+            client,
+        })
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        let mut open = self.clients.lock().expect("not poisoned");
+        if let Some(count) = open.get_mut(&self.client) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.client);
+            }
         }
     }
 }
@@ -78,6 +129,7 @@ pub async fn serve(
     let limits = Arc::new(limits);
     let acceptor = tls.map(tokio_rustls::TlsAcceptor::from);
     let connections = Arc::new(Semaphore::new(limits.max_connections as usize));
+    let clients = Clients::default();
     // Closes the connections still open when the shutdown timeout passes.
     let (close, closing) = watch::channel(false);
     loop {
@@ -98,6 +150,17 @@ pub async fn serve(
             },
             () = shutdown.started() => break,
         };
+        // r[impl cluster.connection-limits]
+        let counted = match limits.per_client {
+            Some(max) => match Counted::new(&clients, peer.ip(), max) {
+                Some(counted) => Some(counted),
+                None => {
+                    tracing::debug!(%peer, "refused a {what} connection: too many from it");
+                    continue;
+                }
+            },
+            None => None,
+        };
         let connection = Connection {
             router: router.clone(),
             limits: limits.clone(),
@@ -108,6 +171,7 @@ pub async fn serve(
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _counted = counted;
             let _ = stream.set_nodelay(true);
             match acceptor {
                 Some(acceptor) => connection.serve_tls(stream, peer, acceptor).await,
@@ -181,8 +245,31 @@ impl Connection {
             .timer(TokioTimer::new())
             .header_read_timeout(self.limits.header_read_timeout);
         builder.http2().timer(TokioTimer::new());
+        // r[impl server.limits]
+        // Requests in flight keep the connection from going idle while they wait on a backend,
+        // until their response's body is sent or dropped.
+        let router = self.router;
+        let busy_activity = activity.clone();
+        let service =
+            tower::service_fn(move |mut request: http::Request<hyper::body::Incoming>| {
+                // The client's address, for limits by address, such as on failed sign-ins.
+                request
+                    .extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer));
+                let busy = Busy::new(busy_activity.clone());
+                let router = router.clone();
+                async move {
+                    let response = router.oneshot(request).await?;
+                    Ok::<_, Infallible>(response.map(|body| {
+                        Body::from_stream(body.into_data_stream().map(move |chunk| {
+                            let _busy = &busy;
+                            chunk
+                        }))
+                    }))
+                }
+            });
         let connection =
-            builder.serve_connection(TokioIo::new(io), TowerToHyperService::new(self.router));
+            builder.serve_connection(TokioIo::new(io), TowerToHyperService::new(service));
         tokio::pin!(connection);
         let mut draining = false;
         loop {
@@ -213,6 +300,26 @@ struct Activity {
     started: Instant,
     /// Milliseconds since `started`.
     last: AtomicU64,
+    /// Requests in flight.
+    busy: AtomicUsize,
+}
+
+/// A request in flight on a connection.
+struct Busy(Arc<Activity>);
+
+impl Busy {
+    fn new(activity: Arc<Activity>) -> Self {
+        activity.busy.fetch_add(1, Ordering::Relaxed);
+        Self(activity)
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        // Idle from when the request finished.
+        self.0.touch();
+        self.0.busy.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Activity {
@@ -220,6 +327,7 @@ impl Activity {
         Self {
             started: Instant::now(),
             last: AtomicU64::new(0),
+            busy: AtomicUsize::new(0),
         }
     }
 
@@ -228,7 +336,8 @@ impl Activity {
         self.last.store(now, Ordering::Relaxed);
     }
 
-    /// Completes once nothing was sent or received for `timeout`, never without one.
+    /// Completes once nothing was sent or received for `timeout`, while no request was in
+    /// flight, never without a timeout.
     async fn idle_for(&self, timeout: Option<Duration>) {
         let Some(timeout) = timeout else {
             return std::future::pending().await;
@@ -237,7 +346,11 @@ impl Activity {
             let last = self.started + Duration::from_millis(self.last.load(Ordering::Relaxed));
             let deadline = last + timeout;
             if Instant::now() >= deadline {
-                return;
+                if self.busy.load(Ordering::Relaxed) == 0 {
+                    return;
+                }
+                self.touch();
+                continue;
             }
             tokio::time::sleep_until(deadline.into()).await;
         }
@@ -300,5 +413,46 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for Watched<I> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::{io::AsyncReadExt, net::TcpStream, sync::watch};
+
+    use super::{Limits, Shutdown, serve};
+
+    // r[verify cluster.connection-limits]
+    #[tokio::test]
+    async fn connections_from_one_client_are_limited() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stopping = watch::Sender::new(false);
+        let limits = Limits::new(&hylla_config::Http::default()).per_client(2);
+        let serving = tokio::spawn(serve(
+            listener,
+            axum::Router::new(),
+            None,
+            limits,
+            Shutdown::new(&stopping),
+            "test",
+        ));
+        let mut open = Vec::new();
+        for _ in 0..2 {
+            open.push(TcpStream::connect(addr).await.unwrap());
+        }
+        // The third is closed at once.
+        let mut third = TcpStream::connect(addr).await.unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(2), third.read(&mut [0; 1])).await;
+        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "{read:?}");
+        // Once one closes, another may connect.
+        drop(open.pop());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut again = TcpStream::connect(addr).await.unwrap();
+        let read = tokio::time::timeout(Duration::from_millis(300), again.read(&mut [0; 1])).await;
+        assert!(read.is_err(), "kept open: {read:?}");
+        serving.abort();
     }
 }

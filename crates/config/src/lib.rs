@@ -47,7 +47,7 @@ pub use load::{
 pub use router::{Route, Router};
 pub use show::{ExplainError, explain, render};
 pub use template::{InvalidTemplate, PathTemplate, under_prefix};
-pub use validate::ValidationError;
+pub use validate::{ValidationError, is_secure_url};
 
 config_tree! {
     #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +78,10 @@ config_tree! {
                     /// `${name}`.
                     pub replace: String,
                 }>,
+                // r[impl config.mappings.cache-control]
+                /// The `Cache-Control` of objects that have none of their own, such as
+                /// `public, max-age=300`. Without it, they're answered without one.
+                pub cache_control: Option<String>,
                 // r[impl config.mappings.writable]
                 /// Whether the control plane may change the mapping's objects: upload,
                 /// delete and move them, under its path prefix only. Public listeners never
@@ -173,6 +177,12 @@ config_tree! {
                 /// paths can tell more than they should, such as who a tenant is.
                 #[facet(default)]
                 pub record_paths: bool,
+                /// Whether requests to public listeners continue the traces their
+                /// `traceparent` header names, following their callers' sampling. Off by
+                /// default, since anyone can send one: turn it on behind a proxy that sets it.
+                /// Requests between nodes continue their traces either way.
+                #[facet(default)]
+                pub follow_callers: bool,
             },
             // r[impl config.telemetry.logs]
             /// Logging, to stderr and optionally exported.
@@ -388,6 +398,12 @@ config_tree! {
             /// disables serving stale objects.
             #[facet(default = Interval::from_secs(24 * 60 * 60))]
             pub stale_if_error: Interval,
+            // r[impl config.cache.not-found-ttl]
+            /// How long an object the backend said is missing is answered with 404 without
+            /// asking it again, such as `10s`, so requests for missing objects don't all reach
+            /// the backend. Changing it through the control plane ends it. `0s` disables it.
+            #[facet(default = Interval::from_secs(10))]
+            pub not_found_ttl: Interval,
             // r[impl config.cache.write-policy]
             /// When chunks are written to disk.
             #[facet(default)]
@@ -428,6 +444,7 @@ impl Default for Cache {
             metadata_ttl: Interval::from_secs(30),
             stale_while_revalidate: Interval::from_secs(0),
             stale_if_error: Interval::from_secs(24 * 60 * 60),
+            not_found_ttl: Interval::from_secs(10),
             write_policy: WritePolicy::default(),
             memory: MemoryCache::default(),
             disk: None,
@@ -476,6 +493,7 @@ impl Default for TracesExport {
             endpoint: None,
             sample_ratio: 1.0,
             record_paths: false,
+            follow_callers: false,
         }
     }
 }
@@ -516,6 +534,7 @@ impl Default for BackendTimeouts {
         Self {
             connect: Interval::from_secs(5),
             request: Interval::from_secs(30),
+            retries: 2,
         }
     }
 }
@@ -604,6 +623,10 @@ pub struct BackendTimeouts {
     /// from a `hylla` backend, which comes as one response.
     #[facet(default = Interval::from_secs(30))]
     pub request: Interval,
+    /// How many times requests to S3 or Azure that failed with a server error, or without an
+    /// answer, are retried, with backoff, within `request` from the first attempt.
+    #[facet(default = 2)]
+    pub retries: u32,
 }
 
 /// Mutual TLS with a `hylla` backend.

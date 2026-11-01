@@ -254,6 +254,7 @@ async fn node_with_issuer(issuer: &str) -> Arc<App> {
                     backend: "assets".into(),
                     rewrites: Vec::new(),
                     writable: false,
+                    cache_control: None,
                     auth: None,
                 }],
             },

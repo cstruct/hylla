@@ -179,6 +179,7 @@ async fn metrics_are_exported_over_otlp() {
                     backend: "assets".into(),
                     rewrites: Vec::new(),
                     writable: false,
+                    cache_control: None,
                     auth: None,
                 }],
             },
@@ -249,6 +250,22 @@ async fn metrics_are_exported_over_otlp() {
         StatusCode::NOT_FOUND
     );
 
+    // A made-up method is counted as `_OTHER`, so methods can't add series without bound.
+    let made_up = Request::builder()
+        .method("FOO1")
+        .uri("/app.css")
+        .header(header::HOST, "cache.example.com")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app
+        .listener("127.0.0.1:8080".parse().unwrap())
+        .oneshot(made_up)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    // Its duration is recorded once its body is sent.
+    drop(response);
+
     // A refresh finds the object cached and unchanged.
     let report = app.refresh("assets", 0).await.unwrap();
     assert_eq!(report.unchanged, 1);
@@ -269,6 +286,11 @@ async fn metrics_are_exported_over_otlp() {
             let resource_attributes = attributes(&resource.resource.as_ref().unwrap().attributes);
             assert_eq!(resource_attributes["service.name"], "hylla");
             assert_eq!(resource_attributes["deployment.environment"], "test");
+            // r[verify telemetry.version]
+            assert_eq!(
+                resource_attributes["service.version"],
+                env!("CARGO_PKG_VERSION")
+            );
             for scope in &resource.scope_metrics {
                 for metric in &scope.metrics {
                     metrics.insert(metric.name.clone(), metric.clone());
@@ -288,6 +310,14 @@ async fn metrics_are_exported_over_otlp() {
         )
     };
     assert_eq!(requests("200"), 2.0);
+    assert_eq!(
+        value(
+            &metrics,
+            "http.server.request.duration",
+            &[("http.request.method", "_OTHER")]
+        ),
+        1.0
+    );
     assert_eq!(requests("206"), 1.0);
     assert_eq!(requests("404"), 1.0);
     assert_eq!(

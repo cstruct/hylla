@@ -29,6 +29,10 @@ r[auth.audience-warning]
 A verifier without an audience MUST be warned about at startup, since it accepts tokens its
 issuer made for other services.
 
+r[auth.issuer-warning]
+A verifier reading its keys from a `jwks_uri` without an issuer MUST be warned about at
+startup, since it accepts tokens from every issuer sharing those keys.
+
 ## Keys from a provider
 
 r[auth.provider-keys]
@@ -37,6 +41,11 @@ from the `jwks_uri` in its issuer's discovery document, whose `issuer` MUST be t
 verifier's. The keys MUST be read when a request first needs them, once for concurrent
 requests, and read again after an hour, or when a token names a key they don't have, but
 not more than once every 30 seconds.
+
+r[auth.provider-https]
+Discovery documents and keys MUST only be read over HTTPS, or HTTP to a loopback address,
+including a `jwks_uri` a discovery document names, and redirects MUST NOT be followed, so
+no one on the network can hand hylla keys.
 
 r[auth.provider-down]
 When the keys can't be read again, the keys read before MUST still be used. Requests MUST
@@ -78,4 +87,4 @@ that doesn't allow the path MUST be answered with 403 and
 
 r[auth.private]
 Responses of a mapping with auth MUST be marked `Cache-Control: private`, unless its auth
-turns that off.
+turns that off, followed by the object's or mapping's other directives, without `public`.

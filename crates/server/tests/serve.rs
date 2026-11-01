@@ -34,6 +34,7 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)]) -> Mapping {
             })
             .collect(),
         writable: false,
+        cache_control: None,
         auth: None,
     }
 }
@@ -334,6 +335,7 @@ async fn serves_through_a_disk_tier() {
         metadata_ttl: Interval::from_secs(60),
         stale_while_revalidate: Interval::from_secs(0),
         stale_if_error: Interval::from_secs(0),
+        not_found_ttl: Interval::from_secs(0),
         write_policy: WritePolicy::OnInsertion,
         memory: MemoryCache { capacity_mib: 1 },
         disk: Some(DiskCache {
@@ -369,6 +371,7 @@ fn disk_cache(
         metadata_ttl: Interval::from_secs(metadata_ttl_seconds),
         stale_while_revalidate: Interval::from_secs(0),
         stale_if_error: Interval::from_secs(stale_if_error_seconds),
+        not_found_ttl: Interval::from_secs(0),
         write_policy: WritePolicy::OnEviction,
         memory: MemoryCache { capacity_mib: 1 },
         disk: Some(DiskCache {
@@ -828,4 +831,245 @@ async fn failed_revalidations_back_off() {
     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     assert_eq!(get(&app, "/assets/app.css").await.body, content());
     wait_for(async || store.requests() > requests + 1).await;
+}
+
+// r[verify cache.coalesce]
+#[tokio::test]
+async fn concurrent_misses_share_one_metadata_fetch() {
+    let (_, store) = flaky_store().await;
+    store.delay(std::time::Duration::from_millis(100));
+    let app = flaky_app(small_cache(30), store.clone()).await;
+    let heads = (0..20).map(|_| request(&app, "HEAD", "cache.example.com", "/assets/app.css", &[]));
+    for response in futures::future::join_all(heads).await {
+        assert_eq!(response.status, StatusCode::OK);
+    }
+    assert_eq!(store.requests(), 1);
+}
+
+// r[verify cache.failure-backoff]
+#[tokio::test]
+async fn failed_fetches_back_off_to_stale_objects() {
+    let (_, store) = flaky_store().await;
+    let cache = Cache {
+        stale_if_error: Interval::from_secs(3600),
+        ..small_cache(1)
+    };
+    let app = flaky_app(cache, store.clone()).await;
+    assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    store.fail(true);
+
+    let requests = store.requests();
+    let response = request(&app, "HEAD", "cache.example.com", "/assets/app.css", &[]).await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(store.requests(), requests + 1);
+    // Within the back-off, the stale object is served without asking the backend again.
+    for _ in 0..5 {
+        assert_eq!(get(&app, "/assets/app.css").await.body, content());
+    }
+    assert_eq!(store.requests(), requests + 1);
+
+    // After it, the backend is asked again.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    request(&app, "HEAD", "cache.example.com", "/assets/app.css", &[]).await;
+    assert_eq!(store.requests(), requests + 2);
+}
+
+// r[verify server.object-headers]
+// r[verify server.cache-control]
+// r[verify config.mappings.cache-control]
+#[tokio::test]
+async fn objects_keep_their_headers_and_mappings_fill_in_cache_control() {
+    let store = Arc::new(InMemory::new());
+    put(&store, "app.css", content()).await;
+    let attributes = Attributes::from_iter([
+        (
+            Attribute::ContentType,
+            object_store::AttributeValue::from("application/javascript"),
+        ),
+        (Attribute::ContentEncoding, "gzip".into()),
+        (Attribute::ContentDisposition, "inline".into()),
+        (Attribute::ContentLanguage, "sv".into()),
+        (Attribute::CacheControl, "public, max-age=3600".into()),
+    ]);
+    store
+        .put_opts(
+            &Path::from("app.js"),
+            b"compressed".to_vec().into(),
+            PutOptions {
+                attributes,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut config = config(small_cache(60));
+    for server in config.servers.values_mut() {
+        server.mappings[0].cache_control = Some("public, max-age=60".into());
+    }
+    let stores = HashMap::from([("assets".to_string(), store as Arc<dyn ObjectStore>)]);
+    let app = App::new(&config, stores).await.unwrap();
+
+    let response = get(&app, "/assets/app.js").await;
+    assert_eq!(
+        header(&response, header::CONTENT_TYPE),
+        "application/javascript"
+    );
+    assert_eq!(header(&response, header::CONTENT_ENCODING), "gzip");
+    assert_eq!(header(&response, header::CONTENT_DISPOSITION), "inline");
+    assert_eq!(header(&response, header::CONTENT_LANGUAGE), "sv");
+    // The object's own Cache-Control wins over the mapping's.
+    assert_eq!(
+        header(&response, header::CACHE_CONTROL),
+        "public, max-age=3600"
+    );
+    assert_eq!(header(&response, header::AGE), "0");
+    let not_modified = request(
+        &app,
+        "GET",
+        "cache.example.com",
+        "/assets/app.js",
+        &[("if-none-match", header(&response, header::ETAG))],
+    )
+    .await;
+    assert_eq!(not_modified.status, StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        header(&not_modified, header::CACHE_CONTROL),
+        "public, max-age=3600"
+    );
+
+    // Objects without one get the mapping's.
+    let response = get(&app, "/assets/app.css").await;
+    assert_eq!(
+        header(&response, header::CACHE_CONTROL),
+        "public, max-age=60"
+    );
+    assert!(!response.headers.contains_key(header::CONTENT_ENCODING));
+
+    // Age counts from when the metadata was fetched.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let response = get(&app, "/assets/app.css").await;
+    assert_eq!(header(&response, header::AGE), "1");
+}
+
+// r[verify server.changed]
+#[tokio::test]
+async fn objects_changed_while_cached_are_fetched_again() {
+    let (app, store) = app(small_cache(60)).await;
+    let range = |range: &'static str| {
+        let app = app.clone();
+        async move {
+            request(
+                &app,
+                "GET",
+                "cache.example.com",
+                "/assets/app.css",
+                &[("range", range)],
+            )
+            .await
+        }
+    };
+    // Cache the metadata and the first chunk, then change the object.
+    assert_eq!(range("bytes=0-99").await.body, content()[..100]);
+    let changed = content().into_iter().rev().collect::<Vec<_>>();
+    put(&store, "app.css", changed.clone()).await;
+    // A chunk that isn't cached is fetched for the cached ETag, which no longer matches: the
+    // new version is served instead of failing.
+    let response = range("bytes=2000-2099").await;
+    assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.body, changed[2000..2100]);
+}
+
+// r[verify server.if-range]
+#[tokio::test]
+async fn ranges_only_apply_while_if_range_matches() {
+    let (app, _) = app(small_cache(60)).await;
+    let full = get(&app, "/assets/app.css").await;
+    let etag = header(&full, header::ETAG).to_string();
+    let modified = header(&full, header::LAST_MODIFIED).to_string();
+    let ranged = |if_range: String| {
+        let app = app.clone();
+        async move {
+            request(
+                &app,
+                "GET",
+                "cache.example.com",
+                "/assets/app.css",
+                &[("range", "bytes=0-99"), ("if-range", &if_range)],
+            )
+            .await
+        }
+    };
+    let response = ranged(etag.clone()).await;
+    assert_eq!(response.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.body, content()[..100]);
+    assert_eq!(ranged(modified).await.status, StatusCode::PARTIAL_CONTENT);
+    // Another version: the whole object, so a resumed download isn't spliced from two.
+    for other in [
+        "\"other\"".to_string(),
+        format!("W/{etag}"),
+        "Mon, 01 Jan 2001 00:00:00 GMT".to_string(),
+    ] {
+        let response = ranged(other.clone()).await;
+        assert_eq!(response.status, StatusCode::OK, "{other}");
+        assert_eq!(response.body, content());
+    }
+}
+
+// r[verify cache.not-found]
+// r[verify config.cache.not-found-ttl]
+#[tokio::test]
+async fn missing_objects_are_remembered_briefly() {
+    let (_, store) = flaky_store().await;
+    let cache = Cache {
+        not_found_ttl: Interval::from_secs(1),
+        ..small_cache(60)
+    };
+    let app = flaky_app(cache, store.clone()).await;
+    let requests = store.requests();
+    for _ in 0..3 {
+        assert_eq!(
+            get(&app, "/assets/missing.css").await.status,
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(store.requests(), requests + 1);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    get(&app, "/assets/missing.css").await;
+    assert_eq!(store.requests(), requests + 2);
+}
+
+// r[verify server.hosts]
+#[tokio::test]
+async fn requests_without_a_host_header_use_their_authority() {
+    let (app, _) = app(small_cache(60)).await;
+    // As HTTP/2 requests carry it, in `:authority`.
+    let request = Request::builder()
+        .uri("http://cache.example.com/assets/app.css")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.listener(listen()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+// r[verify server.read-ahead]
+#[tokio::test]
+async fn chunks_are_read_ahead_while_sending() {
+    let memory = Arc::new(InMemory::new());
+    let large = (0..8 * 1024u32)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    put(&memory, "large.bin", large.clone()).await;
+    let store = Flaky::new(memory);
+    store.delay(std::time::Duration::from_millis(200));
+    let app = flaky_app(small_cache(60), store).await;
+    let started = std::time::Instant::now();
+    let response = get(&app, "/assets/large.bin").await;
+    assert_eq!(response.body, large);
+    // The metadata and 8 chunks, one at a time, would take 1.8s.
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1300),
+        "{:?}",
+        started.elapsed()
+    );
 }

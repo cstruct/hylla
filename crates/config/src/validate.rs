@@ -614,6 +614,26 @@ fn is_http_url(url: &str) -> bool {
         .is_some_and(|host| !host.is_empty())
 }
 
+/// Whether `url` is an HTTPS URL with a host, or an HTTP one to a loopback address, which no
+/// one else on the network can answer for.
+pub fn is_secure_url(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return is_http_url(url);
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 impl Config {
     fn validate_verifiers(&self) -> Vec<ValidationError> {
         let mut verifiers = self.auth.iter().collect::<Vec<_>>();
@@ -643,11 +663,12 @@ impl Config {
                     None
                 }
             };
+            // r[impl auth.provider-https]
             if let Some((field, url)) = url
-                && !is_http_url(url)
+                && !is_secure_url(url)
             {
                 error(format!(
-                    "`{field}` is `{url}`, which isn't an HTTP or HTTPS URL"
+                    "`{field}` is `{url}`, which isn't an HTTPS URL, or an HTTP one to this host"
                 ));
             }
         }
@@ -663,10 +684,15 @@ impl Config {
             reasons.push("there are no `users` and no `oidc`, so no one can sign in".to_string());
         }
         if let Some(oidc) = &control.oidc {
-            for (field, url) in [("issuer", &oidc.issuer), ("url", &oidc.url)] {
-                if !is_http_url(url) {
-                    reasons.push(format!("`oidc.{field}` is `{url}`, which isn't a URL"));
-                }
+            if !is_http_url(&oidc.url) {
+                reasons.push(format!("`oidc.url` is `{}`, which isn't a URL", oidc.url));
+            }
+            // r[impl auth.provider-https]
+            if !is_secure_url(&oidc.issuer) {
+                reasons.push(format!(
+                    "`oidc.issuer` is `{}`, which isn't an HTTPS URL, or an HTTP one to this host",
+                    oidc.issuer
+                ));
             }
             if oidc.client_id.is_empty() {
                 reasons.push("`oidc.client_id` must be set".to_string());
@@ -735,7 +761,6 @@ impl Config {
         if http.max_connections == 0 {
             reasons.push("`max_connections` must be positive".to_string());
         }
-        let idle = http.idle_timeout.duration();
         let mut errors = Vec::new();
         let mut backends = self.backends.iter().collect::<Vec<_>>();
         backends.sort_by_key(|(name, _)| *name);
@@ -749,15 +774,6 @@ impl Config {
                         reason: format!("`timeouts.{field}` must be positive"),
                     });
                 }
-            }
-            // A request waiting on its backend sends nothing, so its connection would be
-            // closed as idle before the backend's timeout.
-            if !idle.is_zero() && idle <= timeouts.request.duration() {
-                reasons.push(format!(
-                    "`idle_timeout` ({}) must be longer than the request timeout of backend \
-                     `{name}` ({})",
-                    http.idle_timeout, timeouts.request
-                ));
             }
         }
         errors.extend(

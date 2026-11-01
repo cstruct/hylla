@@ -167,6 +167,7 @@ fn loads_servers_and_backends() {
                     replace: "/$1".into(),
                 }],
                 writable: false,
+                cache_control: None,
                 auth: None,
             },
             Mapping {
@@ -174,6 +175,7 @@ fn loads_servers_and_backends() {
                 backend: "archive".into(),
                 rewrites: Vec::new(),
                 writable: false,
+                cache_control: None,
                 auth: None,
             },
         ]
@@ -379,6 +381,7 @@ fn cache_settings_default_when_left_out() {
     assert_eq!(cache.metadata_ttl, Interval::from_secs(30));
     assert_eq!(cache.stale_while_revalidate, Interval::from_secs(0));
     assert_eq!(cache.stale_if_error, Interval::from_secs(24 * 60 * 60));
+    assert_eq!(cache.not_found_ttl, Interval::from_secs(10));
     assert_eq!(cache.write_policy, WritePolicy::OnEviction);
     assert_eq!(cache.memory.capacity_mib, 256);
     assert_eq!(cache.disk, None);
@@ -388,6 +391,7 @@ fn cache_settings_default_when_left_out() {
   metadata_ttl 5m
   stale_while_revalidate 1m
   stale_if_error 0s
+  not_found_ttl 0s
   write_policy on_insertion
   memory {{capacity_mib 64}}
   disk {{
@@ -407,6 +411,7 @@ fn cache_settings_default_when_left_out() {
     assert_eq!(cache.metadata_ttl, Interval::from_secs(5 * 60));
     assert_eq!(cache.stale_while_revalidate, Interval::from_secs(60));
     assert_eq!(cache.stale_if_error, Interval::from_secs(0));
+    assert_eq!(cache.not_found_ttl, Interval::from_secs(0));
     assert_eq!(cache.write_policy, WritePolicy::OnInsertion);
     assert_eq!(cache.memory.capacity_mib, 64);
     assert_eq!(
@@ -717,7 +722,10 @@ fn verifiers_need_one_source_of_keys() {
             "    audience hylla\n    jwks_uri https://id.example.com/jwks\n  }\n  internal",
         )
         .replace("    public_key key\n", "")
-        .replace("issuer https://id.example.com", "issuer id.example.com")
+        .replace(
+            "issuer https://id.example.com",
+            "issuer http://id.example.com",
+        )
         .replace(
             "jwks_uri https://id.example.com/jwks\n  }\n}",
             "jwks_uri ftp://id.example.com/jwks\n  }\n}",
@@ -737,11 +745,11 @@ fn verifiers_need_one_source_of_keys() {
             "auth verifier `internal` is invalid: it needs a `public_key`, a `jwks_uri`, or an \
              `issuer` to read its keys from",
             "auth verifier `keys` is invalid: `jwks_uri` is `ftp://id.example.com/jwks`, \
-             which isn't an HTTP or HTTPS URL",
+             which isn't an HTTPS URL, or an HTTP one to this host",
             "auth verifier `partners` is invalid: set either `public_key` or `jwks_uri`, not \
              both",
-            "auth verifier `provider` is invalid: `issuer` is `id.example.com`, which isn't an \
-             HTTP or HTTPS URL",
+            "auth verifier `provider` is invalid: `issuer` is `http://id.example.com`, which \
+             isn't an HTTPS URL, or an HTTP one to this host",
         ]
     );
 }
@@ -1524,6 +1532,7 @@ fn listener_limits_health_and_timeouts_default_when_left_out() {
     let timeouts = config.backends["assets"].timeouts();
     assert_eq!(timeouts.connect, Interval::from_secs(5));
     assert_eq!(timeouts.request, Interval::from_secs(30));
+    assert_eq!(timeouts.retries, 2);
 
     let config = "servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
 backends {assets {type s3, bucket assets, region eu-north-1, timeouts {connect 2s, request 1m}}}
@@ -1578,7 +1587,7 @@ http {
         panic!("expected validation errors");
     };
     let reasons = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
-    assert_eq!(reasons.len(), 5, "{reasons:#?}");
+    assert_eq!(reasons.len(), 4, "{reasons:#?}");
     assert!(
         reasons
             .iter()
@@ -1594,11 +1603,6 @@ http {
             .iter()
             .any(|reason| reason.contains("`max_connections` must be positive"))
     );
-    assert!(reasons.iter().any(|reason| {
-        reason.contains(
-            "`idle_timeout` (1m) must be longer than the request timeout of backend `assets` (1m)",
-        )
-    }));
     assert!(reasons.iter().any(|reason| {
         reason.contains(
             "invalid health config: `listen` is 0.0.0.0:8080, which server `public` listens on too",

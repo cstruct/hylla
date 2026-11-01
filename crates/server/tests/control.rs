@@ -28,6 +28,7 @@ fn mapping(path_prefix: &str, writable: bool) -> Mapping {
         backend: String::new(),
         rewrites: Vec::new(),
         writable,
+        cache_control: None,
         auth: None,
     }
 }
@@ -504,6 +505,7 @@ fn writable_mappings_and_the_control_plane_are_validated() {
                         replace: "/x/$1".into(),
                     }],
                     writable: true,
+                    cache_control: None,
                     auth: None,
                 }],
             },
@@ -591,7 +593,7 @@ fn writable_mappings_and_the_control_plane_are_validated() {
     assert_eq!(
         errors,
         [
-            "`oidc.issuer` is `id.example.com`, which isn't a URL",
+            "`oidc.issuer` is `id.example.com`, which isn't an HTTPS URL, or an HTTP one to this host",
             "`oidc.client_id` must be set",
             "`oidc.groups` must allow at least one group in",
             "`oidc.session_ttl` must be positive",
@@ -618,4 +620,28 @@ async fn pages_cant_be_framed_by_other_sites() {
         assert_eq!(header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
         assert_eq!(header(header::REFERRER_POLICY), "no-referrer");
     }
+}
+
+// r[verify control.auth-limits]
+#[tokio::test]
+async fn clients_failing_to_sign_in_are_slowed_down() {
+    let (app, _) = node("auth-limits").await;
+    let from = |addr: &str, password: &str| {
+        let addr: std::net::SocketAddr = addr.parse().unwrap();
+        Request::builder()
+            .uri("/v1/backends")
+            .header(header::AUTHORIZATION, basic("admin", password))
+            .extension(axum::extract::ConnectInfo(addr))
+    };
+    for _ in 0..10 {
+        let answer = send(&app, from("10.0.0.1:5000", "wrong"), Body::empty()).await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+    }
+    // Further attempts from the same address are refused, even with the right password...
+    let answer = send(&app, from("10.0.0.1:5001", PASSWORD), Body::empty()).await;
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(answer.headers.contains_key(header::RETRY_AFTER));
+    // ...but not from others.
+    let answer = send(&app, from("10.0.0.2:5000", PASSWORD), Body::empty()).await;
+    assert_eq!(answer.status, StatusCode::OK);
 }

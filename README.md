@@ -150,7 +150,7 @@ Images for `linux/amd64` and `linux/arm64` are on Docker Hub as
 [`cstruct/hylla`](https://hub.docker.com/r/cstruct/hylla):
 
 ```bash
-docker run -p 8080:8080 \
+docker run --stop-timeout 30 -p 8080:8080 \
   -v ./config.styx:/etc/hylla/config.styx:ro \
   -v ./secrets.styx:/etc/hylla/secrets.styx:ro \
   -v hylla-cache:/var/cache/hylla \

@@ -13,6 +13,10 @@ use foyer::{
     BlockEngineConfig, Code, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
     HybridCachePolicy,
 };
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use hylla_config::WritePolicy;
 use object_store::{Attribute, GetOptions, GetRange, ObjectStore, path::Path as ObjectPath};
 use opentelemetry::KeyValue;
@@ -41,7 +45,15 @@ pub struct ChunkKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CacheKey {
     Chunk(ChunkKey),
-    Meta { backend: String, key: String },
+    Meta {
+        backend: String,
+        key: String,
+    },
+    /// Since when an object's metadata isn't cached: it was forgotten, or found missing.
+    Absent {
+        backend: String,
+        key: String,
+    },
 }
 
 impl Code for CacheKey {
@@ -56,6 +68,11 @@ impl Code for CacheKey {
             }
             CacheKey::Meta { backend, key } => {
                 1u8.encode(writer)?;
+                backend.encode(writer)?;
+                key.encode(writer)
+            }
+            CacheKey::Absent { backend, key } => {
+                2u8.encode(writer)?;
                 backend.encode(writer)?;
                 key.encode(writer)
             }
@@ -74,6 +91,10 @@ impl Code for CacheKey {
                 backend: String::decode(reader)?,
                 key: String::decode(reader)?,
             }),
+            2 => Ok(CacheKey::Absent {
+                backend: String::decode(reader)?,
+                key: String::decode(reader)?,
+            }),
             tag => Err(foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("unknown cache key tag {tag}"),
@@ -89,7 +110,9 @@ impl Code for CacheKey {
                     + chunk.etag.estimated_size()
                     + chunk.index.estimated_size()
             }
-            CacheKey::Meta { backend, key } => backend.estimated_size() + key.estimated_size(),
+            CacheKey::Meta { backend, key } | CacheKey::Absent { backend, key } => {
+                backend.estimated_size() + key.estimated_size()
+            }
         }
     }
 }
@@ -101,6 +124,39 @@ pub struct ObjectMeta {
     pub etag: Option<String>,
     pub last_modified: SystemTime,
     pub content_type: Option<String>,
+    pub headers: ObjectHeaders,
+}
+
+// r[impl server.object-headers]
+/// The headers an object was stored with, besides its type, sent with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectHeaders {
+    pub cache_control: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_language: Option<String>,
+}
+
+impl ObjectHeaders {
+    /// The headers among an object's attributes.
+    pub(crate) fn from_attributes(attributes: &object_store::Attributes) -> Self {
+        let text = |attribute| attributes.get(&attribute).map(|value| value.to_string());
+        Self {
+            cache_control: text(Attribute::CacheControl),
+            content_encoding: text(Attribute::ContentEncoding),
+            content_disposition: text(Attribute::ContentDisposition),
+            content_language: text(Attribute::ContentLanguage),
+        }
+    }
+
+    fn fields(&self) -> [&Option<String>; 4] {
+        [
+            &self.cache_control,
+            &self.content_encoding,
+            &self.content_disposition,
+            &self.content_language,
+        ]
+    }
 }
 
 /// Metadata as cached, with when it was fetched. Wall clock time, since it must survive
@@ -119,7 +175,13 @@ impl StoredMeta {
             encode_option(&self.meta.etag, bytes)?;
             nanos(self.meta.last_modified).encode(bytes)?;
             encode_option(&self.meta.content_type, bytes)?;
-            nanos(self.fetched).encode(bytes)
+            nanos(self.fetched).encode(bytes)?;
+            // Last, so metadata cached before these were kept fails to decode, and is
+            // fetched again, rather than decoding as something else.
+            for field in self.meta.headers.fields() {
+                encode_option(field, bytes)?;
+            }
+            Ok(())
         };
         write(&mut bytes).expect("writing to a Vec doesn't fail");
         bytes.into()
@@ -127,14 +189,26 @@ impl StoredMeta {
 
     fn from_bytes(mut bytes: &[u8]) -> foyer::Result<Self> {
         let reader = &mut bytes;
+        let size = u64::decode(reader)?;
+        let etag = decode_option(reader)?;
+        let last_modified = from_nanos(u128::decode(reader)?);
+        let content_type = decode_option(reader)?;
+        let fetched = from_nanos(u128::decode(reader)?);
+        let headers = ObjectHeaders {
+            cache_control: decode_option(reader)?,
+            content_encoding: decode_option(reader)?,
+            content_disposition: decode_option(reader)?,
+            content_language: decode_option(reader)?,
+        };
         Ok(Self {
             meta: ObjectMeta {
-                size: u64::decode(reader)?,
-                etag: decode_option(reader)?,
-                last_modified: from_nanos(u128::decode(reader)?),
-                content_type: decode_option(reader)?,
+                size,
+                etag,
+                last_modified,
+                content_type,
+                headers,
             },
-            fetched: from_nanos(u128::decode(reader)?),
+            fetched,
         })
     }
 
@@ -178,8 +252,12 @@ pub struct ObjectCache {
     metadata_ttl: Duration,
     stale_while_revalidate: Duration,
     stale_if_error: Duration,
-    /// The background revalidations of objects, by backend and key.
+    not_found_ttl: Duration,
+    /// The background revalidations of objects, and failed fetches, by backend and key.
     revalidations: Mutex<HashMap<(String, String), Revalidation>>,
+    /// The metadata fetches in flight, by backend and key, shared by the requests waiting on
+    /// them.
+    fetches: Mutex<HashMap<(String, String), MetadataFetch>>,
     /// Where metadata fetched from backends, preloaded objects and objects changed through
     /// this node are reported, when they're shared with a cluster.
     events: std::sync::OnceLock<tokio::sync::mpsc::Sender<CacheEvent>>,
@@ -209,8 +287,37 @@ pub struct SharedMeta {
 /// The state of an object's background revalidation.
 enum Revalidation {
     Running,
-    /// Failed at this time; not retried until the back-off passed.
+    /// A fetch failed at this time; not retried until the back-off passed.
     Failed(Instant),
+}
+
+/// Why an object's metadata isn't cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Absence {
+    /// It was forgotten, as after the object changed.
+    Forgotten,
+    /// The backend said the object is missing.
+    Missing,
+}
+
+/// A metadata fetch in flight.
+type MetadataFetch = Shared<BoxFuture<'static, Result<ObjectMeta, FetchError>>>;
+
+/// Why a shared metadata fetch failed: a `ReadError` that can be cloned for every request
+/// waiting on it.
+#[derive(Debug, Clone)]
+enum FetchError {
+    NotFound,
+    Backend(Arc<anyhow::Error>),
+}
+
+impl From<FetchError> for ReadError {
+    fn from(error: FetchError) -> Self {
+        match error {
+            FetchError::NotFound => ReadError::NotFound,
+            FetchError::Backend(error) => ReadError::Backend(anyhow::anyhow!("{error:#}")),
+        }
+    }
 }
 
 /// How an object listed by the backend compares to the cache.
@@ -227,6 +334,8 @@ pub(crate) enum CachedState {
 pub enum ReadError {
     NotFound,
     Backend(anyhow::Error),
+    /// The object changed since its metadata was cached, which is now forgotten.
+    Changed(anyhow::Error),
 }
 
 impl ObjectCache {
@@ -266,7 +375,9 @@ impl ObjectCache {
             metadata_ttl: config.metadata_ttl.duration(),
             stale_while_revalidate: config.stale_while_revalidate.duration(),
             stale_if_error: config.stale_if_error.duration(),
+            not_found_ttl: config.not_found_ttl.duration(),
             revalidations: Mutex::default(),
+            fetches: Mutex::default(),
             events: std::sync::OnceLock::new(),
         })
     }
@@ -284,13 +395,14 @@ impl ObjectCache {
     /// stale-while-revalidate window past it is used too, while it is revalidated in the
     /// background. Older metadata is refreshed from the backend before it is used; if the
     /// backend fails, metadata within the stale-if-error window is used anyway, so cached
-    /// objects stay available during outages. A missing object is forgotten.
+    /// objects stay available during outages. A missing object is forgotten. With the
+    /// metadata comes its age: how long ago it was fetched from the backend.
     pub async fn metadata(
         self: &Arc<Self>,
         backend: &str,
         store: Arc<dyn ObjectStore>,
         path: &ObjectPath,
-    ) -> Result<ObjectMeta, ReadError> {
+    ) -> Result<(ObjectMeta, Duration), ReadError> {
         // r[impl telemetry.traces.spans]
         let span = tracing::info_span!(
             "metadata",
@@ -309,7 +421,7 @@ impl ObjectCache {
         backend: &str,
         store: Arc<dyn ObjectStore>,
         path: &ObjectPath,
-    ) -> Result<ObjectMeta, ReadError> {
+    ) -> Result<(ObjectMeta, Duration), ReadError> {
         // r[impl telemetry.metrics.cache]
         let record = |result: &'static str| {
             Span::current().record("hylla.result", result);
@@ -322,19 +434,35 @@ impl ObjectCache {
             );
         };
         let cached = self.cached_metadata(backend, path).await;
+        if cached.is_none()
+            && let Some((since, Absence::Missing)) = self.absent(backend, path).await
+            && SystemTime::now()
+                .duration_since(since)
+                .is_ok_and(|missing_for| missing_for < self.not_found_ttl)
+        {
+            record("not_found");
+            return Err(ReadError::NotFound);
+        }
         if let Some(cached) = &cached {
             if cached.age() < self.metadata_ttl {
                 record("fresh");
-                return Ok(cached.meta.clone());
+                return Ok((cached.meta.clone(), cached.age()));
             }
             // r[impl cache.stale-while-revalidate]
             if cached.age() < self.metadata_ttl + self.stale_while_revalidate {
                 record("stale_while_revalidate");
                 self.revalidate_in_background(backend, store, path);
-                return Ok(cached.meta.clone());
+                return Ok((cached.meta.clone(), cached.age()));
+            }
+            // r[impl cache.failure-backoff]
+            if cached.age() < self.metadata_ttl + self.stale_if_error
+                && self.failed_recently(backend, path)
+            {
+                record("stale_if_error");
+                return Ok((cached.meta.clone(), cached.age()));
             }
         }
-        match self.fetch_metadata(backend, store.as_ref(), path).await {
+        match self.shared_fetch(backend, store, path).await {
             Err(ReadError::Backend(error)) => match cached {
                 Some(cached) if cached.age() < self.metadata_ttl + self.stale_if_error => {
                     tracing::warn!(
@@ -344,7 +472,8 @@ impl ObjectCache {
                         "serving stale metadata, the backend failed: {error:#}"
                     );
                     record("stale_if_error");
-                    Ok(cached.meta)
+                    let age = cached.age();
+                    Ok((cached.meta, age))
                 }
                 _ => {
                     record("error");
@@ -357,7 +486,7 @@ impl ObjectCache {
             }
             result => {
                 record("fetched");
-                result
+                result.map(|meta| (meta, Duration::ZERO))
             }
         }
     }
@@ -372,7 +501,7 @@ impl ObjectCache {
         path: &ObjectPath,
     ) {
         let key = (backend.to_string(), path.to_string());
-        let backoff = self.metadata_ttl.max(Duration::from_secs(1));
+        let backoff = self.backoff();
         {
             let mut revalidations = self.revalidations.lock().expect("not poisoned");
             match revalidations.get(&key) {
@@ -389,20 +518,92 @@ impl ObjectCache {
         tokio::spawn(
             async move {
                 let (backend, _) = &key;
-                let result = cache.fetch_metadata(backend, store.as_ref(), &path).await;
-                let mut revalidations = cache.revalidations.lock().expect("not poisoned");
-                match result {
-                    Ok(_) | Err(ReadError::NotFound) => {
-                        revalidations.remove(&key);
-                    }
-                    Err(ReadError::Backend(error)) => {
-                        tracing::warn!(backend, %path, "background revalidation failed: {error:#}");
-                        revalidations.insert(key.clone(), Revalidation::Failed(Instant::now()));
-                    }
+                if let Err(ReadError::Backend(error)) =
+                    cache.shared_fetch(backend, store, &path).await
+                {
+                    tracing::warn!(backend, %path, "background revalidation failed: {error:#}");
                 }
             }
             .instrument(span),
         );
+    }
+
+    /// How long after a failed fetch an object's backend isn't asked again.
+    fn backoff(&self) -> Duration {
+        self.metadata_ttl.max(Duration::from_secs(1))
+    }
+
+    /// Whether fetching the metadata of an object failed within the back-off.
+    fn failed_recently(&self, backend: &str, path: &ObjectPath) -> bool {
+        let key = (backend.to_string(), path.to_string());
+        matches!(
+            self.revalidations.lock().expect("not poisoned").get(&key),
+            Some(Revalidation::Failed(at)) if at.elapsed() < self.backoff()
+        )
+    }
+
+    // r[impl cache.coalesce]
+    /// Fetches the metadata of an object, sharing the fetch with the other requests for it
+    /// in flight, and remembering whether it failed.
+    async fn shared_fetch(
+        self: &Arc<Self>,
+        backend: &str,
+        store: Arc<dyn ObjectStore>,
+        path: &ObjectPath,
+    ) -> Result<ObjectMeta, ReadError> {
+        let key = (backend.to_string(), path.to_string());
+        let fetch = {
+            let mut fetches = self.fetches.lock().expect("not poisoned");
+            match fetches.get(&key) {
+                Some(fetch) => fetch.clone(),
+                None => {
+                    let cache = self.clone();
+                    let path = path.clone();
+                    let fetching = key.clone();
+                    let fetch = async move {
+                        let (backend, _) = &fetching;
+                        let result = cache.fetch_metadata(backend, store.as_ref(), &path).await;
+                        cache
+                            .fetches
+                            .lock()
+                            .expect("not poisoned")
+                            .remove(&fetching);
+                        cache.record_outcome(&fetching, result.as_ref().err());
+                        result.map_err(|error| match error {
+                            ReadError::NotFound => FetchError::NotFound,
+                            ReadError::Backend(error) | ReadError::Changed(error) => {
+                                FetchError::Backend(Arc::new(error))
+                            }
+                        })
+                    }
+                    .in_current_span()
+                    .boxed()
+                    .shared();
+                    fetches.insert(key, fetch.clone());
+                    fetch
+                }
+            }
+        };
+        fetch.await.map_err(ReadError::from)
+    }
+
+    /// Remembers whether fetching an object's metadata failed, for the back-off, forgetting
+    /// failures whose back-off passed.
+    fn record_outcome(&self, key: &(String, String), error: Option<&ReadError>) {
+        let mut revalidations = self.revalidations.lock().expect("not poisoned");
+        match error {
+            Some(ReadError::Backend(_)) => {
+                let backoff = self.backoff();
+                revalidations.retain(|_, revalidation| match revalidation {
+                    Revalidation::Running => true,
+                    Revalidation::Failed(at) => at.elapsed() < backoff,
+                });
+                revalidations.insert(key.clone(), Revalidation::Failed(Instant::now()));
+            }
+            _ => {
+                revalidations.remove(key);
+            }
+        }
     }
 
     fn meta_key(backend: &str, path: &ObjectPath) -> CacheKey {
@@ -466,12 +667,19 @@ impl ObjectCache {
     }
 
     // r[impl cluster.apply-metadata]
-    /// Caches metadata another node fetched, unless the cached metadata is at least as new.
-    /// It keeps its original fetch time, so it expires as if fetched here.
+    // r[impl cluster.forget-tombstones]
+    /// Caches metadata another node fetched, unless the cached metadata is at least as new,
+    /// or the object was forgotten since. It keeps its original fetch time, so it expires as
+    /// if fetched here.
     pub(crate) async fn apply_metadata(&self, shared: SharedMeta) {
         let path = ObjectPath::from(shared.key.as_str());
         if let Some(cached) = self.cached_metadata(&shared.backend, &path).await
             && cached.fetched >= shared.fetched
+        {
+            return;
+        }
+        if let Some((since, _)) = self.absent(&shared.backend, &path).await
+            && since >= shared.fetched
         {
             return;
         }
@@ -540,6 +748,7 @@ impl ObjectCache {
                         .attributes
                         .get(&Attribute::ContentType)
                         .map(|value| value.to_string()),
+                    headers: ObjectHeaders::from_attributes(&result.attributes),
                 };
                 self.store_metadata(backend, path, meta.clone());
                 self.report(|| {
@@ -553,16 +762,53 @@ impl ObjectCache {
                 Ok(meta)
             }
             Err(object_store::Error::NotFound { .. }) => {
-                self.forget(backend, path);
+                self.mark_absent(backend, path, Absence::Missing);
                 Err(ReadError::NotFound)
             }
             Err(error) => Err(ReadError::Backend(error.into())),
         }
     }
 
-    /// Forgets the metadata of an object.
+    /// Forgets the metadata of an object, remembering when, so older metadata from other
+    /// nodes isn't applied.
     pub(crate) fn forget(&self, backend: &str, path: &ObjectPath) {
+        self.mark_absent(backend, path, Absence::Forgotten);
+    }
+
+    /// Drops the metadata of an object, remembering since when and why it's absent.
+    fn mark_absent(&self, backend: &str, path: &ObjectPath, absence: Absence) {
         self.entries.remove(&Self::meta_key(backend, path));
+        let key = CacheKey::Absent {
+            backend: backend.to_string(),
+            key: path.to_string(),
+        };
+        let mut value = Vec::new();
+        let write = |value: &mut Vec<u8>| -> foyer::Result<()> {
+            nanos(SystemTime::now()).encode(value)?;
+            matches!(absence, Absence::Missing).encode(value)
+        };
+        write(&mut value).expect("writing to a Vec doesn't fail");
+        self.entries.insert(key, value.into());
+    }
+
+    /// Since when the metadata of an object is absent, and why, if that's remembered.
+    async fn absent(&self, backend: &str, path: &ObjectPath) -> Option<(SystemTime, Absence)> {
+        let key = CacheKey::Absent {
+            backend: backend.to_string(),
+            key: path.to_string(),
+        };
+        let entry = self.entries.get(&key).await.ok()??;
+        let reader = &mut entry.value().as_ref();
+        let since = from_nanos(u128::decode(reader).ok()?);
+        let missing = bool::decode(reader).ok()?;
+        Some((
+            since,
+            if missing {
+                Absence::Missing
+            } else {
+                Absence::Forgotten
+            },
+        ))
     }
 
     /// Forgets the metadata of an object changed through this node, reporting it so the
@@ -775,6 +1021,7 @@ impl ObjectCache {
                 // failures, such as an outage, keep it so cached chunks stay servable.
                 if changed.load(Ordering::Relaxed) {
                     self.forget(backend, path);
+                    return Err(ReadError::Changed(anyhow::Error::new(error)));
                 }
                 Err(ReadError::Backend(anyhow::Error::new(error)))
             }
@@ -808,6 +1055,10 @@ mod tests {
                 backend: "assets".into(),
                 key: "css/app.css".into(),
             },
+            CacheKey::Absent {
+                backend: "assets".into(),
+                key: "css/app.css".into(),
+            },
         ];
         for key in keys {
             let mut encoded = Vec::new();
@@ -817,16 +1068,56 @@ mod tests {
         }
     }
 
+    // r[verify cluster.forget-tombstones]
+    #[tokio::test]
+    async fn forgotten_objects_refuse_older_metadata_from_other_nodes() {
+        let cache = super::ObjectCache::new(&hylla_config::Cache::default())
+            .await
+            .unwrap();
+        let path = object_store::path::Path::from("app.css");
+        let shared = |fetched| super::SharedMeta {
+            backend: "assets".into(),
+            key: "app.css".into(),
+            meta: ObjectMeta {
+                size: 1,
+                etag: Some("\"1\"".into()),
+                last_modified: UNIX_EPOCH,
+                content_type: None,
+                headers: Default::default(),
+            },
+            fetched,
+        };
+        let before = std::time::SystemTime::now();
+        cache.forget("assets", &path);
+        // Fetched before the object was forgotten, as when another node's update was slow.
+        cache.apply_metadata(shared(before)).await;
+        assert!(!cache.is_cached("assets", &path).await);
+        // Fetched after.
+        let after = std::time::SystemTime::now() + Duration::from_millis(10);
+        cache.apply_metadata(shared(after)).await;
+        assert!(cache.is_cached("assets", &path).await);
+    }
+
     #[test]
     fn metadata_round_trips() {
         let at = |secs, nanos| UNIX_EPOCH + Duration::new(secs, nanos);
-        for (etag, content_type) in [(Some("\"abc\""), Some("text/css")), (None, None)] {
+        let headers = super::ObjectHeaders {
+            cache_control: Some("max-age=60".into()),
+            content_encoding: Some("gzip".into()),
+            content_disposition: None,
+            content_language: Some("sv".into()),
+        };
+        for (etag, content_type, headers) in [
+            (Some("\"abc\""), Some("text/css"), headers),
+            (None, None, Default::default()),
+        ] {
             let stored = StoredMeta {
                 meta: ObjectMeta {
                     size: 3000,
                     etag: etag.map(Into::into),
                     last_modified: at(1_700_000_000, 123),
                     content_type: content_type.map(Into::into),
+                    headers,
                 },
                 fetched: at(1_800_000_000, 456),
             };

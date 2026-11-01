@@ -69,6 +69,7 @@ Each mapping:
 | `path_prefix` | required | Such as `/assets`. It matches `/assets` and `/assets/...`, not `/assets2` |
 | `backend` | required | The name of a backend in `backends` |
 | `rewrites` | none | Regex replacements applied in order to the path, each `{pattern ..., replace ...}`. The replacement can use `$1` or `${name}` |
+| `cache_control` | none | The `Cache-Control` of objects stored without one, such as `public, max-age=300`. Objects keep their own `Cache-Control`, `Content-Encoding`, `Content-Disposition` and `Content-Language` |
 | `writable` | `false` | Whether the [control plane](control-plane.md) may change its objects. Writable mappings can't have rewrites |
 | `auth` | none | Requires a JWT, see below |
 
@@ -98,7 +99,8 @@ JWT verifiers by name, used by mappings' `auth`. Tokens come in an
 | `audience` | none | When set, tokens must have this `aud`. Without it, any token signed with the key is accepted, so hylla warns |
 | `leeway` | `30s` | Clock skew allowed for `exp` and `nbf` |
 
-A verifier needs one of `public_key`, `jwks_uri` or `issuer`. With an OpenID provider, the
+A verifier needs one of `public_key`, `jwks_uri` or `issuer`, which must be HTTPS URLs, or
+HTTP ones to this host. Redirects aren't followed. With an OpenID provider, the
 `issuer` is enough:
 
 ```styx
@@ -155,6 +157,7 @@ Every type also takes:
 |---|---|---|
 | `timeouts.connect` | `5s` | How long connecting may take |
 | `timeouts.request` | `30s` | How long a whole request may take. A chunk must arrive within it, and so must a listing from a `hylla` backend |
+| `timeouts.retries` | `2` | How many times requests that failed with a server error, or without an answer, are retried, with backoff, within the request timeout. S3 and Azure only |
 | `refresh` | none | Background refresh, see below |
 
 A backend's `refresh` keeps cached objects current, and the cache warm:
@@ -181,6 +184,7 @@ Each rule:
 | `metadata_ttl` | `30s` | How long an object's size, ETag and content type are trusted before they're checked again |
 | `stale_while_revalidate` | `0s` | Past the TTL, how long to keep serving while checking in the background. `0s` checks before serving |
 | `stale_if_error` | `1d` | Past the TTL, how long to keep serving while the backend fails. `0s` disables it |
+| `not_found_ttl` | `10s` | How long an object the backend said is missing gets 404 without asking it again. Changing it through the control plane ends it. `0s` disables it |
 | `write_policy` | `on_eviction` | When chunks are written to disk: when they leave memory, or `on_insertion`, as soon as they're cached |
 | `memory.capacity_mib` | `256` | |
 | `disk` | none | Without it, only memory is used |
@@ -208,7 +212,7 @@ health checks.
 | Setting | Default | |
 |---|---|---|
 | `header_read_timeout` | `10s` | How long a client may take to send a request's headers |
-| `idle_timeout` | `60s` | Closes connections that send and receive nothing for this long. `0s` disables it. Must be longer than every backend's request timeout |
+| `idle_timeout` | `60s` | Closes connections that send and receive nothing for this long, while no request on them is in flight. `0s` disables it |
 | `max_connections` | `10000` | Per listener. More wait to be accepted |
 | `shutdown_timeout` | `20s` | On SIGTERM, how long requests in flight may take to finish |
 
@@ -276,7 +280,8 @@ Exporting over OTLP. See [Observability](observability.md).
 | `metrics.interval` | `30s` | |
 | `traces.enabled` | `false` | |
 | `traces.endpoint` | `otlp.endpoint` | The full URL for traces |
-| `traces.sample_ratio` | `1` | The share of traces sampled. Traces callers sampled are always continued |
+| `traces.sample_ratio` | `1` | The share of traces hylla starts that are sampled |
+| `traces.follow_callers` | `false` | Whether public requests continue the trace in their `traceparent` header, and its sampling. Anyone can send one, so turn it on only behind a proxy that sets it |
 | `traces.record_paths` | `false` | Whether request and object paths go in spans |
 | `logs.level` | `info` | `tracing` filter directives, such as `info,hylla_server=debug`. `RUST_LOG` overrides it |
 | `logs.format` | `text` | Or `json` |

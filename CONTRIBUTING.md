@@ -52,7 +52,12 @@ validates the spec references:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy -p hylla-control --lib --target wasm32-unknown-unknown --features hydrate -- -D warnings
+mise run deny
 ```
+
+`mise run deny` checks the dependencies with [cargo-deny](https://github.com/EmbarkStudios/cargo-deny),
+by [deny.toml](deny.toml): security advisories, licenses and sources. An advisory that
+doesn't apply is ignored there, with why. Dependabot proposes updates weekly.
 
 ## The spec
 

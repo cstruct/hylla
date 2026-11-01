@@ -53,6 +53,13 @@ Things to know:
   are announced at once, what doesn't fit in the queues is dropped and counted in
   `hylla.cluster.dropped`. Nodes then fetch from the backend themselves.
 - `share.metadata false` or `share.preload false` turns either off.
+- **Forgets are retried**: a node that misses one because it didn't answer is sent it again,
+  three tries in all. A node also refuses metadata from others fetched before it last forgot
+  the object, so a late update can't bring back a changed object.
+- **Restarted nodes replace their earlier runs**: a node at the same address with a later
+  start replaces the one before, at once rather than after the failure timeout.
+- **The cluster listener takes at most 64 connections from one address**, so one client
+  can't take the connections the nodes need. Keep it on a private network all the same.
 
 ### Mutual TLS
 

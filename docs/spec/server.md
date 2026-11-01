@@ -7,7 +7,8 @@ request's backend.
 
 r[server.hosts]
 A request MUST be served by the server on its listen address whose server names contain
-the request's `Host`, compared case-insensitively and without a port. Requests for other
+the request's `Host`, or without one, the host of its URI, as HTTP/2's `:authority` is,
+compared case-insensitively and without a port. Requests for other
 hosts MUST be answered with 404.
 
 r[server.routes]
@@ -29,6 +30,16 @@ A `GET` MUST be answered with the object's content, its `Content-Length`, `Conte
 (`application/octet-stream` when unknown), `ETag`, `Last-Modified` and `Accept-Ranges:
 bytes`.
 
+r[server.object-headers]
+Responses for an object MUST carry the `Cache-Control`, `Content-Encoding`,
+`Content-Disposition` and `Content-Language` its backend stored with it, cached with its
+metadata, also through a `hylla` backend.
+
+r[server.cache-control]
+An object without a stored `Cache-Control` MUST be answered with its mapping's
+`cache_control`, when set. Responses for objects MUST carry an `Age`: the seconds since the
+object's metadata was fetched from its backend.
+
 r[server.head]
 A `HEAD` MUST be answered with the headers of a `GET` and no body.
 
@@ -36,6 +47,20 @@ r[server.range]
 A `Range` header with a single byte range (`a-b`, `a-` or `-n`) MUST be answered with 206,
 the bytes of that range and a `Content-Range`. A range starting after the object MUST be
 answered with 416. Other `Range` headers MUST be ignored, serving the whole object.
+
+r[server.if-range]
+A `Range` with an `If-Range` that is neither the object's ETag, compared strongly, nor its
+`Last-Modified` MUST be ignored, serving the whole object, so a resumed download isn't
+spliced from two versions.
+
+r[server.read-ahead]
+While an object is sent, up to 4 of the chunks after the one being sent MUST be read at the
+same time, so a cold object isn't fetched one chunk round-trip at a time.
+
+r[server.changed]
+When a chunk can't be fetched because the object changed since its metadata was cached, the
+request MUST be served again with the metadata fetched anew, rather than failing, as long
+as nothing of the response was sent.
 
 r[server.conditional]
 A request whose `If-None-Match` contains the object's ETag, or `*`, MUST be answered with
@@ -52,7 +77,8 @@ memory tier of the cache to disk and exit successfully.
 
 r[server.limits]
 Every listener MUST close a connection whose request headers don't arrive within the header
-read timeout, or that sends and receives nothing for the idle timeout unless it's `0s`, and
+read timeout, or that sends and receives nothing for the idle timeout unless it's `0s`, while
+no request on it is in flight, and
 MUST have at most `max_connections` connections open, leaving further ones waiting to be
 accepted.
 
@@ -93,6 +119,15 @@ An object MUST have at most one background revalidation running, shared by all r
 for it. After a background revalidation fails, the object MUST NOT be revalidated in the
 background again until a back-off of the metadata TTL, at least a second, has passed.
 
+r[cache.coalesce]
+Concurrent requests for an object whose metadata must be fetched from the backend MUST share
+one fetch.
+
+r[cache.failure-backoff]
+After fetching an object's metadata fails, requests within a back-off of the metadata TTL,
+at least a second, MUST be answered from metadata within the stale-if-error window without
+asking the backend again. Failures MUST be forgotten once their back-off passed.
+
 r[cache.stale-if-error]
 When metadata past its TTL can't be fetched again because the backend fails, the cached
 metadata MUST still be used if it is younger than the TTL plus the configured
@@ -101,7 +136,9 @@ after a restart.
 
 r[cache.not-found]
 When the backend reports an object missing, its cached metadata MUST be dropped and the
-request answered with 404, never with stale data.
+request answered with 404, never with stale data. The object MUST then be answered with 404
+without asking the backend for the `not_found_ttl`, unless it's changed through this node's
+control plane or another node's.
 
 r[cache.changed]
 Cached metadata MUST only be dropped by a failed chunk fetch when the object changed (its

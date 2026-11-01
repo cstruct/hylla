@@ -39,13 +39,15 @@ use tracing::{Instrument, Span, field::Empty};
 
 use crate::{
     App,
-    cache::{CacheEvent, ChunkKey, ObjectMeta, SharedMeta},
+    cache::{CacheEvent, ChunkKey, ObjectHeaders, ObjectMeta, SharedMeta},
     metrics::METRICS,
     spans,
 };
 
 use self::sign::Signer;
 
+/// The most connections the cluster listener accepts from one address.
+const CONNECTIONS_PER_NODE: usize = 64;
 /// The most cache events waiting to be shared with other nodes. More are dropped and counted.
 pub(crate) const QUEUE: usize = 10_000;
 
@@ -119,6 +121,10 @@ struct MemberInfo {
     id: String,
     addr: SocketAddr,
     heartbeat: u64,
+    /// How long ago the sender saw the member's heartbeat advance. Missing from nodes of
+    /// earlier versions.
+    #[serde(default)]
+    silent_millis: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,6 +158,15 @@ struct WireMeta {
     last_modified_millis: u64,
     content_type: Option<String>,
     fetched_millis: u64,
+    /// Missing from nodes of earlier versions.
+    #[serde(default)]
+    cache_control: Option<String>,
+    #[serde(default)]
+    content_encoding: Option<String>,
+    #[serde(default)]
+    content_disposition: Option<String>,
+    #[serde(default)]
+    content_language: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -271,6 +286,7 @@ impl Cluster {
             id: self.id.clone(),
             addr: self.addr,
             heartbeat: self.heartbeat.load(Ordering::Relaxed),
+            silent_millis: 0,
         }];
         let known = self.members.lock().expect("not poisoned");
         members.extend(
@@ -281,25 +297,43 @@ impl Cluster {
                     id: id.clone(),
                     addr: member.addr,
                     heartbeat: member.heartbeat,
+                    silent_millis: member.last_seen.elapsed().as_millis() as u64,
                 }),
         );
         Gossip { members }
     }
 
     // r[impl cluster.membership]
-    /// Merges another node's view: members whose heartbeat advanced are seen now.
+    /// Merges another node's view: members whose heartbeat advanced are seen when the
+    /// sender last saw them. Earlier runs of a node, at its address, are dropped.
     fn merge(&self, gossip: Gossip) {
         let mut members = self.members.lock().expect("not poisoned");
         for info in gossip.members {
-            if info.id == self.id {
+            if info.id == self.id || info.addr == self.addr {
                 continue;
+            }
+            let seen = Instant::now()
+                .checked_sub(Duration::from_millis(info.silent_millis))
+                .unwrap_or_else(Instant::now);
+            // Of the runs of a node at the same address, only the latest is a member.
+            let this_run = started(&info.id);
+            let earlier = members
+                .iter()
+                .filter(|(id, member)| member.addr == info.addr && **id != info.id)
+                .map(|(id, _)| (id.clone(), started(id)))
+                .collect::<Vec<_>>();
+            if earlier.iter().any(|(_, other)| *other > this_run) {
+                continue;
+            }
+            for (id, _) in earlier {
+                members.remove(&id);
             }
             match members.get_mut(&info.id) {
                 Some(member) if info.heartbeat <= member.heartbeat => {}
                 Some(member) => {
                     member.addr = info.addr;
                     member.heartbeat = info.heartbeat;
-                    member.last_seen = Instant::now();
+                    member.last_seen = member.last_seen.max(seen);
                 }
                 None => {
                     members.insert(
@@ -307,7 +341,7 @@ impl Cluster {
                         Member {
                             addr: info.addr,
                             heartbeat: info.heartbeat,
-                            last_seen: Instant::now(),
+                            last_seen: seen,
                         },
                     );
                 }
@@ -547,18 +581,74 @@ impl Cluster {
                 hylla.forgotten = updates.forgotten.len(),
                 hylla.peers = peers.len(),
             );
+            // Forgets are sent again when they fail, without the rest of the batch: a node
+            // that missed one would serve a changed object until its metadata expires.
+            let forgets = (!updates.forgotten.is_empty()).then(|| {
+                let forgets = Updates {
+                    origin: self.addr,
+                    fetched: Vec::new(),
+                    preloaded: Vec::new(),
+                    forgotten: std::mem::take(&mut updates.forgotten),
+                };
+                serde_json::to_vec(&forgets).expect("serializable")
+            });
             join_all(peers.into_iter().map(|(_, addr)| {
                 let body = body.clone();
+                let forgets = forgets.clone();
                 async move {
                     let timeout = self.failure_timeout / 2;
                     if let Err(error) = self.post(addr, "/cluster/updates", body, timeout).await {
                         spans::record_error(&Span::current());
                         tracing::warn!(%addr, "sharing updates failed: {error:#}");
+                        let Some(forgets) = forgets else {
+                            return;
+                        };
+                        let resend = || async {
+                            self.post(addr, "/cluster/updates", forgets.clone(), timeout)
+                                .await
+                                .map(|_| ())
+                        };
+                        if let Err(error) = retry(2, Duration::from_secs(1), resend).await {
+                            tracing::warn!(
+                                %addr,
+                                "sharing forgets failed again, the node serves changed objects \
+                                 until their metadata expires: {error:#}"
+                            );
+                        }
                     }
                 }
             }))
             .instrument(span)
             .await;
+        }
+    }
+}
+
+/// When a node started, by its id, `{addr}-{started}`.
+fn started(id: &str) -> u128 {
+    id.rsplit_once('-')
+        .and_then(|(_, started)| started.parse().ok())
+        .unwrap_or_default()
+}
+
+// r[impl cluster.forget-retries]
+/// Runs `send` up to `attempts` times until it succeeds, waiting `delay` after the first
+/// failure and twice as long after each one since.
+async fn retry<F, Fut>(attempts: u32, mut delay: Duration, mut send: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut attempt = 1;
+    loop {
+        match send().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt >= attempts => return Err(error),
+            Err(_) => {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+                attempt += 1;
+            }
         }
     }
 }
@@ -592,6 +682,10 @@ impl From<&SharedMeta> for WireMeta {
             last_modified_millis: millis(shared.meta.last_modified),
             content_type: shared.meta.content_type.clone(),
             fetched_millis: millis(shared.fetched),
+            cache_control: shared.meta.headers.cache_control.clone(),
+            content_encoding: shared.meta.headers.content_encoding.clone(),
+            content_disposition: shared.meta.headers.content_disposition.clone(),
+            content_language: shared.meta.headers.content_language.clone(),
         }
     }
 }
@@ -606,6 +700,12 @@ impl From<WireMeta> for SharedMeta {
                 etag: wire.etag,
                 last_modified: from_millis(wire.last_modified_millis),
                 content_type: wire.content_type,
+                headers: ObjectHeaders {
+                    cache_control: wire.cache_control,
+                    content_encoding: wire.content_encoding,
+                    content_disposition: wire.content_disposition,
+                    content_language: wire.content_language,
+                },
             },
             fetched: from_millis(wire.fetched_millis),
         }
@@ -650,7 +750,7 @@ pub async fn start(
         listener,
         router,
         cluster.tls.clone(),
-        app.limits.clone(),
+        app.limits.clone().per_client(CONNECTIONS_PER_NODE),
         app.shutdown(),
         "cluster",
     ));
@@ -1017,9 +1117,94 @@ mod tests {
                 etag: Some(etag.into()),
                 last_modified: SystemTime::UNIX_EPOCH,
                 content_type: None,
+                headers: Default::default(),
             },
             fetched: SystemTime::now(),
         }
+    }
+
+    fn cluster() -> Cluster {
+        Cluster::new(&hylla_config::Cluster {
+            listen: "127.0.0.1:7946".parse().unwrap(),
+            advertise: None,
+            seeds: Vec::new(),
+            gossip_interval: Interval::from_secs(1),
+            failure_timeout: Interval::from_secs(10),
+            key: "a cluster key of at least thirty-two characters".into(),
+            tls: None,
+            share: ClusterShare::default(),
+        })
+        .unwrap()
+    }
+
+    // r[verify cluster.membership]
+    #[test]
+    fn earlier_runs_and_long_silent_members_are_not_live() {
+        let cluster = cluster();
+        let info = |id: &str, silent_millis| super::MemberInfo {
+            id: id.into(),
+            addr: id.rsplit_once('-').unwrap().0.parse().unwrap(),
+            heartbeat: 5,
+            silent_millis,
+        };
+        let live = |cluster: &Cluster| {
+            let mut ids = cluster
+                .live_peers()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        cluster.merge(super::Gossip {
+            members: vec![
+                // An earlier run of this node.
+                info("127.0.0.1:7946-1", 0),
+                // An earlier run of another node, and its current one.
+                info("127.0.0.1:7947-1", 0),
+                info("127.0.0.1:7947-2", 0),
+                // A node the sender hasn't heard from for a minute.
+                info("127.0.0.1:7948-1", 60_000),
+            ],
+        });
+        assert_eq!(live(&cluster), ["127.0.0.1:7947-2"]);
+        // An earlier run learned of after the later one is dropped too.
+        cluster.merge(super::Gossip {
+            members: vec![info("127.0.0.1:7947-1", 0)],
+        });
+        assert_eq!(live(&cluster), ["127.0.0.1:7947-2"]);
+        // A later run replaces the one before.
+        cluster.merge(super::Gossip {
+            members: vec![info("127.0.0.1:7947-3", 0)],
+        });
+        assert_eq!(live(&cluster), ["127.0.0.1:7947-3"]);
+    }
+
+    // r[verify cluster.forget-retries]
+    #[tokio::test]
+    async fn failed_sends_are_retried_a_few_times() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let delay = Duration::from_millis(10);
+        let result = super::retry(3, delay, || async {
+            if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                anyhow::bail!("not yet")
+            }
+            Ok(())
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        attempts.store(0, Ordering::SeqCst);
+        let result = super::retry(3, delay, || async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("never")
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     // r[verify cluster.queue]
