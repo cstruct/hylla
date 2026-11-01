@@ -4,7 +4,9 @@
 //! through seeds. Each refresh rule runs on one node, its owner by rendezvous hashing over
 //! the live nodes. Metadata a node fetches from a backend is pushed to the others, and what
 //! the owner of a rule preloads is announced to the others, which pull the chunks from it
-//! rather than from the backend. Everything between nodes is signed with the cluster key.
+//! rather than from the backend. Objects changed through a node's control plane are
+//! announced too, so the others forget their metadata. Everything between nodes is signed with the cluster key,
+//! and, with TLS configured, sent over mutual TLS.
 
 mod sign;
 
@@ -55,6 +57,10 @@ pub struct Cluster {
     share: ClusterShare,
     signer: Signer,
     client: reqwest::Client,
+    /// `https` with TLS configured, `http` otherwise.
+    scheme: &'static str,
+    /// The listener's TLS configuration, if TLS is configured.
+    tls: Option<Arc<rustls::ServerConfig>>,
     heartbeat: AtomicU64,
     /// The other nodes, by id.
     members: Mutex<HashMap<String, Member>>,
@@ -87,6 +93,15 @@ struct Updates {
     origin: SocketAddr,
     fetched: Vec<WireMeta>,
     preloaded: Vec<WireMeta>,
+    /// Objects whose metadata to forget; missing from nodes that predate it.
+    #[serde(default)]
+    forgotten: Vec<WireKey>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireKey {
+    backend: String,
+    key: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,6 +130,25 @@ impl Cluster {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
+        let client = reqwest::Client::builder().connect_timeout(config.failure_timeout.duration());
+        let (client, tls) = match &config.tls {
+            // r[impl cluster.tls]
+            Some(tls) => {
+                let files = crate::tls::Files {
+                    ca: &tls.ca,
+                    cert: &tls.cert,
+                    key: &tls.key,
+                };
+                let server = crate::tls::server_config(&files, &tls.server_name)
+                    .context("setting up cluster TLS")?;
+                let client = client.use_preconfigured_tls(
+                    crate::tls::client_config(&files, Some(&tls.server_name))
+                        .context("setting up cluster TLS")?,
+                );
+                (client, Some(server))
+            }
+            None => (client, None),
+        };
         Ok(Self {
             // r[impl cluster.identity]
             // The start time makes a restarted node a new member, rather than one whose
@@ -127,9 +161,9 @@ impl Cluster {
             failure_timeout: config.failure_timeout.duration(),
             share: config.share.clone(),
             signer: Signer::new(&config.key),
-            client: reqwest::Client::builder()
-                .connect_timeout(config.failure_timeout.duration())
-                .build()?,
+            client: client.build()?,
+            scheme: if tls.is_some() { "https" } else { "http" },
+            tls,
             heartbeat: AtomicU64::new(0),
             members: Mutex::default(),
             pulls: Semaphore::new(4),
@@ -271,7 +305,7 @@ impl Cluster {
         let signature = self.signer.sign("POST", path, &body);
         let response = self
             .client
-            .post(format!("http://{addr}{path}"))
+            .post(format!("{}://{addr}{path}", self.scheme))
             .header(sign::HEADER, signature)
             .header("content-type", "application/json")
             .headers(spans::trace_headers())
@@ -301,7 +335,7 @@ impl Cluster {
         let signature = self.signer.sign("GET", &path_and_query, b"");
         let response = self
             .client
-            .get(format!("http://{addr}{path_and_query}"))
+            .get(format!("{}://{addr}{path_and_query}", self.scheme))
             .header(sign::HEADER, signature)
             .headers(spans::trace_headers())
             .timeout(Duration::from_secs(30))
@@ -316,6 +350,7 @@ impl Cluster {
 
     // r[impl cluster.share-metadata]
     // r[impl cluster.share-preload]
+    // r[impl cluster.share-forgets]
     /// Pushes batches of cache events to the live nodes.
     async fn broadcast(&self, mut events: mpsc::UnboundedReceiver<CacheEvent>) {
         while let Some(event) = events.recv().await {
@@ -335,6 +370,7 @@ impl Cluster {
                 origin: self.addr,
                 fetched: Vec::new(),
                 preloaded: Vec::new(),
+                forgotten: Vec::new(),
             };
             for event in batch {
                 match event {
@@ -344,10 +380,18 @@ impl Cluster {
                     CacheEvent::Preloaded(shared) if self.share.preload => {
                         updates.preloaded.push(WireMeta::from(&shared));
                     }
+                    // Forgets are shared whatever is turned off: other nodes cache what
+                    // they fetch themselves too.
+                    CacheEvent::Forgotten { backend, key } => {
+                        updates.forgotten.push(WireKey { backend, key });
+                    }
                     _ => {}
                 }
             }
-            if updates.fetched.is_empty() && updates.preloaded.is_empty() {
+            if updates.fetched.is_empty()
+                && updates.preloaded.is_empty()
+                && updates.forgotten.is_empty()
+            {
                 continue;
             }
             let body = serde_json::to_vec(&updates).expect("serializable");
@@ -361,6 +405,7 @@ impl Cluster {
                 otel.status_code = Empty,
                 hylla.fetched = updates.fetched.len(),
                 hylla.preloaded = updates.preloaded.len(),
+                hylla.forgotten = updates.forgotten.len(),
                 hylla.peers = peers.len(),
             );
             join_all(peers.into_iter().map(|(_, addr)| {
@@ -383,6 +428,7 @@ fn record_updates(direction: &'static str, updates: &Updates, peers: u64) {
     for (kind, count) in [
         ("fetched", updates.fetched.len()),
         ("preloaded", updates.preloaded.len()),
+        ("forgotten", updates.forgotten.len()),
     ] {
         if count > 0 {
             METRICS.cluster_updates.add(
@@ -454,12 +500,16 @@ pub async fn start(
 
     let gossiping = cluster.clone();
     let broadcasting = cluster.clone();
-    Ok(vec![
-        tokio::spawn(async move {
+    let serving = match &cluster.tls {
+        Some(tls) => tokio::spawn(crate::tls::serve(listener, router, tls.clone(), "cluster")),
+        None => tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, router).await {
                 tracing::error!("cluster listener failed: {error}");
             }
         }),
+    };
+    Ok(vec![
+        serving,
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(gossiping.gossip_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -571,10 +621,11 @@ async fn receive_updates(
     if let Err(response) = verify(&cluster, &method, &uri, &headers, &body) {
         return response;
     }
-    let Ok(updates) = serde_json::from_slice::<Updates>(&body) else {
+    let Ok(mut updates) = serde_json::from_slice::<Updates>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
     record_updates("received", &updates, 1);
+    let forgotten = std::mem::take(&mut updates.forgotten);
     if cluster.share.metadata {
         for wire in updates.fetched {
             app.cache.apply_metadata(wire.into()).await;
@@ -597,6 +648,12 @@ async fn receive_updates(
                 async move { pull(&app, &cluster, origin, shared).await }.instrument(span),
             );
         }
+    }
+    // r[impl cluster.apply-forgets]
+    // Last, so metadata fetched before a change in the same batch doesn't come back.
+    for wire in forgotten {
+        app.cache
+            .forget(&wire.backend, &ObjectPath::from(wire.key.as_str()));
     }
     StatusCode::NO_CONTENT.into_response()
 }

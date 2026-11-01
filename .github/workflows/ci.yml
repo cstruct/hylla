@@ -55,6 +55,15 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+      - name: Lint the UI's WASM build
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked -p hylla-control --lib --target wasm32-unknown-unknown --features hydrate -- -D warnings
+
+      # So the tests run with the UI's hydration bundle embedded, as releases do.
+      - name: Build the UI's hydration bundle
+        if: runner.os == 'Linux'
+        run: mise run ui
+
       - name: Run tests
         run: cargo test --locked --workspace --all-features
 

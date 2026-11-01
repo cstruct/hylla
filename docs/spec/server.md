@@ -36,6 +36,10 @@ r[server.conditional]
 A request whose `If-None-Match` contains the object's ETag, or `*`, MUST be answered with
 304 and no body.
 
+r[server.if-match]
+A request with an `If-Match` that contains neither the object's ETag nor `*` MUST be
+answered with 412 and no body, so a reader can't mix parts of different versions.
+
 r[server.shutdown]
 On SIGINT or SIGTERM, hylla MUST stop accepting requests, finish those in flight, write the
 memory tier of the cache to disk and exit successfully.

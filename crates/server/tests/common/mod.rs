@@ -113,3 +113,74 @@ impl ObjectStore for Flaky {
         self.inner.copy_opts(from, to, options).await
     }
 }
+
+/// A certificate and key issued by a [`Pki`], as the paths of their PEM files.
+pub struct Issued {
+    pub cert: String,
+    pub key: String,
+}
+
+/// A CA issuing certificates into a directory of its own, removed when it's dropped.
+pub struct Pki {
+    dir: std::path::PathBuf,
+    ca: std::path::PathBuf,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+    issued: std::sync::atomic::AtomicUsize,
+}
+
+impl Pki {
+    pub fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("hylla-pki-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("{name} CA"));
+        let key = rcgen::KeyPair::generate().unwrap();
+        let ca = dir.join("ca.crt");
+        std::fs::write(&ca, params.self_signed(&key).unwrap().pem()).unwrap();
+        Self {
+            dir,
+            ca,
+            issuer: rcgen::Issuer::new(params, key),
+            issued: 0.into(),
+        }
+    }
+
+    /// The path of the CA's certificate.
+    pub fn ca(&self) -> String {
+        self.ca.display().to_string()
+    }
+
+    /// A certificate for `name`, for both serving and connecting.
+    pub fn issue(&self, name: &str) -> Issued {
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &self.issuer).unwrap();
+        let issued = self
+            .issued
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (cert_path, key_path) = (
+            self.dir.join(format!("issued-{issued}.crt")),
+            self.dir.join(format!("issued-{issued}.key")),
+        );
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        Issued {
+            cert: cert_path.display().to_string(),
+            key: key_path.display().to_string(),
+        }
+    }
+}
+
+impl Drop for Pki {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}

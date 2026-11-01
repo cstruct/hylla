@@ -10,10 +10,19 @@ path = "src/main.rs"
 
 [dependencies]
 hylla-config = { path = "../config" }
+hylla-control = { path = "../control", features = ["ssr"] }
+leptos = { version = "0.8.21", features = ["ssr"] }
+leptos_axum = "0.8.10"
+# The UI's hydration bundle, embedded if `mise run ui` built it.
+rust-embed = { version = "8.12.0", features = ["interpolate-folder-path", "mime-guess"] }
 anyhow = "1.0.104"
+async-trait = "0.1.92"
 aws-lc-rs = "1.18.2"
-axum = "0.8.9"
+argon2 = "0.5.3"
+axum = { version = "0.8.9", features = ["multipart"] }
+base64 = "0.23.1"
 bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6.7", features = ["derive"] }
 foyer = "0.22.6"
 futures = "0.3.34"
@@ -31,6 +40,12 @@ humantime = "2.4.0"
 object_store = { version = "0.14.2", features = ["aws", "azure"] }
 percent-encoding = "2.3.2"
 reqwest = { version = "0.13.5", default-features = false }
+# Mutual TLS between cluster nodes, with the aws-lc-rs provider the rest of the tree uses.
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+hyper-util = { version = "0.1.21", features = ["server-auto", "service", "tokio"] }
+# Checking nodes' client certificates for the cluster's server name, as rustls does for servers.
+webpki = { package = "rustls-webpki", version = "0.103.15", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_urlencoded = "0.7.1"
 tokio = { version = "1.53.3", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
@@ -42,6 +57,5 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ordna-source-env = "0.1.3"
 opentelemetry-proto = { version = "0.33.1", features = ["gen-tonic-messages", "logs", "metrics", "trace"] }
 prost = "0.14.4"
-base64 = "0.23.1"
-async-trait = "0.1.92"
 tower = { version = "0.5.3", features = ["util"] }
+rcgen = "0.14.10"

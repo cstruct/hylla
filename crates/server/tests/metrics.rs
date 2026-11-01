@@ -178,6 +178,7 @@ async fn metrics_are_exported_over_otlp() {
                     path_prefix: "/".into(),
                     backend: "assets".into(),
                     rewrites: Vec::new(),
+                    writable: false,
                     auth: None,
                 }],
             },
@@ -211,6 +212,8 @@ async fn metrics_are_exported_over_otlp() {
         auth: HashMap::new(),
         telemetry: Default::default(),
         // A cluster that isn't started, of only this node.
+        control: None,
+        serve_backends: None,
         cluster: Some(Cluster {
             listen: "127.0.0.1:7946".parse().unwrap(),
             advertise: None,
@@ -218,6 +221,7 @@ async fn metrics_are_exported_over_otlp() {
             gossip_interval: Interval::from_secs(1),
             failure_timeout: Interval::from_secs(10),
             key: "a cluster key of at least thirty-two characters".into(),
+            tls: None,
             share: Default::default(),
         }),
     };

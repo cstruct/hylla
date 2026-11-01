@@ -1,0 +1,39 @@
+[package]
+name = "hylla-control"
+description = "hylla's control plane UI, server-rendered with Leptos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+# The rlib for the server, which renders the UI, and the cdylib for the browser, which
+# hydrates it.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+leptos = "0.8.21"
+leptos_meta = "0.8.7"
+leptos_router = "0.8.16"
+serde = { version = "1.0.229", features = ["derive"] }
+
+async-trait = { version = "0.1.92", optional = true }
+http = { version = "1.5.0", optional = true }
+leptos_axum = { version = "0.8.10", optional = true }
+
+# Pinned to the wasm-bindgen CLI in mise.toml, which must match it exactly.
+wasm-bindgen = { version = "=0.2.128", optional = true }
+console_error_panic_hook = { version = "0.1.7", optional = true }
+
+[features]
+# Rendering on the server, as hylla-server does.
+ssr = [
+    "dep:async-trait",
+    "dep:http",
+    "dep:leptos_axum",
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+]
+# Hydrating in the browser, for the WASM bundle `mise run ui` builds.
+hydrate = ["dep:console_error_panic_hook", "dep:wasm-bindgen", "leptos/hydrate"]

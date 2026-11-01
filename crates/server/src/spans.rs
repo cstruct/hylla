@@ -81,7 +81,7 @@ pub fn record_error(span: &Span) {
 
 // r[impl telemetry.traces.spans]
 /// Runs a request to a backend in a span, recording its duration and outcome in the
-/// metrics too.
+/// metrics and the backend's status too.
 pub async fn backend_call<T>(
     backend: &str,
     operation: &'static str,
@@ -102,9 +102,23 @@ pub async fn backend_call<T>(
         record_object(&span, path.as_ref());
     }
     let started = Instant::now();
+    let at = std::time::SystemTime::now();
     let result = call.instrument(span.clone()).await;
     let outcome = metrics::outcome(&result);
     metrics::backend_request(backend, operation, started, outcome);
+    crate::status::record(
+        backend,
+        crate::status::Call {
+            at,
+            operation,
+            outcome,
+            duration: started.elapsed(),
+            error: match &result {
+                Err(error) if outcome == "error" => Some(error.to_string()),
+                _ => None,
+            },
+        },
+    );
     span.record("hylla.outcome", outcome);
     if outcome == "error" {
         record_error(&span);

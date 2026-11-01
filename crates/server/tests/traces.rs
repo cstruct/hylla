@@ -122,6 +122,7 @@ fn config(cluster: Option<Cluster>) -> Config {
                     path_prefix: "/".into(),
                     backend: "assets".into(),
                     rewrites: Vec::new(),
+                    writable: false,
                     auth: None,
                 }],
             },
@@ -154,6 +155,8 @@ fn config(cluster: Option<Cluster>) -> Config {
         },
         auth: HashMap::new(),
         telemetry: Default::default(),
+        control: None,
+        serve_backends: None,
         cluster,
     }
 }
@@ -331,6 +334,7 @@ async fn traces_are_exported_over_otlp() {
                     gossip_interval: Interval(Duration::from_millis(50)),
                     failure_timeout: Interval(Duration::from_millis(500)),
                     key: KEY.into(),
+                    tls: None,
                     share: ClusterShare::default(),
                 })),
                 stores,

@@ -50,6 +50,18 @@ pub enum ValidationError {
     },
     /// The cluster settings are invalid.
     InvalidCluster { reason: String },
+    /// A backend's settings are invalid.
+    InvalidBackend { backend: String, reason: String },
+    /// The settings of serving backends to other nodes are invalid.
+    InvalidServeBackends { reason: String },
+    /// A mapping can't be writable.
+    InvalidWritable {
+        server: String,
+        mapping: usize,
+        reason: String,
+    },
+    /// The control plane's settings are invalid.
+    InvalidControl { reason: String },
     /// A cache size setting is out of range.
     InvalidCache { reason: String },
     /// Several servers answer to the same host name on the same address.
@@ -136,6 +148,21 @@ impl fmt::Display for ValidationError {
                 reason,
             } => write!(f, "refresh of backend `{backend}` is invalid: {reason}"),
             Self::InvalidCluster { reason } => write!(f, "invalid cluster config: {reason}"),
+            Self::InvalidBackend { backend, reason } => {
+                write!(f, "backend `{backend}` is invalid: {reason}")
+            }
+            Self::InvalidServeBackends { reason } => {
+                write!(f, "invalid serve_backends config: {reason}")
+            }
+            Self::InvalidWritable {
+                server,
+                mapping,
+                reason,
+            } => write!(
+                f,
+                "mapping {mapping} of server `{server}` can't be writable: {reason}"
+            ),
+            Self::InvalidControl { reason } => write!(f, "invalid control config: {reason}"),
             Self::InvalidCache { reason } => write!(f, "invalid cache config: {reason}"),
             Self::DuplicateHost {
                 listen,
@@ -188,6 +215,27 @@ impl Config {
                     .push(name.clone());
             }
             for (index, mapping) in server.mappings.iter().enumerate() {
+                // r[impl config.validate.writable]
+                if mapping.writable {
+                    let mut error = |reason: &str| {
+                        errors.push(ValidationError::InvalidWritable {
+                            server: name.clone(),
+                            mapping: index,
+                            reason: reason.to_string(),
+                        })
+                    };
+                    if !mapping.rewrites.is_empty() {
+                        error(
+                            "it has rewrites, so its backend keys can't be mapped back to its paths",
+                        );
+                    }
+                    if matches!(
+                        self.backends.get(&mapping.backend),
+                        Some(crate::Backend::Hylla { .. })
+                    ) {
+                        error("its backend is another hylla node, which is read only");
+                    }
+                }
                 // r[impl config.validate.backend-refs]
                 if !self.backends.contains_key(&mapping.backend) {
                     errors.push(ValidationError::UnknownBackend {
@@ -251,6 +299,12 @@ impl Config {
         errors.extend(self.validate_refresh());
         // r[impl config.validate.cluster]
         errors.extend(self.validate_cluster());
+        // r[impl config.validate.hylla-backends]
+        errors.extend(self.validate_hylla_backends());
+        // r[impl config.validate.serve-backends]
+        errors.extend(self.validate_serve_backends());
+        // r[impl config.validate.control]
+        errors.extend(self.validate_control());
 
         for ((listen, server_name), servers) in hosts {
             if servers.len() > 1 {
@@ -357,6 +411,30 @@ impl Config {
     }
 }
 
+/// Reasons TLS files are invalid: every one must be set.
+fn tls_file_reasons(files: [(&str, &str); 3]) -> Vec<String> {
+    files
+        .into_iter()
+        .filter(|(_, path)| path.is_empty())
+        .map(|(field, _)| format!("`tls.{field}` must be a file"))
+        .collect()
+}
+
+/// Whether `name` is a DNS name, such as `hylla.cluster`: dot-separated labels of letters,
+/// digits and hyphens, not starting or ending with a hyphen, and not an address.
+fn is_dns_name(name: &str) -> bool {
+    let labels_valid = name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    });
+    labels_valid && name.len() <= 253 && name.parse::<std::net::IpAddr>().is_err()
+}
+
 impl Config {
     fn validate_cluster(&self) -> Vec<ValidationError> {
         let Some(cluster) = &self.cluster else {
@@ -379,6 +457,19 @@ impl Config {
         if cluster.key.len() < 32 {
             reasons.push("`key` must be at least 32 characters".to_string());
         }
+        if let Some(tls) = &cluster.tls {
+            reasons.extend(tls_file_reasons([
+                ("ca", &tls.ca),
+                ("cert", &tls.cert),
+                ("key", &tls.key),
+            ]));
+            if !is_dns_name(&tls.server_name) {
+                reasons.push(format!(
+                    "`tls.server_name` is `{}`, which isn't a DNS name",
+                    tls.server_name
+                ));
+            }
+        }
         for seed in &cluster.seeds {
             let valid = seed
                 .rsplit_once(':')
@@ -396,6 +487,180 @@ impl Config {
         reasons
             .into_iter()
             .map(|reason| ValidationError::InvalidCluster { reason })
+            .collect()
+    }
+}
+
+impl Config {
+    fn validate_hylla_backends(&self) -> Vec<ValidationError> {
+        let mut backends = self.backends.iter().collect::<Vec<_>>();
+        backends.sort_by_key(|(name, _)| *name);
+        let mut errors = Vec::new();
+        for (name, backend) in backends {
+            let crate::Backend::Hylla {
+                url,
+                backend: remote,
+                tls,
+                ..
+            } = backend
+            else {
+                continue;
+            };
+            let mut reasons = Vec::new();
+            let host = url
+                .strip_prefix("https://")
+                .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
+            if host.is_none_or(str::is_empty) {
+                reasons.push(format!(
+                    "`url` is `{url}`, which isn't an `https://` URL with a host"
+                ));
+            }
+            if remote.is_empty() {
+                reasons.push("`backend` must name a backend of the other node".to_string());
+            }
+            reasons.extend(tls_file_reasons([
+                ("ca", &tls.ca),
+                ("cert", &tls.cert),
+                ("key", &tls.key),
+            ]));
+            errors.extend(
+                reasons
+                    .into_iter()
+                    .map(|reason| ValidationError::InvalidBackend {
+                        backend: name.clone(),
+                        reason,
+                    }),
+            );
+        }
+        errors
+    }
+
+    fn validate_serve_backends(&self) -> Vec<ValidationError> {
+        let Some(serve) = &self.serve_backends else {
+            return Vec::new();
+        };
+        let mut reasons = Vec::new();
+        if serve.backends.is_empty() {
+            reasons.push("`backends` must name at least one backend to serve".to_string());
+        }
+        for backend in &serve.backends {
+            if !self.backends.contains_key(backend) {
+                reasons.push(format!("`backends` names unknown backend `{backend}`"));
+            }
+        }
+        let mut servers = self
+            .servers
+            .iter()
+            .filter(|(_, server)| server.listen == serve.listen)
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        servers.sort();
+        for server in servers {
+            reasons.push(format!(
+                "`listen` is {}, which server `{server}` listens on too",
+                serve.listen
+            ));
+        }
+        if self
+            .cluster
+            .as_ref()
+            .is_some_and(|cluster| cluster.listen == serve.listen)
+        {
+            reasons.push(format!(
+                "`listen` is {}, which the cluster listens on too",
+                serve.listen
+            ));
+        }
+        reasons.extend(tls_file_reasons([
+            ("ca", &serve.tls.ca),
+            ("cert", &serve.tls.cert),
+            ("key", &serve.tls.key),
+        ]));
+        if !is_dns_name(&serve.tls.client_name) {
+            reasons.push(format!(
+                "`tls.client_name` is `{}`, which isn't a DNS name",
+                serve.tls.client_name
+            ));
+        }
+        reasons
+            .into_iter()
+            .map(|reason| ValidationError::InvalidServeBackends { reason })
+            .collect()
+    }
+}
+
+impl Config {
+    fn validate_control(&self) -> Vec<ValidationError> {
+        let Some(control) = &self.control else {
+            return Vec::new();
+        };
+        let mut reasons = Vec::new();
+        if control.users.is_empty() && control.oidc.is_none() {
+            reasons.push("there are no `users` and no `oidc`, so no one can sign in".to_string());
+        }
+        if let Some(oidc) = &control.oidc {
+            for (field, url) in [("issuer", &oidc.issuer), ("url", &oidc.url)] {
+                let host = url
+                    .strip_prefix("https://")
+                    .or_else(|| url.strip_prefix("http://"))
+                    .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
+                if host.is_none_or(str::is_empty) {
+                    reasons.push(format!("`oidc.{field}` is `{url}`, which isn't a URL"));
+                }
+            }
+            if oidc.client_id.is_empty() {
+                reasons.push("`oidc.client_id` must be set".to_string());
+            }
+            if oidc.groups.is_empty() {
+                reasons.push("`oidc.groups` must allow at least one group in".to_string());
+            }
+            if oidc.session_ttl.duration().is_zero() {
+                reasons.push("`oidc.session_ttl` must be positive".to_string());
+            }
+        }
+        let mut users = control.users.iter().collect::<Vec<_>>();
+        users.sort_by_key(|(name, _)| *name);
+        for (name, user) in users {
+            if !user.password_hash.starts_with("$argon2") {
+                reasons.push(format!(
+                    "the `password_hash` of user `{name}` isn't an argon2 hash, as \
+                     `hylla hash-password` prints"
+                ));
+            }
+        }
+        if control.max_upload_mib == 0 {
+            reasons.push("`max_upload_mib` must be positive".to_string());
+        }
+        let mut servers = self
+            .servers
+            .iter()
+            .filter(|(_, server)| server.listen == control.listen)
+            .map(|(name, _)| format!("server `{name}`"))
+            .collect::<Vec<_>>();
+        servers.sort();
+        if self
+            .cluster
+            .as_ref()
+            .is_some_and(|cluster| cluster.listen == control.listen)
+        {
+            servers.push("the cluster".to_string());
+        }
+        if self
+            .serve_backends
+            .as_ref()
+            .is_some_and(|serve| serve.listen == control.listen)
+        {
+            servers.push("serve_backends".to_string());
+        }
+        for other in servers {
+            reasons.push(format!(
+                "`listen` is {}, which {other} listens on too",
+                control.listen
+            ));
+        }
+        reasons
+            .into_iter()
+            .map(|reason| ValidationError::InvalidControl { reason })
             .collect()
     }
 }

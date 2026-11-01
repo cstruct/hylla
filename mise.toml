@@ -1,8 +1,11 @@
 [tools]
 # The Rust toolchain, installed through rustup.
-rust = { version = "1.99.0", components = "rustfmt,clippy" }
+rust = { version = "1.99.0", components = "rustfmt,clippy", targets = "wasm32-unknown-unknown" }
 # Tracks the spec in docs/spec against the code, from its GitHub releases.
 "github:bearcove/tracey" = "1.4.0"
+# Binds the control plane UI's WASM bundle, see `mise run ui`. It must match the
+# wasm-bindgen crate in crates/control exactly.
+"github:wasm-bindgen/wasm-bindgen" = "0.2.128"
 
 # Tools for the end-to-end tests, see `mise run e2e`.
 # An S3 compatible gateway serving a local directory, from its GitHub releases.
@@ -15,3 +18,10 @@ node = "24"
 [tasks.e2e]
 description = "Run the end-to-end tests against VersityGW and Azurite"
 run = "cargo test -p hylla-server --test e2e -- --ignored --test-threads=1"
+
+[tasks.ui]
+description = "Build the control plane UI's hydration bundle into target/site/pkg, which hylla embeds"
+run = [
+  "cargo build --locked --profile ui -p hylla-control --lib --target wasm32-unknown-unknown --features hydrate",
+  "wasm-bindgen --target web --no-typescript --out-dir target/site/pkg --out-name hylla target/wasm32-unknown-unknown/ui/hylla_control.wasm",
+]
