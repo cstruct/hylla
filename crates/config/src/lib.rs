@@ -234,6 +234,12 @@ config_tree! {
             /// least 32 characters.
             #[config(secret)]
             pub key: String,
+            // r[impl config.cluster.previous-keys]
+            /// Keys still accepted from other nodes, though not signed with, while the key is
+            /// changed one node at a time.
+            #[config(secret)]
+            #[facet(default)]
+            pub previous_keys: Vec<String>,
             // r[impl config.cluster.tls]
             /// Mutual TLS between the nodes, encrypting what they send each other and
             /// checking their certificates. Without it, nodes talk plain HTTP, though signed
@@ -241,7 +247,7 @@ config_tree! {
             pub tls: Option<pub struct ClusterTls {
                 /// The PEM file of the CA certificates nodes' certificates must be issued
                 /// by. Use a CA for the cluster only: any certificate it issued for
-                /// `server_name` is a node. Read at startup.
+                /// `server_name` is a node. Read again when it changes.
                 pub ca: String,
                 /// The PEM file of this node's certificate chain, read again when it
                 /// changes, so certificates can be rotated without a restart.
@@ -278,7 +284,7 @@ config_tree! {
             /// The listener's certificate, and what other nodes' certificates must be.
             pub tls: pub struct ServeTls {
                 /// The PEM file of the CA certificates other nodes' certificates must be
-                /// issued by. Read at startup.
+                /// issued by. Read again when it changes.
                 pub ca: String,
                 /// The PEM file of this node's certificate chain, issued for the host other
                 /// nodes reach it at. Read again when it changes.
@@ -633,8 +639,8 @@ pub struct BackendTimeouts {
 #[config]
 #[derive(Debug, Clone, PartialEq)]
 pub struct HyllaTls {
-    /// The PEM file of the CA certificates the node's certificate must be issued by. Read at
-    /// startup.
+    /// The PEM file of the CA certificates the node's certificate must be issued by. Read
+    /// again when it changes.
     pub ca: String,
     /// The PEM file of this node's certificate chain, presented to the other node, issued for
     /// its `client_name`. Read again when it changes.

@@ -63,8 +63,9 @@ request MUST be served again with the metadata fetched anew, rather than failing
 as nothing of the response was sent.
 
 r[server.conditional]
-A request whose `If-None-Match` contains the object's ETag, or `*`, MUST be answered with
-304 and no body.
+A request whose `If-None-Match` contains the object's ETag, compared weakly, so `W/"x"`
+matches `"x"`, or `*`, also for an object without an ETag, MUST be answered with 304 and no
+body.
 
 r[server.if-match]
 A request with an `If-Match` that contains neither the object's ETag nor `*` MUST be
@@ -74,6 +75,10 @@ r[server.shutdown]
 On SIGINT or SIGTERM, hylla MUST stop accepting connections and finish the requests in
 flight, closing the connections still open once the shutdown timeout passes, then write the
 memory tier of the cache to disk and exit successfully.
+
+r[server.sighup]
+On SIGHUP, hylla MUST log that it doesn't reload its config, and keep running, rather than
+being ended by it, as a reflexive `kill -HUP` or systemd's `ExecReload` would.
 
 r[server.limits]
 Every listener MUST close a connection whose request headers don't arrive within the header
@@ -92,6 +97,11 @@ r[health.ready]
 The health listener MUST answer `GET /readyz` with 200 once every listener is serving, and
 with 503 before that and once shutdown started, so load balancers stop sending requests
 before connections are closed.
+
+r[health.check]
+`hylla healthcheck ADDRESS` MUST succeed when the health listener at `ADDRESS` answers
+`/healthz`, or with `--ready`, `/readyz`, with 200 within a few seconds, and fail otherwise,
+so containers without curl can be checked.
 
 ## Cache
 

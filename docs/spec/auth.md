@@ -47,6 +47,10 @@ Discovery documents and keys MUST only be read over HTTPS, or HTTP to a loopback
 including a `jwks_uri` a discovery document names, and redirects MUST NOT be followed, so
 no one on the network can hand hylla keys.
 
+r[auth.provider-limits]
+Discovery documents, keys, tokens and user info MUST be read up to 1 MiB, refusing larger
+answers without reading further.
+
 r[auth.provider-down]
 When the keys can't be read again, the keys read before MUST still be used. Requests MUST
 NOT wait for a read in progress when the keys read before have the token's key. While no

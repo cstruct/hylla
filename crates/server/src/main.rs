@@ -34,6 +34,15 @@ enum Command {
     Config(ConfigCommand),
     /// Hash a password read from stdin, for a control plane user's `password_hash`
     HashPassword,
+    /// Check a running hylla's health listener, failing unless it's healthy, for container
+    /// health checks in images without curl
+    Healthcheck {
+        /// The health listener's address, such as `127.0.0.1:8081`
+        address: std::net::SocketAddr,
+        /// Check `/readyz` rather than `/healthz`
+        #[arg(long)]
+        ready: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug, PartialEq, Eq)]
@@ -125,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
             inspected.into_loaded()?;
             Ok(())
         }
+        Command::Healthcheck { address, ready } => healthcheck(address, ready).await,
         // r[impl control.hash-password]
         Command::HashPassword => {
             let mut password = String::new();
@@ -178,6 +188,24 @@ async fn run(files: &ConfigFiles) -> anyhow::Result<()> {
     served
 }
 
+// r[impl health.check]
+/// Fails unless the health listener at `address` answers its liveness check, or with
+/// `ready` its readiness check, with 200 within a few seconds.
+async fn healthcheck(address: std::net::SocketAddr, ready: bool) -> anyhow::Result<()> {
+    let path = if ready { "/readyz" } else { "/healthz" };
+    let url = format!("http://{address}{path}");
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("checking {url}"))?;
+    let status = response.status();
+    anyhow::ensure!(status == reqwest::StatusCode::OK, "{url} answered {status}");
+    Ok(())
+}
+
 // r[impl server.shutdown]
 /// Completes on Ctrl-C or SIGTERM, which is how containers are stopped. As a container's
 /// first process, hylla would otherwise ignore SIGTERM and be killed without writing its
@@ -186,6 +214,18 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
+        // r[impl server.sighup]
+        // Listened for, so it doesn't end hylla as it would by default.
+        let hangup = signal(SignalKind::hangup());
+        if let Ok(mut hangup) = hangup {
+            tokio::spawn(async move {
+                while hangup.recv().await.is_some() {
+                    tracing::warn!(
+                        "got SIGHUP: hylla doesn't reload its config, restart it to apply changes"
+                    );
+                }
+            });
+        }
         match signal(SignalKind::terminate()) {
             Ok(mut terminate) => {
                 tokio::select! {
@@ -211,6 +251,37 @@ mod tests {
     use ordna_source_env::EnvSource;
 
     use super::{Args, Command, ConfigCommand};
+
+    // r[verify health.check]
+    #[tokio::test]
+    async fn healthchecks_pass_only_when_the_listener_answers_200() {
+        use axum::{Router, http::StatusCode, routing::get};
+
+        let router = Router::new()
+            .route("/healthz", get(|| async { StatusCode::OK }))
+            .route("/readyz", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        super::healthcheck(address, false).await.unwrap();
+        assert!(super::healthcheck(address, true).await.is_err());
+        server.abort();
+        // Nothing listening.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        assert!(super::healthcheck(closed, false).await.is_err());
+
+        let args = super::Args::parse_from(["hylla", "healthcheck", "127.0.0.1:8081", "--ready"]);
+        assert_eq!(
+            args.command,
+            Some(Command::Healthcheck {
+                address: "127.0.0.1:8081".parse().unwrap(),
+                ready: true,
+            })
+        );
+    }
 
     // r[verify control.hash-password]
     #[test]

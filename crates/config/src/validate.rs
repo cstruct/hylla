@@ -474,6 +474,9 @@ impl Config {
         if cluster.key.len() < 32 {
             reasons.push("`key` must be at least 32 characters".to_string());
         }
+        if cluster.previous_keys.iter().any(|key| key.len() < 32) {
+            reasons.push("`previous_keys` must each be at least 32 characters".to_string());
+        }
         if let Some(tls) = &cluster.tls {
             reasons.extend(tls_file_reasons([
                 ("ca", &tls.ca),

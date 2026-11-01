@@ -158,6 +158,7 @@ async fn node_with(
             gossip_interval: Interval(Duration::from_millis(50)),
             failure_timeout: Interval(Duration::from_millis(500)),
             key: key.into(),
+            previous_keys: Vec::new(),
             tls,
             share: ClusterShare::default(),
         }),

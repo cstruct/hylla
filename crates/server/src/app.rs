@@ -734,12 +734,17 @@ async fn serve_version(
     }
 
     // r[impl server.conditional]
-    if let (Some(etag), Some(if_none_match)) =
-        (&meta.etag, request_headers.get(header::IF_NONE_MATCH))
+    // Weak comparison, as RFC 9110 has it: proxies that compress responses weaken ETags.
+    let weak = |tag: &str| tag.trim().trim_start_matches("W/").to_string();
+    if let Some(if_none_match) = request_headers.get(header::IF_NONE_MATCH)
         && if_none_match.to_str().is_ok_and(|value| {
-            value
-                .split(',')
-                .any(|tag| tag.trim() == etag || tag.trim() == "*")
+            value.split(',').any(|tag| {
+                tag.trim() == "*"
+                    || meta
+                        .etag
+                        .as_deref()
+                        .is_some_and(|etag| weak(tag) == weak(etag))
+            })
         })
     {
         return Ok((StatusCode::NOT_MODIFIED, headers).into_response());

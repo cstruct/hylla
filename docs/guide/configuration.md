@@ -228,6 +228,7 @@ Sharing with other hylla nodes. See [Clustering](clustering.md).
 | `gossip_interval` | `1s` | |
 | `failure_timeout` | `10s` | How long a node may go unheard before it's considered gone |
 | `key` | required, secret | Shared by the nodes, at least 32 characters |
+| `previous_keys` | none, secret | Keys still accepted from other nodes while `key` is changed, see [Clustering](clustering.md#changing-the-key) |
 | `tls` | none | Mutual TLS: `ca`, `cert` and `key` files, and the `server_name` every node's certificate is issued for |
 | `share.metadata` | `true` | Push metadata fetched from backends to the other nodes |
 | `share.preload` | `true` | Run each refresh rule on one node, and pull what it preloads from it |

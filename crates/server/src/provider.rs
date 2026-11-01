@@ -197,7 +197,8 @@ impl Provider {
         if !status.is_success() {
             bail!("{url} answered {status}");
         }
-        Ok(serde_json::from_slice(&response.bytes().await?)?)
+        let body = crate::limited::read(response, crate::limited::JSON).await?;
+        Ok(serde_json::from_slice(&body)?)
     }
 }
 

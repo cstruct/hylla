@@ -225,6 +225,7 @@ async fn metrics_are_exported_over_otlp() {
             gossip_interval: Interval::from_secs(1),
             failure_timeout: Interval::from_secs(10),
             key: "a cluster key of at least thirty-two characters".into(),
+            previous_keys: Vec::new(),
             tls: None,
             share: Default::default(),
         }),

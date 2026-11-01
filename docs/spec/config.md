@@ -278,6 +278,10 @@ DNS name.
 r[config.cluster.key]
 `key` MUST be the secret shared by the nodes, so only the secrets file can set it.
 
+r[config.cluster.previous-keys]
+`previous_keys` MUST be optional secrets, keys still accepted from other nodes while the key
+is changed. Like `key`, each MUST be at least 32 characters.
+
 r[config.cluster.tls]
 An optional `tls` section in `cluster` MUST turn on mutual TLS between the nodes, from the
 PEM files of the `ca` nodes' certificates must be issued by and of this node's `cert` and

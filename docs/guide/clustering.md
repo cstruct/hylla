@@ -42,7 +42,12 @@ What the nodes share:
 Things to know:
 
 - **Everything between nodes is signed** with the shared key: requests and answers both.
-  So all nodes must run a hylla version that signs answers.
+  Each request carries a random nonce, and one seen before is refused, so requests can't be
+  replayed. Nodes must run hylla versions that sign the same way: these nodes can't talk to
+  versions before nonces were added, so upgrade every node at once, or expect the cluster
+  to split until they're all upgraded.
+- **Answers are read up to a limit**: a chunk up to the chunk size, anything else up to
+  4 MiB.
 - **Signatures carry a timestamp**, and are refused when it's more than a minute off. Keep
   the nodes' clocks in sync, such as with NTP. hylla warns when it refuses a node for its
   clock.
@@ -60,6 +65,23 @@ Things to know:
   start replaces the one before, at once rather than after the failure timeout.
 - **The cluster listener takes at most 64 connections from one address**, so one client
   can't take the connections the nodes need. Keep it on a private network all the same.
+
+### Changing the key
+
+Nodes sign with `key`, and also accept `previous_keys`. To change the key without the nodes
+refusing each other, one node at a time each step:
+
+1. Add the new key to `previous_keys` on every node, so they all accept it.
+2. On every node, make the new key `key`, and move the old one to `previous_keys`.
+3. Remove the old key from `previous_keys` on every node.
+
+```styx
+// secrets.styx, during step 2
+cluster {
+  key the-new-key-of-at-least-32-characters
+  previous_keys (the-old-key-of-at-least-32-characters)
+}
+```
 
 ### Mutual TLS
 
@@ -86,7 +108,7 @@ cluster {
   checked for `server_name`, not for addresses.
 - Use a CA for the cluster only: any certificate it issues for `server_name` is a node.
 - The certificate and key are read again when their files change, so cert-manager can
-  rotate them without a restart. The CA is read at startup.
+  rotate them without a restart. So is the CA.
 - All nodes need `tls` on or off together.
 
 [examples/cluster-kubernetes](../../examples/cluster-kubernetes) runs a cluster with mutual
@@ -132,6 +154,10 @@ backends {
 - The shield's certificate must be issued for the host in the edges' `url`, and the edges'
   certificates for its `client_name`, by the CA each side trusts.
 - Only the listed backends are served; others are refused.
+- **The shield doesn't apply its mappings' `auth`**: any node with a certificate for
+  `client_name` reads every object of the listed backends, whatever paths its tokens would
+  allow. The edges' mappings are where tenants are kept apart, so issue those certificates
+  only to nodes you trust with all of it.
 - Refresh rules on the edges list through the shield, in one response, within the
   backend's `timeouts.request`.
 - A `hylla` backend is read only, so mappings to it can't be writable.

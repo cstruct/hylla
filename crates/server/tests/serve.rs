@@ -291,6 +291,39 @@ async fn matching_etags_are_not_modified() {
     .await;
     assert_eq!(response.status, StatusCode::NOT_MODIFIED);
     assert!(response.body.is_empty());
+
+    // Compared weakly, as proxies that compress responses weaken ETags.
+    let weak = format!("\"other\", W/{etag}");
+    let response = request(
+        &app,
+        "GET",
+        "cache.example.com",
+        "/assets/app.css",
+        &[("if-none-match", &weak)],
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::NOT_MODIFIED);
+
+    // `*` matches any object that exists, also one without an ETag.
+    let (_, store) = flaky_store().await;
+    store.strip_etags();
+    let app = flaky_app(small_cache(60), store).await;
+    let any = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            request(
+                &app,
+                "GET",
+                "cache.example.com",
+                path,
+                &[("if-none-match", "*")],
+            )
+            .await
+            .status
+        }
+    };
+    assert_eq!(any("/assets/app.css").await, StatusCode::NOT_MODIFIED);
+    assert_eq!(any("/assets/missing.css").await, StatusCode::NOT_FOUND);
 }
 
 // r[verify cache.ram]

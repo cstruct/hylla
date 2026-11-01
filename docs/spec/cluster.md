@@ -31,6 +31,15 @@ Every request between nodes MUST be signed with the shared cluster key, covering
 path and query, a timestamp and its body, and requests with a missing, invalid or more than
 a minute old signature MUST be refused. The key itself MUST NOT be sent.
 
+r[cluster.replay]
+Every request's signature MUST cover a random nonce too, and a request whose nonce was
+accepted before, within the minute its timestamp allows, MUST be refused, so requests can't
+be replayed.
+
+r[cluster.key-rotation]
+Requests and answers MUST be signed with `key`, and accepted when signed with it or any of
+`previous_keys`, so the key can be changed one node at a time.
+
 r[cluster.clock-skew]
 A request refused because its signature's timestamp is too far from now MUST be warned
 about, at most once a minute, naming how far the clocks are apart.
@@ -52,8 +61,9 @@ cluster CA for the configured server name, whatever address they are at. Request
 signed either way.
 
 r[cluster.tls.rotate]
-A node's certificate and key MUST be read again when their files change, for new
-connections, keeping the ones in use when the new files can't be read or don't match.
+A node's certificate and key, and the CA it trusts, MUST be read again when their files
+change, for new connections, keeping the ones in use when the new files can't be read or
+don't match.
 
 ## Sharing
 
@@ -105,6 +115,10 @@ r[cluster.queue]
 The updates waiting to be shared with other nodes, and the announced objects waiting to be
 pulled, MUST each be held in a queue of bounded size, dropping and counting what doesn't
 fit. An object MUST be queued for pulling once while it's queued or being pulled.
+
+r[cluster.response-limits]
+Answers from other nodes MUST be read up to a limit, refusing larger ones without reading
+further: a chunk up to the chunk size, anything else up to 4 MiB.
 
 r[cluster.chunks]
 A node MUST serve other nodes chunks from its cache only, never fetching them from a backend

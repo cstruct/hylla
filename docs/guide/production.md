@@ -74,6 +74,23 @@ With a `health` listener, point load balancers and orchestrators at it:
 - `/readyz` answers 200 once every listener serves, and 503 once shutdown starts. Use it for
   readiness, so a node leaves the load balancer before its connections close.
 
+The image has no shell or curl, so for Docker and Compose health checks, hylla checks
+itself: `hylla healthcheck 127.0.0.1:8081` fails unless the health listener at that address
+answers `/healthz` with 200, or with `--ready`, `/readyz`.
+
+```yaml
+# compose.yaml
+services:
+  hylla:
+    image: cstruct/hylla
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "hylla", "healthcheck", "127.0.0.1:8081"]
+      interval: 10s
+```
+
+hylla doesn't reload its config: on SIGHUP, it logs so and keeps running.
+
 On SIGTERM or Ctrl-C, hylla stops accepting connections, gives requests in flight
 `http.shutdown_timeout` (20 seconds by default) to finish, closes the connections still
 open, and writes its memory cache to disk. Give it longer than the shutdown timeout to stop,

@@ -809,6 +809,39 @@ fn clusters_are_configured_with_a_secret_key() {
     );
 }
 
+// r[verify config.cluster.previous-keys]
+#[test]
+fn clusters_accept_previous_keys_while_the_key_changes() {
+    let secrets = &format!(
+        r#"cluster {{
+  key "a cluster key of at least thirty-two characters"
+  previous_keys ("the previous key of at least thirty-two characters")
+}}
+{MINIMAL_SECRETS}"#
+    );
+    let files = Files::new("cluster-previous-keys", CLUSTER, secrets);
+    let cluster = files.load(&[]).unwrap().into_config().cluster.unwrap();
+    assert_eq!(
+        cluster.previous_keys,
+        ["the previous key of at least thirty-two characters"]
+    );
+
+    let short = secrets.replace(
+        "the previous key of at least thirty-two characters",
+        "short",
+    );
+    let files = Files::new("cluster-short-previous-key", CLUSTER, &short);
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    assert!(
+        errors[0]
+            .to_string()
+            .contains("`previous_keys` must each be at least 32 characters"),
+        "{errors:?}"
+    );
+}
+
 // r[verify config.validate.cluster]
 #[test]
 fn cluster_settings_are_validated() {

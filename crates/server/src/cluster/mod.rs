@@ -46,6 +46,8 @@ use crate::{
 
 use self::sign::Signer;
 
+/// The most a gossip or updates answer from another node may be.
+const MAX_ANSWER: usize = 4 * 1024 * 1024;
 /// The most connections the cluster listener accepts from one address.
 const CONNECTIONS_PER_NODE: usize = 64;
 /// The most cache events waiting to be shared with other nodes. More are dropped and counted.
@@ -223,7 +225,7 @@ impl Cluster {
             failure_timeout,
             gossip_timeout,
             share: config.share.clone(),
-            signer: Signer::new(&config.key),
+            signer: Signer::new(&config.key, &config.previous_keys),
             client: client.build()?,
             scheme: if tls.is_some() { "https" } else { "http" },
             tls,
@@ -460,7 +462,7 @@ impl Cluster {
             .get(sign::RESPONSE_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = response.bytes().await?;
+        let bytes = crate::limited::read(response, MAX_ANSWER).await?;
         self.check_response(addr, &signature, response_signature, status, &bytes)?;
         Ok(bytes)
     }
@@ -490,6 +492,7 @@ impl Cluster {
         &self,
         addr: SocketAddr,
         chunk: &ChunkKey,
+        max: usize,
     ) -> anyhow::Result<Option<Bytes>> {
         let query = serde_urlencoded::to_string(ChunkQuery {
             backend: chunk.backend.clone(),
@@ -516,7 +519,7 @@ impl Cluster {
             .get(sign::RESPONSE_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = response.bytes().await?;
+        let bytes = crate::limited::read(response, max).await?;
         self.check_response(addr, &signature, response_signature, status, &bytes)?;
         Ok((status == StatusCode::OK).then_some(bytes))
     }
@@ -1020,7 +1023,8 @@ async fn pull(app: &App, cluster: &Cluster, origin: SocketAddr, shared: SharedMe
         if app.cache.cached_chunk(&key).await.is_some() {
             continue;
         }
-        match cluster.fetch_chunk(origin, &key).await {
+        let max = usize::try_from(app.cache.chunk_size()).unwrap_or(usize::MAX);
+        match cluster.fetch_chunk(origin, &key, max).await {
             Ok(Some(bytes)) => {
                 METRICS
                     .cluster_pulled_chunks
@@ -1131,6 +1135,7 @@ mod tests {
             gossip_interval: Interval::from_secs(1),
             failure_timeout: Interval::from_secs(10),
             key: "a cluster key of at least thirty-two characters".into(),
+            previous_keys: Vec::new(),
             tls: None,
             share: ClusterShare::default(),
         })
@@ -1217,6 +1222,7 @@ mod tests {
             gossip_interval: Interval::from_secs(1),
             failure_timeout: Interval::from_secs(10),
             key: "a cluster key of at least thirty-two characters".into(),
+            previous_keys: Vec::new(),
             tls: None,
             share: ClusterShare::default(),
         })

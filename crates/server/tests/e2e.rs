@@ -109,6 +109,16 @@ impl Process {
 
     /// Sends SIGTERM, as `docker stop` does, and waits for the process to exit, returning
     /// whether it succeeded.
+    /// Sends the process a signal, such as `HUP`.
+    fn signal(&self, signal: &str) {
+        let child = self.child.as_ref().unwrap();
+        let sent = Command::new("kill")
+            .args([format!("-{signal}"), child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+    }
+
     fn terminate(&mut self) -> bool {
         let mut child = self.child.take().unwrap();
         let sent = Command::new("kill")
@@ -540,6 +550,17 @@ backends {{
         hylla.body("/css/app.css").await,
         (reqwest::StatusCode::OK, content())
     );
+    // r[verify server.sighup]
+    // SIGHUP, as a reflexive reload sends, doesn't stop it.
+    hylla.process.signal("HUP");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        hylla.body("/css/app.css").await,
+        (reqwest::StatusCode::OK, content()),
+        "{}",
+        hylla.process.logs()
+    );
+
     // Only in memory so far: it's written to disk on the way out.
     assert!(
         hylla.process.terminate(),

@@ -309,7 +309,8 @@ impl Oidc {
             .context("exchanging the code")?;
         let status = response.status();
         let body: Value =
-            serde_json::from_slice(&response.bytes().await?).context("reading the tokens")?;
+            serde_json::from_slice(&crate::limited::read(response, crate::limited::JSON).await?)
+                .context("reading the tokens")?;
         if !status.is_success() {
             bail!("the provider refused the code: {status} {body}");
         }
@@ -381,7 +382,8 @@ impl Oidc {
             bail!("the user info endpoint answered {}", response.status());
         }
         Ok(Some(
-            serde_json::from_slice(&response.bytes().await?).context("reading the user info")?,
+            serde_json::from_slice(&crate::limited::read(response, crate::limited::JSON).await?)
+                .context("reading the user info")?,
         ))
     }
 
