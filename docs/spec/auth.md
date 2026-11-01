@@ -1,7 +1,8 @@
 # Auth
 
 Mappings can require requests to carry a JWT, checked against a configured verifier, and
-optionally limit tokens to backend paths derived from their claims.
+optionally limit tokens to backend paths derived from their claims. A verifier's keys are a
+configured public key, or read from its provider.
 
 ## Tokens
 
@@ -14,7 +15,7 @@ The token MUST be read from an `Authorization: Bearer` header; requests without 
 be refused.
 
 r[auth.keys]
-Each verifier's public key MUST be parsed at startup, failing startup when it doesn't
+Each verifier's `public_key` MUST be parsed at startup, failing startup when it doesn't
 parse for the verifier's algorithm.
 
 r[auth.validate]
@@ -28,6 +29,25 @@ r[auth.audience-warning]
 A verifier without an audience MUST be warned about at startup, since it accepts tokens its
 issuer made for other services.
 
+## Keys from a provider
+
+r[auth.provider-keys]
+A verifier without a `public_key` MUST read its keys from its `jwks_uri`, or without one,
+from the `jwks_uri` in its issuer's discovery document, whose `issuer` MUST be the
+verifier's. The keys MUST be read when a request first needs them, once for concurrent
+requests, and read again after an hour, or when a token names a key they don't have, but
+not more than once every 30 seconds.
+
+r[auth.provider-down]
+When the keys can't be read again, the keys read before MUST still be used. Requests MUST
+NOT wait for a read in progress when the keys read before have the token's key. While no
+keys have been read, requests MUST be answered with 503.
+
+r[auth.provider-key-choice]
+A token MUST be checked with the key its `kid` names, or without a `kid`, only when there is
+just one key. Keys for another algorithm than the verifier's, by their `alg`, or for
+another use than signing, by their `use`, MUST NOT be used.
+
 ## Paths
 
 r[auth.paths]
@@ -38,6 +58,11 @@ token's claims.
 r[auth.claim-values]
 A template MUST only render when every claim it uses is a string or number forming a single,
 non-empty path segment that isn't `.` or `..`, so claims can't widen the prefix.
+
+r[auth.list-claims]
+A claim that is a list MUST stand for each of its items that is a string or number forming
+such a segment, so a template renders a prefix for every one of them, such as one per group
+for `/teams/${groups}`, and a request under any of them is allowed.
 
 r[auth.dot-segments]
 Requests for a mapping with auth whose backend path has `.` or `..` segments MUST be refused

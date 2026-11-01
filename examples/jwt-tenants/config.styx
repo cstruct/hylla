@@ -21,11 +21,12 @@ servers {
     )
   }
 }
-// The verifier: the provider's public key and what its tokens must say.
+// The verifier: the provider whose keys check tokens, and what its tokens must say.
 auth {
   customers {
     algorithm ES256
-    public_key "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEreplacewiththeprovidersownpublickeyreplacewiththeprovidersownpublickeyAA==\n-----END PUBLIC KEY-----\n"
+    // Keys are read through https://id.example.com/.well-known/openid-configuration, and
+    // read again as the provider rotates them. For a fixed key, set `public_key` instead.
     issuer https://id.example.com
     // Without an audience, any token the provider signs is accepted, also ones made for
     // other services. hylla warns about it at startup.

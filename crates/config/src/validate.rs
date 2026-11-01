@@ -60,6 +60,8 @@ pub enum ValidationError {
         mapping: usize,
         reason: String,
     },
+    /// A JWT verifier has no keys, or two sources of them, or an invalid URL to read them from.
+    InvalidVerifier { verifier: String, reason: String },
     /// The control plane's settings are invalid.
     InvalidControl { reason: String },
     /// A cache size setting is out of range.
@@ -138,6 +140,9 @@ impl fmt::Display for ValidationError {
                 f,
                 "auth of mapping {mapping} of server `{server}` is invalid: {reason}"
             ),
+            Self::InvalidVerifier { verifier, reason } => {
+                write!(f, "auth verifier `{verifier}` is invalid: {reason}")
+            }
             Self::InvalidRefresh {
                 backend,
                 rule: Some(rule),
@@ -299,6 +304,8 @@ impl Config {
                 }
             }
         }
+        // r[impl config.validate.verifiers]
+        errors.extend(self.validate_verifiers());
         // r[impl config.validate.cache]
         errors.extend(self.validate_cache());
         // r[impl config.validate.refresh]
@@ -599,7 +606,54 @@ impl Config {
     }
 }
 
+/// Whether `url` is an HTTP or HTTPS URL with a host.
+fn is_http_url(url: &str) -> bool {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default())
+        .is_some_and(|host| !host.is_empty())
+}
+
 impl Config {
+    fn validate_verifiers(&self) -> Vec<ValidationError> {
+        let mut verifiers = self.auth.iter().collect::<Vec<_>>();
+        verifiers.sort_by_key(|(name, _)| *name);
+        let mut errors = Vec::new();
+        for (name, verifier) in verifiers {
+            let mut error = |reason: String| {
+                errors.push(ValidationError::InvalidVerifier {
+                    verifier: name.clone(),
+                    reason,
+                })
+            };
+            let url = match (&verifier.public_key, &verifier.jwks_uri, &verifier.issuer) {
+                (Some(_), Some(_), _) => {
+                    error("set either `public_key` or `jwks_uri`, not both".into());
+                    None
+                }
+                (Some(_), None, _) => None,
+                (None, Some(jwks_uri), _) => Some(("jwks_uri", jwks_uri)),
+                (None, None, Some(issuer)) => Some(("issuer", issuer)),
+                (None, None, None) => {
+                    error(
+                        "it needs a `public_key`, a `jwks_uri`, or an `issuer` to read its keys \
+                         from"
+                            .into(),
+                    );
+                    None
+                }
+            };
+            if let Some((field, url)) = url
+                && !is_http_url(url)
+            {
+                error(format!(
+                    "`{field}` is `{url}`, which isn't an HTTP or HTTPS URL"
+                ));
+            }
+        }
+        errors
+    }
+
     fn validate_control(&self) -> Vec<ValidationError> {
         let Some(control) = &self.control else {
             return Vec::new();
@@ -610,11 +664,7 @@ impl Config {
         }
         if let Some(oidc) = &control.oidc {
             for (field, url) in [("issuer", &oidc.issuer), ("url", &oidc.url)] {
-                let host = url
-                    .strip_prefix("https://")
-                    .or_else(|| url.strip_prefix("http://"))
-                    .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or_default());
-                if host.is_none_or(str::is_empty) {
+                if !is_http_url(url) {
                     reasons.push(format!("`oidc.{field}` is `{url}`, which isn't a URL"));
                 }
             }

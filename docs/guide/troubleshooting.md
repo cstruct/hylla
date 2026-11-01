@@ -61,6 +61,10 @@ expected: the cache is in memory only.
 - 403 `insufficient_scope`: the token is valid, but the path isn't under a prefix its claims
   allow, such as `/tenants/${tenant_id}` with another tenant's id.
 - 400: the path has `.` or `..` segments.
+- 503: the verifier reads its keys from a provider, which hasn't answered yet. hylla warns
+  when reading it fails, and tries again every 30 seconds. Check that the `issuer` or
+  `jwks_uri` can be reached from hylla, and that the discovery document's `issuer` is the
+  verifier's, character for character.
 
 ## Cluster nodes don't find each other
 

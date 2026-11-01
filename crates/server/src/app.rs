@@ -529,10 +529,16 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
     let auth = server.auth.get(route.mapping).and_then(Option::as_ref);
     let private = auth.is_some_and(|auth| auth.private);
     if let Some(auth) = auth
-        && let Err(refusal) = auth.check(request.headers(), &format!("/{key}"))
+        && let Err(refusal) = auth.check(request.headers(), &format!("/{key}")).await
     {
-        if let auth::Refusal::InvalidToken(reason) = &refusal {
-            tracing::debug!(reason, "refused an invalid token");
+        match &refusal {
+            auth::Refusal::InvalidToken(reason) => {
+                tracing::debug!(reason, "refused an invalid token");
+            }
+            auth::Refusal::KeysUnavailable(reason) => {
+                tracing::debug!(reason, "refused a token, without keys to check it with");
+            }
+            _ => {}
         }
         METRICS
             .auth_refusals

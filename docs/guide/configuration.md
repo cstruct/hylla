@@ -81,7 +81,7 @@ A mapping's `auth`:
 | Setting | Default | |
 |---|---|---|
 | `verifier` | required | The name of a verifier in `auth` |
-| `paths` | none | Backend path prefixes a token may read, with claims filled in, such as `/tenants/${tenant_id}`. Without any, a valid token reads anything the mapping serves |
+| `paths` | none | Backend path prefixes a token may read, with claims filled in, such as `/tenants/${tenant_id}`. A list claim allows a prefix for each item: `/teams/${groups}` allows every group's. Without any, a valid token reads anything the mapping serves |
 | `private` | `true` | Whether responses are marked `Cache-Control: private` |
 
 ### `auth`
@@ -92,10 +92,29 @@ JWT verifiers by name, used by mappings' `auth`. Tokens come in an
 | Setting | Default | |
 |---|---|---|
 | `algorithm` | required | One of `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384` or `EdDSA` |
-| `public_key` | required | The PEM encoded public key |
-| `issuer` | none | When set, tokens must have this `iss` |
+| `public_key` | none | The PEM encoded public key |
+| `jwks_uri` | none | Where the provider publishes its keys, for providers without a discovery document |
+| `issuer` | none | When set, tokens must have this `iss`. Without `public_key` or `jwks_uri`, keys are read through `{issuer}/.well-known/openid-configuration` |
 | `audience` | none | When set, tokens must have this `aud`. Without it, any token signed with the key is accepted, so hylla warns |
 | `leeway` | `30s` | Clock skew allowed for `exp` and `nbf` |
+
+A verifier needs one of `public_key`, `jwks_uri` or `issuer`. With an OpenID provider, the
+`issuer` is enough:
+
+```styx
+auth {
+  customers {
+    algorithm ES256
+    issuer https://id.example.com
+    audience files.example.com
+  }
+}
+```
+
+Keys from a provider are read when the first token needs them, and read again after an
+hour, or when a token names a key they don't have, as after the provider rotated its keys,
+but not more than once every 30 seconds. While the provider can't be reached, the keys it
+had are still used. Until they've been read once, requests are answered with 503.
 
 ### `backends`
 

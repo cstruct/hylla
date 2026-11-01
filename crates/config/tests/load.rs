@@ -579,6 +579,15 @@ auth {
     public_key key
     leeway 1m
   }
+  provider {
+    algorithm ES256
+    issuer https://id.example.com
+    audience hylla
+  }
+  keys {
+    algorithm RS256
+    jwks_uri https://id.example.com/jwks
+  }
 }
 servers {
   public {
@@ -626,14 +635,26 @@ fn mappings_configure_auth() {
     assert!(
         partners
             .public_key
+            .as_ref()
+            .unwrap()
             .starts_with("-----BEGIN PUBLIC KEY-----\nkey\n")
     );
+    assert_eq!(partners.jwks_uri, None);
     assert_eq!(partners.audience.as_deref(), Some("hylla"));
     assert_eq!(partners.issuer, None);
     assert_eq!(partners.leeway, Interval::from_secs(30));
     let internal = &config.auth["internal"];
     assert_eq!(internal.algorithm, JwtAlgorithm::EdDsa);
     assert_eq!(internal.leeway, Interval::from_secs(60));
+    // Without a public key, keys are read from the provider.
+    let provider = &config.auth["provider"];
+    assert_eq!(provider.public_key, None);
+    assert_eq!(provider.issuer.as_deref(), Some("https://id.example.com"));
+    let keys = &config.auth["keys"];
+    assert_eq!(
+        keys.jwks_uri.as_deref(),
+        Some("https://id.example.com/jwks")
+    );
 
     let mappings = &config.servers["public"].mappings;
     assert_eq!(
@@ -685,6 +706,44 @@ fn mapping_auth_is_validated() {
     assert!(errors[0].contains("mapping 0") && errors[0].contains("must start with `/`"));
     assert!(errors[1].contains("mapping 0") && errors[1].contains("claim names may only contain"));
     assert!(errors[2].contains("mapping 1") && errors[2].contains("unknown verifier `missing`"));
+}
+
+// r[verify config.validate.verifiers]
+#[test]
+fn verifiers_need_one_source_of_keys() {
+    let config = AUTH
+        .replace(
+            "    audience hylla\n  }\n  internal",
+            "    audience hylla\n    jwks_uri https://id.example.com/jwks\n  }\n  internal",
+        )
+        .replace("    public_key key\n", "")
+        .replace("issuer https://id.example.com", "issuer id.example.com")
+        .replace(
+            "jwks_uri https://id.example.com/jwks\n  }\n}",
+            "jwks_uri ftp://id.example.com/jwks\n  }\n}",
+        );
+    let files = Files::new(
+        "auth-verifiers",
+        &config,
+        "backends {assets {access_key_id a, secret_access_key b}}",
+    );
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            "auth verifier `internal` is invalid: it needs a `public_key`, a `jwks_uri`, or an \
+             `issuer` to read its keys from",
+            "auth verifier `keys` is invalid: `jwks_uri` is `ftp://id.example.com/jwks`, \
+             which isn't an HTTP or HTTPS URL",
+            "auth verifier `partners` is invalid: set either `public_key` or `jwks_uri`, not \
+             both",
+            "auth verifier `provider` is invalid: `issuer` is `id.example.com`, which isn't an \
+             HTTP or HTTPS URL",
+        ]
+    );
 }
 
 const CLUSTER: &str = "
@@ -961,6 +1020,8 @@ fn the_reference_example_loads() {
     assert!(
         config.auth["partners"]
             .public_key
+            .as_deref()
+            .unwrap()
             .starts_with("-----BEGIN PUBLIC KEY-----\n")
     );
 }

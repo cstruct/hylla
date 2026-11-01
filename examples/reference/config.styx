@@ -18,7 +18,7 @@ servers {
         // Optional: require a JWT.
         auth {
           verifier partners
-          // Optional: backend prefixes with claims filled in.
+          // Optional: backend prefixes with claims filled in. A list claim allows each item.
           paths ("/tenant/${sub}")
           // Cache-Control: private (the default).
           private true
@@ -69,7 +69,10 @@ cluster {
 auth {
   partners {
     algorithm ES256  // RS256..512, PS256..512, ES256, ES384 or EdDSA
+    // One of: a fixed key, the provider's keys at a URL, or through the issuer's discovery
+    // document, as `issuer https://id.example.com` alone does.
     public_key "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...\n-----END PUBLIC KEY-----\n"
+    // jwks_uri https://id.example.com/jwks
     audience hylla  // optional; required in tokens when set (so is issuer)
     leeway 30s  // clock skew allowed for exp and nbf
   }

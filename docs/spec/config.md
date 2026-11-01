@@ -196,7 +196,7 @@ size, and a disk capacity of fewer than 4 blocks MUST be reported as invalid.
 
 r[config.auth.verifiers]
 JWT verifiers MUST be configured in an optional top-level `auth` map from names to
-verifiers, each with an `algorithm`, a PEM `public_key`, an optional `issuer` and
+verifiers, each with an `algorithm`, an optional PEM `public_key`, `jwks_uri`, `issuer` and
 `audience`, and a `leeway` defaulting to `30s`.
 
 r[config.auth.algorithms]
@@ -214,6 +214,11 @@ a token's claim and `$$` is a literal `$`, such as `/tenant/${sub}`.
 r[config.validate.auth]
 A mapping's auth naming a verifier that isn't configured, or with a path template that
 doesn't parse, MUST be reported as invalid.
+
+r[config.validate.verifiers]
+A verifier with both a `public_key` and a `jwks_uri`, or with none of `public_key`,
+`jwks_uri` and `issuer`, or whose `jwks_uri`, or `issuer` it reads its keys through, isn't
+an HTTP or HTTPS URL, MUST be reported as invalid.
 
 ## Serving backends
 

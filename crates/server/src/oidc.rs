@@ -9,17 +9,17 @@
 
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
 use base64::Engine;
 use hylla_config::ControlOidc;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
-use serde::Deserialize;
+use jsonwebtoken::{Algorithm, Validation};
 use serde_json::Value;
-use tokio::sync::RwLock;
+
+use crate::provider::{self, Discovery, Provider, Said, Source};
 
 /// The cookie binding a sign-in to the browser that started it.
 const LOGIN_COOKIE: &str = "hylla_login";
@@ -30,25 +30,6 @@ const LOGIN_TTL: Duration = Duration::from_secs(600);
 
 /// The most sign-ins in progress at a time.
 const MAX_PENDING: usize = 10_000;
-/// How long the provider's discovery document and keys are used before they're read again.
-const PROVIDER_TTL: Duration = Duration::from_secs(3600);
-
-/// The endpoints the provider's discovery document names.
-#[derive(Debug, Clone, Deserialize)]
-struct Discovery {
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    jwks_uri: String,
-    userinfo_endpoint: Option<String>,
-    end_session_endpoint: Option<String>,
-}
-
-struct Provider {
-    discovery: Discovery,
-    keys: JwkSet,
-    read: Instant,
-}
 
 /// A sign-in started at the provider.
 struct Pending {
@@ -94,12 +75,7 @@ impl std::fmt::Display for SignInError {
 
 pub struct Oidc {
     config: ControlOidc,
-    client: reqwest::Client,
-    provider: RwLock<Option<Provider>>,
-    /// How long what the provider said is used before it's read again.
-    provider_ttl: Duration,
-    /// Held while the provider is read again, so concurrent sign-ins read it once.
-    refreshing: tokio::sync::Mutex<()>,
+    provider: Provider,
     pending: Mutex<HashMap<String, Pending>>,
     /// Sessions by the SHA-256 of their cookie's value.
     sessions: Mutex<HashMap<Vec<u8>, Session>>,
@@ -128,12 +104,7 @@ impl Oidc {
     pub fn new(config: &ControlOidc) -> anyhow::Result<Self> {
         Ok(Self {
             config: config.clone(),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()?,
-            provider: RwLock::default(),
-            provider_ttl: PROVIDER_TTL,
-            refreshing: tokio::sync::Mutex::default(),
+            provider: Provider::new(Source::Issuer(config.issuer.clone()))?,
             pending: Mutex::default(),
             sessions: Mutex::default(),
         })
@@ -178,80 +149,19 @@ impl Oidc {
         }
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
-        let response = self.client.get(url).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            bail!("{url} answered {status}");
-        }
-        Ok(serde_json::from_slice(&response.bytes().await?)?)
-    }
-
-    /// The provider's endpoints and keys, read again when they're old, or when `kid` isn't
-    /// among the keys, as after the provider rotated them.
+    /// The provider's endpoints and what it said, with its keys, read again when they're
+    /// old, or when `kid` isn't among the keys, as after the provider rotated them.
     // r[impl control.oidc.keys]
-    async fn discovery_and_keys(&self, kid: Option<&str>) -> anyhow::Result<(Discovery, JwkSet)> {
-        let current = |provider: &Option<Provider>| {
-            provider.as_ref().and_then(|provider| {
-                (provider.read.elapsed() < self.provider_ttl
-                    && kid.is_none_or(|kid| provider.keys.find(kid).is_some()))
-                .then(|| (provider.discovery.clone(), provider.keys.clone()))
-            })
-        };
-        if let Some(current) = current(&*self.provider.read().await) {
-            return Ok(current);
-        }
-        let _refreshing = self.refreshing.lock().await;
-        // Another sign-in may have read it while this one waited.
-        if let Some(current) = current(&*self.provider.read().await) {
-            return Ok(current);
-        }
-        match self.read_provider().await {
-            Ok((discovery, keys)) => {
-                *self.provider.write().await = Some(Provider {
-                    discovery: discovery.clone(),
-                    keys: keys.clone(),
-                    read: Instant::now(),
-                });
-                Ok((discovery, keys))
-            }
-            Err(error) => {
-                // While the provider can't be reached, what it said before still holds, for
-                // keys it had.
-                let provider = self.provider.read().await;
-                match provider.as_ref() {
-                    Some(provider) if kid.is_none_or(|kid| provider.keys.find(kid).is_some()) => {
-                        tracing::warn!(
-                            "reading the provider again failed, using what it said before: \
-                             {error:#}"
-                        );
-                        Ok((provider.discovery.clone(), provider.keys.clone()))
-                    }
-                    _ => Err(error),
-                }
-            }
-        }
-    }
-
-    /// The provider's discovery document and keys, read from it.
-    async fn read_provider(&self) -> anyhow::Result<(Discovery, JwkSet)> {
-        let issuer = self.config.issuer.trim_end_matches('/');
-        let discovery: Discovery = self
-            .get_json(&format!("{issuer}/.well-known/openid-configuration"))
-            .await
-            .context("reading the provider's discovery document")?;
-        // r[impl control.oidc.issuer]
-        if discovery.issuer.trim_end_matches('/') != issuer {
-            bail!(
-                "the provider says its issuer is `{}`, not `{issuer}`",
-                discovery.issuer
-            );
-        }
-        let keys: JwkSet = self
-            .get_json(&discovery.jwks_uri)
-            .await
-            .context("reading the provider's keys")?;
-        Ok((discovery, keys))
+    async fn discovery_and_keys(
+        &self,
+        kid: Option<&str>,
+    ) -> anyhow::Result<(Discovery, Arc<Said>)> {
+        let said = self.provider.said(kid).await?;
+        let discovery = said
+            .discovery
+            .clone()
+            .context("the provider has no discovery document")?;
+        Ok((discovery, said))
     }
 
     // r[impl control.oidc.login]
@@ -266,8 +176,11 @@ impl Oidc {
             .collect::<Vec<_>>()
             .join(" ");
         let redirect_uri = self.redirect_uri();
+        let authorization_endpoint = discovery
+            .authorization_endpoint
+            .context("the provider names no authorization endpoint")?;
         let url = with_query(
-            &discovery.authorization_endpoint,
+            &authorization_endpoint,
             &[
                 ("response_type", "code"),
                 ("client_id", &self.config.client_id),
@@ -379,7 +292,10 @@ impl Oidc {
             ("redirect_uri", &redirect_uri),
             ("code_verifier", &pending.verifier),
         ];
-        let mut request = self.client.post(&discovery.token_endpoint);
+        let token_endpoint = discovery
+            .token_endpoint
+            .context("the provider names no token endpoint")?;
+        let mut request = self.provider.client().post(&token_endpoint);
         match &self.config.client_secret {
             Some(secret) => request = request.basic_auth(&self.config.client_id, Some(secret)),
             None => form.push(("client_id", &self.config.client_id)),
@@ -429,24 +345,8 @@ impl Oidc {
                 header.alg
             );
         }
-        let (discovery, keys) = self.discovery_and_keys(header.kid.as_deref()).await?;
-        // r[impl control.oidc.id-token-key]
-        let jwk = match &header.kid {
-            Some(kid) => keys.find(kid),
-            // Without a key id, only when there's no choice of key.
-            None if keys.keys.len() == 1 => keys.keys.first(),
-            None => bail!("the ID token names no key, and the provider has several"),
-        }
-        .context("the ID token's key isn't among the provider's keys")?;
-        if let Some(algorithm) = &jwk.common.key_algorithm
-            && format!("{algorithm:?}") != format!("{:?}", header.alg)
-        {
-            bail!(
-                "the ID token is signed with {:?}, but its key is for {algorithm:?}",
-                header.alg
-            );
-        }
-        let key = DecodingKey::from_jwk(jwk).context("reading the provider's key")?;
+        let (discovery, said) = self.discovery_and_keys(header.kid.as_deref()).await?;
+        let key = provider::key(&said.keys, &header).context("checking the ID token's key")?;
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&discovery.issuer]);
         validation.set_audience(&[&self.config.client_id]);
@@ -470,7 +370,8 @@ impl Oidc {
             return Ok(None);
         };
         let response = self
-            .client
+            .provider
+            .client()
             .get(endpoint)
             .bearer_auth(access_token)
             .send()
@@ -658,7 +559,8 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, router).await });
 
         let mut oidc = Oidc::new(&config("http://127.0.0.1:9090", &issuer)).unwrap();
-        oidc.provider_ttl = Duration::from_millis(200);
+        oidc.provider.ttl = Duration::from_millis(200);
+        oidc.provider.reread_after = Duration::ZERO;
         let oidc = Arc::new(oidc);
         let reads = (0..10).map(|_| {
             let oidc = oidc.clone();
@@ -674,7 +576,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         oidc.discovery_and_keys(Some("a")).await.unwrap();
         assert!(fake.reads.load(Ordering::SeqCst) > 1);
-        assert!(oidc.discovery_and_keys(Some("rotated")).await.is_err());
+        let (_, said) = oidc.discovery_and_keys(Some("rotated")).await.unwrap();
+        assert!(said.keys.find("rotated").is_none());
         server.abort();
     }
 

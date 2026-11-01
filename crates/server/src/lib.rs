@@ -16,6 +16,7 @@ mod listen;
 mod logs;
 mod metrics;
 mod oidc;
+mod provider;
 mod range;
 mod refresh;
 mod spans;

@@ -1,18 +1,28 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use anyhow::Context;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
-use hylla_config::{JwtAlgorithm, MappingAuth, PathTemplate, Verifier, under_prefix};
+use hylla_config::{JwtAlgorithm, MappingAuth, PathTemplate, Verifier};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::{Map, Value};
+
+use crate::provider::{self, Provider, Source};
 
 /// The configured JWT verifiers, by name.
 pub struct Verifiers(HashMap<String, Arc<TokenVerifier>>);
 
-/// Checks tokens against one public key.
+/// Checks tokens against a public key, or the keys of their provider.
 pub struct TokenVerifier {
-    key: DecodingKey,
+    keys: Keys,
+    algorithm: Algorithm,
     validation: Validation,
+}
+
+enum Keys {
+    /// The configured public key.
+    Fixed(DecodingKey),
+    /// The keys the provider publishes.
+    Provider(Provider),
 }
 
 // r[impl auth.audience-warning]
@@ -38,7 +48,8 @@ fn warnings(verifiers: &HashMap<String, Verifier>) -> Vec<String> {
 
 impl Verifiers {
     // r[impl auth.keys]
-    /// Parses the public keys of the verifiers, failing on keys that don't parse.
+    /// Parses the public keys of the verifiers, failing on keys that don't parse. Keys from
+    /// providers are read when first needed.
     pub fn new(verifiers: &HashMap<String, Verifier>) -> anyhow::Result<Self> {
         for warning in warnings(verifiers) {
             tracing::warn!("{warning}");
@@ -76,19 +87,43 @@ impl Verifiers {
 
 impl TokenVerifier {
     fn new(verifier: &Verifier) -> anyhow::Result<Self> {
-        let pem = verifier.public_key.as_bytes();
-        let (algorithm, key) = match verifier.algorithm {
-            JwtAlgorithm::Rs256 => (Algorithm::RS256, DecodingKey::from_rsa_pem(pem)),
-            JwtAlgorithm::Rs384 => (Algorithm::RS384, DecodingKey::from_rsa_pem(pem)),
-            JwtAlgorithm::Rs512 => (Algorithm::RS512, DecodingKey::from_rsa_pem(pem)),
-            JwtAlgorithm::Ps256 => (Algorithm::PS256, DecodingKey::from_rsa_pem(pem)),
-            JwtAlgorithm::Ps384 => (Algorithm::PS384, DecodingKey::from_rsa_pem(pem)),
-            JwtAlgorithm::Ps512 => (Algorithm::PS512, DecodingKey::from_rsa_pem(pem)),
-            JwtAlgorithm::Es256 => (Algorithm::ES256, DecodingKey::from_ec_pem(pem)),
-            JwtAlgorithm::Es384 => (Algorithm::ES384, DecodingKey::from_ec_pem(pem)),
-            JwtAlgorithm::EdDsa => (Algorithm::EdDSA, DecodingKey::from_ed_pem(pem)),
+        let algorithm = match verifier.algorithm {
+            JwtAlgorithm::Rs256 => Algorithm::RS256,
+            JwtAlgorithm::Rs384 => Algorithm::RS384,
+            JwtAlgorithm::Rs512 => Algorithm::RS512,
+            JwtAlgorithm::Ps256 => Algorithm::PS256,
+            JwtAlgorithm::Ps384 => Algorithm::PS384,
+            JwtAlgorithm::Ps512 => Algorithm::PS512,
+            JwtAlgorithm::Es256 => Algorithm::ES256,
+            JwtAlgorithm::Es384 => Algorithm::ES384,
+            JwtAlgorithm::EdDsa => Algorithm::EdDSA,
         };
-        let key = key.context("parsing the public key")?;
+        // r[impl auth.provider-keys]
+        let keys = match (&verifier.public_key, &verifier.jwks_uri, &verifier.issuer) {
+            (Some(pem), _, _) => {
+                let pem = pem.as_bytes();
+                let key = match verifier.algorithm {
+                    JwtAlgorithm::Rs256
+                    | JwtAlgorithm::Rs384
+                    | JwtAlgorithm::Rs512
+                    | JwtAlgorithm::Ps256
+                    | JwtAlgorithm::Ps384
+                    | JwtAlgorithm::Ps512 => DecodingKey::from_rsa_pem(pem),
+                    JwtAlgorithm::Es256 | JwtAlgorithm::Es384 => DecodingKey::from_ec_pem(pem),
+                    JwtAlgorithm::EdDsa => DecodingKey::from_ed_pem(pem),
+                };
+                Keys::Fixed(key.context("parsing the public key")?)
+            }
+            (None, Some(jwks_uri), _) => {
+                Keys::Provider(Provider::new(Source::Jwks(jwks_uri.clone()))?)
+            }
+            (None, None, Some(issuer)) => {
+                Keys::Provider(Provider::new(Source::Issuer(issuer.clone()))?)
+            }
+            (None, None, None) => {
+                anyhow::bail!("there's no `public_key`, `jwks_uri` or `issuer` to read keys from")
+            }
+        };
 
         // r[impl auth.validate]
         // Only the configured algorithm is accepted, so tokens can't pick another one.
@@ -111,13 +146,42 @@ impl TokenVerifier {
             required.push("iss");
         }
         validation.set_required_spec_claims(&required);
-        Ok(Self { key, validation })
+        Ok(Self {
+            keys,
+            algorithm,
+            validation,
+        })
     }
 
     /// The claims of `token`, if it is valid.
-    fn verify(&self, token: &str) -> Result<Map<String, Value>, jsonwebtoken::errors::Error> {
-        jsonwebtoken::decode::<Map<String, Value>>(token, &self.key, &self.validation)
+    async fn verify(&self, token: &str) -> Result<Map<String, Value>, Refusal> {
+        let invalid = |error: String| Refusal::InvalidToken(error);
+        let key = match &self.keys {
+            Keys::Fixed(key) => Cow::Borrowed(key),
+            Keys::Provider(provider) => {
+                let header = jsonwebtoken::decode_header(token)
+                    .map_err(|error| invalid(error.to_string()))?;
+                // Tokens that can't be valid don't get to make hylla read the provider.
+                if header.alg != self.algorithm {
+                    return Err(invalid(format!(
+                        "the token is signed with {:?}",
+                        header.alg
+                    )));
+                }
+                // r[impl auth.provider-down]
+                let said = provider
+                    .said(header.kid.as_deref())
+                    .await
+                    .map_err(|error| Refusal::KeysUnavailable(format!("{error:#}")))?;
+                Cow::Owned(
+                    provider::key(&said.keys, &header)
+                        .map_err(|error| invalid(format!("{error:#}")))?,
+                )
+            }
+        };
+        jsonwebtoken::decode::<Map<String, Value>>(token, &key, &self.validation)
             .map(|data| data.claims)
+            .map_err(|error| invalid(error.to_string()))
     }
 }
 
@@ -137,6 +201,9 @@ pub enum Refusal {
     InvalidToken(String),
     /// A valid token that doesn't allow the path.
     Forbidden,
+    /// The verifier's provider has never been read, so there are no keys to check tokens
+    /// with.
+    KeysUnavailable(String),
     /// A path with `.` or `..` segments.
     DotSegments,
 }
@@ -145,7 +212,7 @@ impl CompiledAuth {
     // r[impl auth.bearer]
     // r[impl auth.paths]
     /// Checks a request for `backend_path`, the path requested from the backend.
-    pub fn check(&self, headers: &HeaderMap, backend_path: &str) -> Result<(), Refusal> {
+    pub async fn check(&self, headers: &HeaderMap, backend_path: &str) -> Result<(), Refusal> {
         // r[impl auth.dot-segments]
         if backend_path
             .split('/')
@@ -154,23 +221,27 @@ impl CompiledAuth {
             return Err(Refusal::DotSegments);
         }
         let token = bearer_token(headers).ok_or(Refusal::MissingToken)?;
-        let claims = self
-            .verifier
-            .verify(token)
-            .map_err(|error| Refusal::InvalidToken(error.to_string()))?;
+        let claims = self.verifier.verify(token).await?;
         if self.paths.is_empty() {
             return Ok(());
         }
-        let claim = |name: &str| match claims.get(name)? {
-            Value::String(value) => Some(value.clone()),
-            Value::Number(value) => Some(value.to_string()),
-            _ => None,
+        // r[impl auth.list-claims]
+        let claim = |name: &str| {
+            let text = |value: &Value| match value {
+                Value::String(value) => Some(value.clone()),
+                Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            };
+            match claims.get(name) {
+                Some(Value::Array(items)) => items.iter().filter_map(text).collect(),
+                Some(value) => text(value).into_iter().collect(),
+                None => Vec::new(),
+            }
         };
-        let allowed = self.paths.iter().any(|template| {
-            template
-                .render(claim)
-                .is_ok_and(|prefix| under_prefix(backend_path, &prefix))
-        });
+        let allowed = self
+            .paths
+            .iter()
+            .any(|template| template.allows(backend_path, claim));
         if allowed {
             Ok(())
         } else {
@@ -192,6 +263,7 @@ impl Refusal {
             Refusal::MissingToken => "missing_token",
             Refusal::InvalidToken(_) => "invalid_token",
             Refusal::Forbidden => "forbidden",
+            Refusal::KeysUnavailable(_) => "keys_unavailable",
             Refusal::DotSegments => "dot_segments",
         }
     }
@@ -212,6 +284,7 @@ pub fn refusal_response(refusal: &Refusal) -> (StatusCode, HeaderMap) {
             Some(r#"Bearer error="insufficient_scope""#),
         ),
         Refusal::DotSegments => (StatusCode::BAD_REQUEST, None),
+        Refusal::KeysUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, None),
     };
     if let Some(challenge) = challenge {
         headers.insert(
@@ -233,7 +306,8 @@ mod tests {
     fn verifiers_without_an_audience_are_warned_about() {
         let verifier = |audience: Option<&str>| Verifier {
             algorithm: JwtAlgorithm::Es256,
-            public_key: String::new(),
+            public_key: Some(String::new()),
+            jwks_uri: None,
             issuer: None,
             audience: audience.map(Into::into),
             leeway: Interval::from_secs(30),

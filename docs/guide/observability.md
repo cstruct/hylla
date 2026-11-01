@@ -39,7 +39,7 @@ Attributes never include object keys or request paths, so cardinality stays low.
 | `hylla.backend.request.duration` | `hylla.backend`, `hylla.operation`, `hylla.outcome` | Requests to backends |
 | `hylla.backend.bytes` | `hylla.backend` | Chunk bytes fetched from backends |
 | `hylla.refresh.objects` | `hylla.backend`, `hylla.rule`, `hylla.result` | Objects refresh runs handled, by what they did |
-| `hylla.auth.refusals` | `hylla.reason`: `missing_token`, `invalid_token`, `forbidden`, `dot_segments` | Requests refused by auth |
+| `hylla.auth.refusals` | `hylla.reason`: `missing_token`, `invalid_token`, `forbidden`, `dot_segments`, `keys_unavailable` | Requests refused by auth |
 | `hylla.cluster.members` | | Live nodes, this one included |
 | `hylla.cluster.updates` | `hylla.direction`, `hylla.kind` | Metadata, preload and forget updates sent and received |
 | `hylla.cluster.pulled_chunks` | `hylla.source`: `peer` or `backend` | Chunks of preloaded objects pulled |

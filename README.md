@@ -17,7 +17,8 @@ fetch each one from the bucket rarely, and keep serving while the bucket is down
   stale. Refresh rules check and preload objects in the background, so requests rarely wait
   on the bucket.
 - **Routing** by host and path prefix, with regex rewrites from paths to bucket keys.
-- **JWT auth** per mapping, optionally limiting each token to keys built from its claims.
+- **JWT auth** per mapping, with keys from your OpenID provider, optionally limiting each
+  token to keys built from its claims.
 - **Clusters** that share their work, so the bucket serves each object once per cluster,
   and **origin shields** for nodes far from the bucket.
 - **A control plane** to see how backends are doing and change objects, with sign-in through

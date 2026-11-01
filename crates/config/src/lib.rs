@@ -46,7 +46,7 @@ pub use load::{
 };
 pub use router::{Route, Router};
 pub use show::{ExplainError, explain, render};
-pub use template::{InvalidTemplate, PathTemplate, RenderError, under_prefix};
+pub use template::{InvalidTemplate, PathTemplate, under_prefix};
 pub use validate::ValidationError;
 
 config_tree! {
@@ -620,16 +620,21 @@ pub struct HyllaTls {
     pub key: String,
 }
 
-/// Checks JWTs: their signature against a public key, and their `exp` and `nbf` claims, and
-/// optionally their `iss` and `aud`.
+/// Checks JWTs: their signature against a public key, or the keys of their provider, and
+/// their `exp` and `nbf` claims, and optionally their `iss` and `aud`.
 #[config]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Verifier {
     /// The one algorithm tokens must be signed with.
     pub algorithm: JwtAlgorithm,
-    /// The public key, PEM encoded.
-    pub public_key: String,
-    /// When set, tokens must have this `iss`.
+    /// The public key, PEM encoded. Without it, keys are read from `jwks_uri`, or the
+    /// issuer's discovery document, and read again as the provider rotates them.
+    pub public_key: Option<String>,
+    /// Where the provider publishes its keys, as a JSON Web Key Set, for providers without a
+    /// discovery document.
+    pub jwks_uri: Option<String>,
+    /// When set, tokens must have this `iss`. Without a `public_key` or `jwks_uri`, keys are
+    /// read through its discovery document, at `{issuer}/.well-known/openid-configuration`.
     pub issuer: Option<String>,
     /// When set, tokens must have this `aud`.
     pub audience: Option<String>,

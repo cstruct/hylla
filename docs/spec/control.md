@@ -26,8 +26,9 @@ spaces, starting with a single `/` and without `\`. Anything else MUST return to
 
 r[control.oidc.keys]
 The provider's discovery document and keys MUST be read once for concurrent sign-ins, and
-read again after an hour or when an ID token names an unknown key. When the provider can't
-be reached then, what it said before MUST still be used, for the keys it had.
+read again after an hour or when an ID token names an unknown key, but not more than once
+every 30 seconds. When the provider can't be reached then, what it said before MUST still
+be used, for the keys it had.
 
 r[control.oidc.id-token-key]
 An ID token without a key id MUST only be checked with the provider's key when it has just
