@@ -79,10 +79,12 @@ pub async fn start(
         .route("/backends/{backend}/objects/{*key}", get(object))
         .route("/backends/{backend}/list", get(list))
         .with_state(app.clone());
-    Ok(tokio::spawn(crate::tls::serve(
+    Ok(tokio::spawn(crate::listen::serve(
         listener,
         router,
-        upstream.tls.clone(),
+        Some(upstream.tls.clone()),
+        app.limits.clone(),
+        app.shutdown(),
         "serve_backends",
     )))
 }
@@ -149,6 +151,7 @@ async fn object(
             path,
             &headers,
             method == Method::HEAD,
+            None,
         )
         .await
     }

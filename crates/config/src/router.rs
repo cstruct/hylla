@@ -135,6 +135,7 @@ mod tests {
                 })
                 .collect(),
             writable: false,
+            cache_control: None,
             auth: None,
         }
     }

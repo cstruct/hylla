@@ -46,8 +46,8 @@ pub use load::{
 };
 pub use router::{Route, Router};
 pub use show::{ExplainError, explain, render};
-pub use template::{InvalidTemplate, PathTemplate, RenderError, under_prefix};
-pub use validate::ValidationError;
+pub use template::{InvalidTemplate, PathTemplate, under_prefix};
+pub use validate::{ValidationError, is_secure_url};
 
 config_tree! {
     #[derive(Debug, Clone, PartialEq)]
@@ -78,6 +78,10 @@ config_tree! {
                     /// `${name}`.
                     pub replace: String,
                 }>,
+                // r[impl config.mappings.cache-control]
+                /// The `Cache-Control` of objects that have none of their own, such as
+                /// `public, max-age=300`. Without it, they're answered without one.
+                pub cache_control: Option<String>,
                 // r[impl config.mappings.writable]
                 /// Whether the control plane may change the mapping's objects: upload,
                 /// delete and move them, under its path prefix only. Public listeners never
@@ -173,6 +177,12 @@ config_tree! {
                 /// paths can tell more than they should, such as who a tenant is.
                 #[facet(default)]
                 pub record_paths: bool,
+                /// Whether requests to public listeners continue the traces their
+                /// `traceparent` header names, following their callers' sampling. Off by
+                /// default, since anyone can send one: turn it on behind a proxy that sets it.
+                /// Requests between nodes continue their traces either way.
+                #[facet(default)]
+                pub follow_callers: bool,
             },
             // r[impl config.telemetry.logs]
             /// Logging, to stderr and optionally exported.
@@ -224,6 +234,12 @@ config_tree! {
             /// least 32 characters.
             #[config(secret)]
             pub key: String,
+            // r[impl config.cluster.previous-keys]
+            /// Keys still accepted from other nodes, though not signed with, while the key is
+            /// changed one node at a time.
+            #[config(secret)]
+            #[facet(default)]
+            pub previous_keys: Vec<String>,
             // r[impl config.cluster.tls]
             /// Mutual TLS between the nodes, encrypting what they send each other and
             /// checking their certificates. Without it, nodes talk plain HTTP, though signed
@@ -231,7 +247,7 @@ config_tree! {
             pub tls: Option<pub struct ClusterTls {
                 /// The PEM file of the CA certificates nodes' certificates must be issued
                 /// by. Use a CA for the cluster only: any certificate it issued for
-                /// `server_name` is a node. Read at startup.
+                /// `server_name` is a node. Read again when it changes.
                 pub ca: String,
                 /// The PEM file of this node's certificate chain, read again when it
                 /// changes, so certificates can be rotated without a restart.
@@ -268,7 +284,7 @@ config_tree! {
             /// The listener's certificate, and what other nodes' certificates must be.
             pub tls: pub struct ServeTls {
                 /// The PEM file of the CA certificates other nodes' certificates must be
-                /// issued by. Read at startup.
+                /// issued by. Read again when it changes.
                 pub ca: String,
                 /// The PEM file of this node's certificate chain, issued for the host other
                 /// nodes reach it at. Read again when it changes.
@@ -329,6 +345,37 @@ config_tree! {
                 pub session_ttl: Interval,
             }>,
         }>,
+        // r[impl config.health]
+        /// Health checks for load balancers and orchestrators, on a listener of their own:
+        /// `/healthz` while the process runs, `/readyz` while it serves. Optional.
+        pub health: Option<pub struct Health {
+            /// The address to listen on, such as `0.0.0.0:8081`.
+            pub listen: SocketAddr,
+        }>,
+        // r[impl config.http]
+        /// Limits of every listener: the servers', the control plane's, the cluster's,
+        /// `serve_backends`' and the health checks'. Optional; every setting has a default.
+        #[facet(default)]
+        pub http: pub struct Http {
+            /// How long a client may take to send a request's headers, such as `10s`.
+            #[facet(default = Interval::from_secs(10))]
+            pub header_read_timeout: Interval,
+            /// How long a connection may go without sending or receiving anything, idle
+            /// between requests or stalled, before it's closed, such as `60s`. `0s` disables
+            /// it.
+            #[facet(default = Interval::from_secs(60))]
+            pub idle_timeout: Interval,
+            /// The most connections each listener has open at a time. Further ones wait to
+            /// be accepted.
+            #[facet(default = 10000)]
+            pub max_connections: u32,
+            /// On SIGTERM, how long requests in flight may take to finish before their
+            /// connections are closed, such as `20s`. Keep it below the time hylla is given
+            /// to stop, such as Kubernetes' `terminationGracePeriodSeconds`, so the cache is
+            /// written to disk before hylla is killed.
+            #[facet(default = Interval::from_secs(20))]
+            pub shutdown_timeout: Interval,
+        },
         // r[impl config.auth.verifiers]
         /// JWT verifiers by name, used by mappings' `auth`.
         #[facet(default)]
@@ -357,6 +404,12 @@ config_tree! {
             /// disables serving stale objects.
             #[facet(default = Interval::from_secs(24 * 60 * 60))]
             pub stale_if_error: Interval,
+            // r[impl config.cache.not-found-ttl]
+            /// How long an object the backend said is missing is answered with 404 without
+            /// asking it again, such as `10s`, so requests for missing objects don't all reach
+            /// the backend. Changing it through the control plane ends it. `0s` disables it.
+            #[facet(default = Interval::from_secs(10))]
+            pub not_found_ttl: Interval,
             // r[impl config.cache.write-policy]
             /// When chunks are written to disk.
             #[facet(default)]
@@ -397,6 +450,7 @@ impl Default for Cache {
             metadata_ttl: Interval::from_secs(30),
             stale_while_revalidate: Interval::from_secs(0),
             stale_if_error: Interval::from_secs(24 * 60 * 60),
+            not_found_ttl: Interval::from_secs(10),
             write_policy: WritePolicy::default(),
             memory: MemoryCache::default(),
             disk: None,
@@ -445,6 +499,7 @@ impl Default for TracesExport {
             endpoint: None,
             sample_ratio: 1.0,
             record_paths: false,
+            follow_callers: false,
         }
     }
 }
@@ -465,6 +520,27 @@ impl Default for ClusterShare {
         Self {
             metadata: true,
             preload: true,
+        }
+    }
+}
+
+impl Default for Http {
+    fn default() -> Self {
+        Self {
+            header_read_timeout: Interval::from_secs(10),
+            idle_timeout: Interval::from_secs(60),
+            max_connections: 10000,
+            shutdown_timeout: Interval::from_secs(20),
+        }
+    }
+}
+
+impl Default for BackendTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Interval::from_secs(5),
+            request: Interval::from_secs(30),
+            retries: 2,
         }
     }
 }
@@ -499,6 +575,9 @@ pub enum Backend {
         access_key_id: String,
         #[config(secret)]
         secret_access_key: String,
+        /// How long requests to the backend may take.
+        #[facet(default)]
+        timeouts: BackendTimeouts,
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
@@ -512,6 +591,9 @@ pub enum Backend {
         endpoint: Option<String>,
         #[config(secret)]
         account_key: String,
+        /// How long requests to the backend may take.
+        #[facet(default)]
+        timeouts: BackendTimeouts,
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
@@ -526,17 +608,39 @@ pub enum Backend {
         /// The name of the backend on that node.
         backend: String,
         tls: HyllaTls,
+        /// How long requests to the backend may take.
+        #[facet(default)]
+        timeouts: BackendTimeouts,
         /// Background refresh of cached objects.
         refresh: Option<Refresh>,
     },
+}
+
+// r[impl config.backends.timeouts]
+/// How long requests to a backend may take.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendTimeouts {
+    /// Connecting, such as `5s`.
+    #[facet(default = Interval::from_secs(5))]
+    pub connect: Interval,
+    /// A whole request, from sending it to reading the last byte of the response, such as
+    /// `30s`. A chunk must be fetched within it, and so must a listing for a refresh rule
+    /// from a `hylla` backend, which comes as one response.
+    #[facet(default = Interval::from_secs(30))]
+    pub request: Interval,
+    /// How many times requests to S3 or Azure that failed with a server error, or without an
+    /// answer, are retried, with backoff, within `request` from the first attempt.
+    #[facet(default = 2)]
+    pub retries: u32,
 }
 
 /// Mutual TLS with a `hylla` backend.
 #[config]
 #[derive(Debug, Clone, PartialEq)]
 pub struct HyllaTls {
-    /// The PEM file of the CA certificates the node's certificate must be issued by. Read at
-    /// startup.
+    /// The PEM file of the CA certificates the node's certificate must be issued by. Read
+    /// again when it changes.
     pub ca: String,
     /// The PEM file of this node's certificate chain, presented to the other node, issued for
     /// its `client_name`. Read again when it changes.
@@ -545,16 +649,21 @@ pub struct HyllaTls {
     pub key: String,
 }
 
-/// Checks JWTs: their signature against a public key, and their `exp` and `nbf` claims, and
-/// optionally their `iss` and `aud`.
+/// Checks JWTs: their signature against a public key, or the keys of their provider, and
+/// their `exp` and `nbf` claims, and optionally their `iss` and `aud`.
 #[config]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Verifier {
     /// The one algorithm tokens must be signed with.
     pub algorithm: JwtAlgorithm,
-    /// The public key, PEM encoded.
-    pub public_key: String,
-    /// When set, tokens must have this `iss`.
+    /// The public key, PEM encoded. Without it, keys are read from `jwks_uri`, or the
+    /// issuer's discovery document, and read again as the provider rotates them.
+    pub public_key: Option<String>,
+    /// Where the provider publishes its keys, as a JSON Web Key Set, for providers without a
+    /// discovery document.
+    pub jwks_uri: Option<String>,
+    /// When set, tokens must have this `iss`. Without a `public_key` or `jwks_uri`, keys are
+    /// read through its discovery document, at `{issuer}/.well-known/openid-configuration`.
     pub issuer: Option<String>,
     /// When set, tokens must have this `aud`.
     pub audience: Option<String>,
@@ -651,6 +760,15 @@ impl RefreshMode {
 }
 
 impl Backend {
+    /// How long requests to the backend may take.
+    pub fn timeouts(&self) -> &BackendTimeouts {
+        match self {
+            Backend::S3 { timeouts, .. }
+            | Backend::AzureBlob { timeouts, .. }
+            | Backend::Hylla { timeouts, .. } => timeouts,
+        }
+    }
+
     /// The backend's background refresh, if any.
     pub fn refresh(&self) -> Option<&Refresh> {
         match self {

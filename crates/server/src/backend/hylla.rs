@@ -7,7 +7,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{StreamExt, TryStreamExt, stream, stream::BoxStream};
 use http::{StatusCode, header};
-use hylla_config::HyllaTls;
+use hylla_config::{BackendTimeouts, HyllaTls};
 use object_store::{
     Attribute, Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload,
     ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
@@ -40,7 +40,13 @@ pub struct HyllaStore {
 
 impl HyllaStore {
     // r[impl upstream.tls]
-    pub fn new(url: &str, backend: &str, tls: &HyllaTls) -> anyhow::Result<Self> {
+    // r[impl backend.timeouts]
+    pub fn new(
+        url: &str,
+        backend: &str,
+        tls: &HyllaTls,
+        timeouts: &BackendTimeouts,
+    ) -> anyhow::Result<Self> {
         let files = crate::tls::Files {
             ca: &tls.ca,
             cert: &tls.cert,
@@ -49,6 +55,8 @@ impl HyllaStore {
         // The node is checked for its URL's host, as HTTPS servers are.
         let client = reqwest::Client::builder()
             .use_preconfigured_tls(crate::tls::client_config(&files, None)?)
+            .connect_timeout(timeouts.connect.duration())
+            .timeout(timeouts.request.duration())
             .build()?;
         Ok(Self {
             url: url.trim_end_matches('/').to_string(),
@@ -211,8 +219,16 @@ impl ObjectStore for HyllaStore {
             version: None,
         };
         let mut attributes = Attributes::new();
-        if let Some(content_type) = text(header::CONTENT_TYPE) {
-            attributes.insert(Attribute::ContentType, content_type.to_string().into());
+        for (name, attribute) in [
+            (header::CONTENT_TYPE, Attribute::ContentType),
+            (header::CACHE_CONTROL, Attribute::CacheControl),
+            (header::CONTENT_ENCODING, Attribute::ContentEncoding),
+            (header::CONTENT_DISPOSITION, Attribute::ContentDisposition),
+            (header::CONTENT_LANGUAGE, Attribute::ContentLanguage),
+        ] {
+            if let Some(value) = text(name) {
+                attributes.insert(attribute, value.to_string().into());
+            }
         }
         let payload = if options.head {
             stream::empty().boxed()

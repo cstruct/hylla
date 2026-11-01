@@ -1,0 +1,134 @@
+// Most of hylla's settings in one place, with what they do. Copy the parts you need: most
+// are optional, with defaults. docs/guide/configuration.md lists every setting, also those
+// of the control plane, mutual TLS and the other backend types.
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com cdn.example.com)
+    mappings (
+      {
+        path_prefix /assets
+        backend assets
+        // Regex replacements, applied in order: /assets/app.css is /app.css on the backend.
+        rewrites ({pattern "^/assets/(.*)$", replace /$1})
+      }
+      {
+        path_prefix /tenant
+        backend assets
+        // Optional: require a JWT.
+        auth {
+          verifier partners
+          // Optional: backend prefixes with claims filled in. A list claim allows each item.
+          paths ("/tenant/${sub}")
+          // Cache-Control: private (the default).
+          private true
+        }
+      }
+      {path_prefix /, backend assets}
+    )
+  }
+}
+// Optional: export over OTLP.
+telemetry {
+  service_name hylla
+  resource ({key deployment.environment, value production})
+  otlp {
+    // Or the OTEL_EXPORTER_OTLP_* environment variables.
+    endpoint http://collector:4318
+    protocol http_protobuf  // or grpc
+  }
+  metrics {
+    enabled true
+    endpoint http://prometheus:9090/api/v1/otlp/v1/metrics  // optional, per signal
+    interval 30s
+  }
+  traces {
+    enabled true
+    endpoint http://quickwit:7280/api/v1/otlp/v1/traces  // optional, per signal
+    sample_ratio 0.1  // callers' sampled traces are always continued
+    record_paths false  // paths can be sensitive
+  }
+  logs {
+    level info  // or RUST_LOG
+    format json  // or text; JSON lines carry trace and span IDs
+    export true  // over OTLP too
+    endpoint http://quickwit:7280/api/v1/otlp/v1/logs  // optional, per signal
+  }
+}
+// Optional: share with other hylla nodes.
+cluster {
+  listen 0.0.0.0:7946  // private network only: gossip and data between nodes
+  advertise 10.0.0.5:7946  // how the others reach this node
+  seeds (hylla-headless.cache.svc.cluster.local:7946)  // addresses or DNS names
+  share {
+    metadata true  // push revalidated metadata to the other nodes
+    preload true  // one node runs each refresh rule; the others pull from it
+  }
+}
+// JWT verifiers, by name.
+auth {
+  partners {
+    algorithm ES256  // RS256..512, PS256..512, ES256, ES384 or EdDSA
+    // One of: a fixed key, the provider's keys at a URL, or through the issuer's discovery
+    // document, as `issuer https://id.example.com` alone does.
+    public_key "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...\n-----END PUBLIC KEY-----\n"
+    // jwks_uri https://id.example.com/jwks
+    audience hylla  // optional; required in tokens when set (so is issuer)
+    leeway 30s  // clock skew allowed for exp and nbf
+  }
+}
+backends {
+  assets {
+    type s3  // s3 or azure_blob
+    bucket assets
+    region eu-north-1
+    endpoint http://localhost:9000  // optional, for S3 compatible stores
+    timeouts {connect 5s, request 30s}  // optional, these are the defaults
+    // Optional background refresh of this backend's objects.
+    refresh {
+      concurrency 4  // objects refreshed at the same time
+      rules (
+        // Backend keys: directory-like prefixes ("" for everything), or a single key.
+        // Modes: disabled, revalidate (the default), preload or both.
+        {prefix css/, every 15m, mode revalidate}
+        // Preloading needs max_objects and/or max_mib.
+        {key index.html, every 10m, mode both, max_objects 1}
+      )
+    }
+  }
+}
+// Optional: health checks for load balancers, on a listener of their own. /healthz
+// answers 200 while hylla runs, /readyz while it serves (503 once it's shutting down).
+health {
+  listen 0.0.0.0:8081
+}
+// Optional, every setting has a default. Applies to every listener.
+http {
+  header_read_timeout 10s  // to send a request's headers
+  idle_timeout 60s  // closes connections that send and receive nothing; 0s disables
+  max_connections 10000  // per listener; more wait to be accepted
+  // On SIGTERM, how long requests in flight may take to finish. Keep it below the time
+  // hylla gets to stop, such as terminationGracePeriodSeconds, so the cache is written.
+  shutdown_timeout 20s
+}
+// Optional, every setting has a default.
+cache {
+  chunk_size_kib 1024  // objects are cached in chunks of this size
+  metadata_ttl 30s  // how long size, ETag and content type are cached
+  // Past the TTL, keep serving this long while revalidating in the background, so
+  // requests don't wait; 0s disables.
+  stale_while_revalidate 0s
+  // Keep serving cached objects this long past their TTL while the backend fails; 0s
+  // disables.
+  stale_if_error 1d
+  write_policy on_eviction  // or on_insertion: when chunks are written to disk
+  memory {
+    capacity_mib 256
+  }
+  // Optional; without it only memory is used.
+  disk {
+    path /var/cache/hylla
+    capacity_mib 10240
+    block_size_mib 16  // foyer disk blocks; a chunk must fit in one
+  }
+}

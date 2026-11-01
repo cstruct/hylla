@@ -38,6 +38,12 @@ struct Behaviour {
     audience: &'static str,
     /// Replaces the nonce of the sign-in.
     nonce: Option<&'static str>,
+    /// The key id in ID tokens' headers.
+    kid: Option<&'static str>,
+    /// The algorithm the provider's key is for.
+    key_algorithm: &'static str,
+    /// Whether the provider publishes another key too.
+    another_key: bool,
 }
 
 impl Default for Behaviour {
@@ -47,6 +53,9 @@ impl Default for Behaviour {
             user_info_groups: None,
             audience: "hylla",
             nonce: None,
+            kid: Some("test-key"),
+            key_algorithm: "ES256",
+            another_key: false,
         }
     }
 }
@@ -136,7 +145,15 @@ async fn discovery(State(state): State<Shared>) -> Json<Value> {
 }
 
 async fn jwks(State(state): State<Shared>) -> Json<Value> {
-    Json(json!({ "keys": [state.lock().unwrap().jwk.clone()] }))
+    let state = state.lock().unwrap();
+    let mut jwk = state.jwk.clone();
+    jwk["alg"] = json!(state.behaviour.key_algorithm);
+    let mut keys = vec![jwk.clone()];
+    if state.behaviour.another_key {
+        jwk["kid"] = json!("other-key");
+        keys.push(jwk);
+    }
+    Json(json!({ "keys": keys }))
 }
 
 async fn token(
@@ -188,7 +205,7 @@ async fn token(
         claims["groups"] = json!(groups);
     }
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    header.kid = Some("test-key".into());
+    header.kid = behaviour.kid.map(Into::into);
     let id_token = jsonwebtoken::encode(&header, &claims, &state.key).unwrap();
     (
         StatusCode::OK,
@@ -237,6 +254,7 @@ async fn node_with_issuer(issuer: &str) -> Arc<App> {
                     backend: "assets".into(),
                     rewrites: Vec::new(),
                     writable: false,
+                    cache_control: None,
                     auth: None,
                 }],
             },
@@ -249,6 +267,7 @@ async fn node_with_issuer(issuer: &str) -> Arc<App> {
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
+                timeouts: Default::default(),
                 refresh: None,
             },
         )]),
@@ -277,6 +296,8 @@ async fn node_with_issuer(issuer: &str) -> Arc<App> {
             }),
         }),
         serve_backends: None,
+        health: None,
+        http: Default::default(),
     };
     config.validate().unwrap();
     let stores = HashMap::from([(
@@ -617,5 +638,65 @@ async fn providers_must_be_the_issuer_they_say() {
     let app = node_with_issuer(&provider.issuer.replace("127.0.0.1", "localhost")).await;
     let login = send(&app, page("/auth/login")).await;
     assert_eq!(login.status, StatusCode::BAD_GATEWAY);
-    assert!(login.body.contains("issuer"), "{}", login.body);
+    // The mismatch is logged, not told to whoever is signing in.
+    assert!(!login.body.contains("issuer"), "{}", login.body);
+    assert!(!login.body.contains("localhost"), "{}", login.body);
+    // Reached under its own name, the same provider works.
+    let app = node(&provider).await;
+    assert_eq!(
+        send(&app, page("/auth/login")).await.status,
+        StatusCode::SEE_OTHER
+    );
+}
+
+// r[verify control.oidc.return-to]
+#[tokio::test]
+async fn signing_in_never_returns_elsewhere() {
+    let provider = Provider::start().await;
+    let app = node(&provider).await;
+    for return_to in ["/%09/evil.example", "/%0A/evil.example", "//evil.example"] {
+        let callback = sign_in(&app, &provider, return_to).await;
+        assert_eq!(callback.status, StatusCode::SEE_OTHER, "{}", callback.body);
+        assert_eq!(callback.location(), "/", "{return_to}");
+    }
+}
+
+// r[verify control.oidc.id-token-key]
+// r[verify control.oidc.errors]
+#[tokio::test]
+async fn id_tokens_must_name_their_key_and_match_its_algorithm() {
+    let outcome = async |behaviour: Behaviour| {
+        let provider = Provider::start().await;
+        provider.behave(behaviour);
+        let app = node(&provider).await;
+        let answer = sign_in(&app, &provider, "/").await;
+        (answer, provider.issuer.clone())
+    };
+    // Without a key id, the only key is used.
+    let (answer, _) = outcome(Behaviour {
+        kid: None,
+        ..Behaviour::default()
+    })
+    .await;
+    assert_eq!(answer.status, StatusCode::SEE_OTHER, "{}", answer.body);
+
+    for behaviour in [
+        // Without a key id, and a choice of keys.
+        Behaviour {
+            kid: None,
+            another_key: true,
+            ..Behaviour::default()
+        },
+        // Signed with another algorithm than its key is for.
+        Behaviour {
+            key_algorithm: "ES384",
+            ..Behaviour::default()
+        },
+    ] {
+        let (answer, issuer) = outcome(behaviour).await;
+        assert_eq!(answer.status, StatusCode::BAD_GATEWAY, "{}", answer.body);
+        // Why is for the logs, not for whoever is signing in.
+        assert!(!answer.body.contains("ES"), "{}", answer.body);
+        assert!(!answer.body.contains(&issuer), "{}", answer.body);
+    }
 }

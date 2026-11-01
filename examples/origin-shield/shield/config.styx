@@ -1,0 +1,38 @@
+// The shield: next to the bucket, serving it through its cache to edge nodes elsewhere, so
+// the bucket serves each object once for all of them.
+servers {
+  // Optional: it can serve clients itself too.
+  local {
+    listen 0.0.0.0:8080
+    server_names (shield.internal)
+    mappings ({path_prefix /, backend assets})
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+  }
+}
+serve_backends {
+  listen 0.0.0.0:7947
+  // Only these backends are served; others are refused.
+  backends (assets)
+  // Always mutual TLS.
+  tls {
+    ca /etc/hylla/tls/ca.crt
+    // Issued for the host the edges reach it at: shield.internal.
+    cert /etc/hylla/tls/tls.crt
+    key /etc/hylla/tls/tls.key
+    // Only certificates the CA issued for this name are edges.
+    client_name hylla.edge
+  }
+}
+cache {
+  memory {capacity_mib 4096}
+  disk {
+    path /var/cache/hylla
+    capacity_mib 512000
+  }
+}

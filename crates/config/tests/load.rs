@@ -167,6 +167,7 @@ fn loads_servers_and_backends() {
                     replace: "/$1".into(),
                 }],
                 writable: false,
+                cache_control: None,
                 auth: None,
             },
             Mapping {
@@ -174,6 +175,7 @@ fn loads_servers_and_backends() {
                 backend: "archive".into(),
                 rewrites: Vec::new(),
                 writable: false,
+                cache_control: None,
                 auth: None,
             },
         ]
@@ -211,6 +213,7 @@ fn loads_servers_and_backends() {
             endpoint: None,
             access_key_id: "AKIA123".into(),
             secret_access_key: "s3cr3t".into(),
+            timeouts: Default::default(),
             refresh: None,
         }
     );
@@ -221,6 +224,7 @@ fn loads_servers_and_backends() {
             container: "archive".into(),
             endpoint: None,
             account_key: "hunter2".into(),
+            timeouts: Default::default(),
             refresh: None,
         }
     );
@@ -377,6 +381,7 @@ fn cache_settings_default_when_left_out() {
     assert_eq!(cache.metadata_ttl, Interval::from_secs(30));
     assert_eq!(cache.stale_while_revalidate, Interval::from_secs(0));
     assert_eq!(cache.stale_if_error, Interval::from_secs(24 * 60 * 60));
+    assert_eq!(cache.not_found_ttl, Interval::from_secs(10));
     assert_eq!(cache.write_policy, WritePolicy::OnEviction);
     assert_eq!(cache.memory.capacity_mib, 256);
     assert_eq!(cache.disk, None);
@@ -386,6 +391,7 @@ fn cache_settings_default_when_left_out() {
   metadata_ttl 5m
   stale_while_revalidate 1m
   stale_if_error 0s
+  not_found_ttl 0s
   write_policy on_insertion
   memory {{capacity_mib 64}}
   disk {{
@@ -405,6 +411,7 @@ fn cache_settings_default_when_left_out() {
     assert_eq!(cache.metadata_ttl, Interval::from_secs(5 * 60));
     assert_eq!(cache.stale_while_revalidate, Interval::from_secs(60));
     assert_eq!(cache.stale_if_error, Interval::from_secs(0));
+    assert_eq!(cache.not_found_ttl, Interval::from_secs(0));
     assert_eq!(cache.write_policy, WritePolicy::OnInsertion);
     assert_eq!(cache.memory.capacity_mib, 64);
     assert_eq!(
@@ -577,6 +584,15 @@ auth {
     public_key key
     leeway 1m
   }
+  provider {
+    algorithm ES256
+    issuer https://id.example.com
+    audience hylla
+  }
+  keys {
+    algorithm RS256
+    jwks_uri https://id.example.com/jwks
+  }
 }
 servers {
   public {
@@ -624,14 +640,26 @@ fn mappings_configure_auth() {
     assert!(
         partners
             .public_key
+            .as_ref()
+            .unwrap()
             .starts_with("-----BEGIN PUBLIC KEY-----\nkey\n")
     );
+    assert_eq!(partners.jwks_uri, None);
     assert_eq!(partners.audience.as_deref(), Some("hylla"));
     assert_eq!(partners.issuer, None);
     assert_eq!(partners.leeway, Interval::from_secs(30));
     let internal = &config.auth["internal"];
     assert_eq!(internal.algorithm, JwtAlgorithm::EdDsa);
     assert_eq!(internal.leeway, Interval::from_secs(60));
+    // Without a public key, keys are read from the provider.
+    let provider = &config.auth["provider"];
+    assert_eq!(provider.public_key, None);
+    assert_eq!(provider.issuer.as_deref(), Some("https://id.example.com"));
+    let keys = &config.auth["keys"];
+    assert_eq!(
+        keys.jwks_uri.as_deref(),
+        Some("https://id.example.com/jwks")
+    );
 
     let mappings = &config.servers["public"].mappings;
     assert_eq!(
@@ -683,6 +711,47 @@ fn mapping_auth_is_validated() {
     assert!(errors[0].contains("mapping 0") && errors[0].contains("must start with `/`"));
     assert!(errors[1].contains("mapping 0") && errors[1].contains("claim names may only contain"));
     assert!(errors[2].contains("mapping 1") && errors[2].contains("unknown verifier `missing`"));
+}
+
+// r[verify config.validate.verifiers]
+#[test]
+fn verifiers_need_one_source_of_keys() {
+    let config = AUTH
+        .replace(
+            "    audience hylla\n  }\n  internal",
+            "    audience hylla\n    jwks_uri https://id.example.com/jwks\n  }\n  internal",
+        )
+        .replace("    public_key key\n", "")
+        .replace(
+            "issuer https://id.example.com",
+            "issuer http://id.example.com",
+        )
+        .replace(
+            "jwks_uri https://id.example.com/jwks\n  }\n}",
+            "jwks_uri ftp://id.example.com/jwks\n  }\n}",
+        );
+    let files = Files::new(
+        "auth-verifiers",
+        &config,
+        "backends {assets {access_key_id a, secret_access_key b}}",
+    );
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(
+        errors,
+        [
+            "auth verifier `internal` is invalid: it needs a `public_key`, a `jwks_uri`, or an \
+             `issuer` to read its keys from",
+            "auth verifier `keys` is invalid: `jwks_uri` is `ftp://id.example.com/jwks`, \
+             which isn't an HTTPS URL, or an HTTP one to this host",
+            "auth verifier `partners` is invalid: set either `public_key` or `jwks_uri`, not \
+             both",
+            "auth verifier `provider` is invalid: `issuer` is `http://id.example.com`, which \
+             isn't an HTTPS URL, or an HTTP one to this host",
+        ]
+    );
 }
 
 const CLUSTER: &str = "
@@ -737,6 +806,39 @@ fn clusters_are_configured_with_a_secret_key() {
     assert_eq!(
         violations.layer_mismatches()[0].path.to_string(),
         "cluster.key"
+    );
+}
+
+// r[verify config.cluster.previous-keys]
+#[test]
+fn clusters_accept_previous_keys_while_the_key_changes() {
+    let secrets = &format!(
+        r#"cluster {{
+  key "a cluster key of at least thirty-two characters"
+  previous_keys ("the previous key of at least thirty-two characters")
+}}
+{MINIMAL_SECRETS}"#
+    );
+    let files = Files::new("cluster-previous-keys", CLUSTER, secrets);
+    let cluster = files.load(&[]).unwrap().into_config().cluster.unwrap();
+    assert_eq!(
+        cluster.previous_keys,
+        ["the previous key of at least thirty-two characters"]
+    );
+
+    let short = secrets.replace(
+        "the previous key of at least thirty-two characters",
+        "short",
+    );
+    let files = Files::new("cluster-short-previous-key", CLUSTER, &short);
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    assert!(
+        errors[0]
+            .to_string()
+            .contains("`previous_keys` must each be at least 32 characters"),
+        "{errors:?}"
     );
 }
 
@@ -901,25 +1003,57 @@ fn flags_override_the_config_file_and_environment() {
     assert_eq!(loaded.config().telemetry.logs.level, "info");
 }
 
-/// The ```styx block of the README starting with `first_line`.
-fn readme_block(first_line: &str) -> String {
-    let readme =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md")).unwrap();
-    let start = readme
-        .find(&format!("```styx\n{first_line}\n"))
-        .unwrap_or_else(|| panic!("no README block starting with `{first_line}`"))
-        + "```styx\n".len();
-    let end = start + readme[start..].find("```").unwrap();
-    readme[start..end].to_string()
+/// A file of the examples, by its path under `examples/`.
+fn example(path: &str) -> String {
+    let path = format!("{}/../../examples/{path}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("reading {path}: {error}"))
+}
+
+/// The directories under `examples/` with a `config.styx`, relative to it.
+fn example_dirs() -> Vec<String> {
+    fn walk(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<String>) {
+        if dir.join("config.styx").exists() {
+            let relative = dir.strip_prefix(root).unwrap();
+            found.push(relative.to_string_lossy().into_owned());
+        }
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, found);
+            }
+        }
+    }
+    let root = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples"));
+    let mut found = Vec::new();
+    walk(&root, &root, &mut found);
+    found.sort();
+    found
 }
 
 // r[verify config.sources]
 #[test]
-fn the_readme_example_loads() {
+fn every_example_loads() {
+    let dirs = example_dirs();
+    assert!(dirs.len() >= 7, "{dirs:?}");
+    for dir in dirs {
+        let files = Files::new(
+            &format!("example-{}", dir.replace('/', "-")),
+            &example(&format!("{dir}/config.styx")),
+            &example(&format!("{dir}/secrets.styx")),
+        );
+        if let Err(error) = files.load(&[]) {
+            panic!("examples/{dir} doesn't load: {error}");
+        }
+    }
+}
+
+// r[verify config.sources]
+#[test]
+fn the_reference_example_loads() {
     let files = Files::new(
-        "readme",
-        &readme_block("// config.styx"),
-        &readme_block("// secrets.styx"),
+        "reference",
+        &example("reference/config.styx"),
+        &example("reference/secrets.styx"),
     );
     let config = files.load(&[]).unwrap().into_config();
     assert_eq!(config.servers["public"].mappings.len(), 3);
@@ -927,6 +1061,8 @@ fn the_readme_example_loads() {
     assert!(
         config.auth["partners"]
             .public_key
+            .as_deref()
+            .unwrap()
             .starts_with("-----BEGIN PUBLIC KEY-----\n")
     );
 }
@@ -1059,11 +1195,11 @@ fn explain_shows_the_shadow_chain() {
 
 // r[verify config.show]
 #[test]
-fn the_readme_example_shows_as_styx() {
+fn the_reference_example_shows_as_styx() {
     let files = Files::new(
-        "readme-show",
-        &readme_block("// config.styx"),
-        &readme_block("// secrets.styx"),
+        "reference-show",
+        &example("reference/config.styx"),
+        &example("reference/secrets.styx"),
     );
     let shown = hylla_config::render(&files.load(&[]).unwrap().into());
     facet_styx::from_str::<facet_value::Value>(&shown).unwrap();
@@ -1323,6 +1459,7 @@ fn hylla_backends_read_another_node_over_tls() {
                 cert: "/etc/hylla/tls/tls.crt".into(),
                 key: "/etc/hylla/tls/tls.key".into(),
             },
+            timeouts: Default::default(),
             refresh: None,
         }
     );
@@ -1410,4 +1547,98 @@ fn backends_are_served_to_other_nodes_over_tls() {
              name",
         ]
     );
+}
+
+// r[verify config.http]
+// r[verify config.health]
+// r[verify config.backends.timeouts]
+#[test]
+fn listener_limits_health_and_timeouts_default_when_left_out() {
+    let files = Files::new("http-defaults", MINIMAL, MINIMAL_SECRETS);
+    let config = files.load(&[]).unwrap().into_config();
+    assert_eq!(config.http, hylla_config::Http::default());
+    assert_eq!(config.http.header_read_timeout, Interval::from_secs(10));
+    assert_eq!(config.http.idle_timeout, Interval::from_secs(60));
+    assert_eq!(config.http.max_connections, 10000);
+    assert_eq!(config.http.shutdown_timeout, Interval::from_secs(20));
+    assert_eq!(config.health, None);
+    let timeouts = config.backends["assets"].timeouts();
+    assert_eq!(timeouts.connect, Interval::from_secs(5));
+    assert_eq!(timeouts.request, Interval::from_secs(30));
+    assert_eq!(timeouts.retries, 2);
+
+    let config = "servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
+backends {assets {type s3, bucket assets, region eu-north-1, timeouts {connect 2s, request 1m}}}
+health {listen 0.0.0.0:8081}
+http {
+  header_read_timeout 5s
+  idle_timeout 2m
+  max_connections 100
+  shutdown_timeout 10s
+}
+";
+    let files = Files::new("http-settings", config, MINIMAL_SECRETS);
+    let config = files
+        .load(&[("HYLLA__HTTP__MAX_CONNECTIONS", "50")])
+        .unwrap()
+        .into_config();
+    assert_eq!(
+        config.http,
+        hylla_config::Http {
+            header_read_timeout: Interval::from_secs(5),
+            idle_timeout: Interval::from_secs(120),
+            max_connections: 50,
+            shutdown_timeout: Interval::from_secs(10),
+        }
+    );
+    assert_eq!(
+        config.health,
+        Some(hylla_config::Health {
+            listen: "0.0.0.0:8081".parse().unwrap()
+        })
+    );
+    let timeouts = config.backends["assets"].timeouts();
+    assert_eq!(timeouts.connect, Interval::from_secs(2));
+    assert_eq!(timeouts.request, Interval::from_secs(60));
+}
+
+// r[verify config.validate.http]
+// r[verify config.validate.health]
+// r[verify config.validate.backend-timeouts]
+#[test]
+fn listener_limits_health_and_timeouts_are_validated() {
+    let config = "servers {public {listen 0.0.0.0:8080, server_names (cache.example.com), mappings ({path_prefix /, backend assets})}}
+backends {assets {type s3, bucket assets, region eu-north-1, timeouts {connect 0s, request 1m}}}
+health {listen 0.0.0.0:8080}
+http {
+  header_read_timeout 0s
+  max_connections 0
+}
+";
+    let files = Files::new("http-invalid", config, MINIMAL_SECRETS);
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let reasons = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(reasons.len(), 4, "{reasons:#?}");
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("`timeouts.connect` must be positive"))
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("`header_read_timeout` must be positive"))
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("`max_connections` must be positive"))
+    );
+    assert!(reasons.iter().any(|reason| {
+        reason.contains(
+            "invalid health config: `listen` is 0.0.0.0:8080, which server `public` listens on too",
+        )
+    }));
 }

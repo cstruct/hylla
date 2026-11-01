@@ -12,6 +12,10 @@ pub struct Flaky {
     inner: Arc<InMemory>,
     failing: std::sync::atomic::AtomicBool,
     requests: std::sync::atomic::AtomicUsize,
+    /// How long reads wait before they're answered, in milliseconds.
+    delay_ms: std::sync::atomic::AtomicU64,
+    /// Whether objects are answered without ETags, as some stores do.
+    no_etags: std::sync::atomic::AtomicBool,
 }
 
 impl Flaky {
@@ -20,12 +24,28 @@ impl Flaky {
             inner,
             failing: false.into(),
             requests: 0.into(),
+            delay_ms: 0.into(),
+            no_etags: false.into(),
         })
     }
 
     pub fn fail(&self, failing: bool) {
         self.failing
             .store(failing, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Makes reads wait this long, as a slow backend does.
+    pub fn delay(&self, delay: std::time::Duration) {
+        self.delay_ms.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Answers objects without ETags from now on.
+    pub fn strip_etags(&self) {
+        self.no_etags
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn requests(&self) -> usize {
@@ -76,7 +96,15 @@ impl ObjectStore for Flaky {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         self.check()?;
-        self.inner.get_opts(location, options).await
+        let delay = self.delay_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        let mut result = self.inner.get_opts(location, options).await?;
+        if self.no_etags.load(std::sync::atomic::Ordering::Relaxed) {
+            result.meta.e_tag = None;
+        }
+        Ok(result)
     }
 
     fn delete_stream(

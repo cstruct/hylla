@@ -28,6 +28,7 @@ fn mapping(path_prefix: &str, writable: bool) -> Mapping {
         backend: String::new(),
         rewrites: Vec::new(),
         writable,
+        cache_control: None,
         auth: None,
     }
 }
@@ -76,6 +77,7 @@ async fn node(backend: &str) -> (Arc<App>, Arc<InMemory>) {
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
+                timeouts: Default::default(),
                 refresh: None,
             },
         )]),
@@ -91,10 +93,12 @@ async fn node(backend: &str) -> (Arc<App>, Arc<InMemory>) {
                     password_hash: hash(PASSWORD),
                 },
             )]),
-            max_upload_mib: 1,
+            max_upload_mib: 32,
             oidc: None,
         }),
         serve_backends: None,
+        health: None,
+        http: Default::default(),
     };
     config.validate().unwrap();
     let stores = HashMap::from([(backend.to_string(), memory.clone() as Arc<dyn ObjectStore>)]);
@@ -330,14 +334,56 @@ async fn writable_mappings_change_objects_under_their_prefix() {
     }
     assert!(memory.head(&Path::from("readme.txt")).await.is_ok());
 
-    // Uploads are limited, here to 1 MiB.
+    // Uploads are limited, here to 32 MiB, also when sent in parts.
     let answer = send(
         &app,
         signed_in("PUT", "/v1/mappings/public/0/objects/big.bin"),
-        Body::from(vec![0u8; 2 * 1024 * 1024]),
+        Body::from(vec![0u8; 33 * 1024 * 1024]),
     )
     .await;
     assert_eq!(answer.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(memory.head(&Path::from("uploads/big.bin")).await.is_err());
+}
+
+// r[verify control.upload-streaming]
+#[tokio::test]
+async fn large_uploads_are_sent_in_parts() {
+    let (app, memory) = node("streaming").await;
+    // 20 MiB in 64 KiB pieces, as a client sends it: several parts.
+    let content = (0..20 * 1024 * 1024u32)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let pieces = content
+        .chunks(64 * 1024)
+        .map(|piece| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(piece)))
+        .collect::<Vec<_>>();
+    let answer = send(
+        &app,
+        signed_in("PUT", "/v1/mappings/public/0/objects/big.bin"),
+        Body::from_stream(futures::stream::iter(pieces)),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT, "{}", answer.body);
+    let stored = memory
+        .get(&Path::from("uploads/big.bin"))
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), content.len());
+    assert!(stored == content);
+
+    // Small ones in one request, as before.
+    let answer = send(
+        &app,
+        signed_in("PUT", "/v1/mappings/public/0/objects/small.txt"),
+        Body::from("small"),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NO_CONTENT);
+    let stored = memory.get(&Path::from("uploads/small.txt")).await.unwrap();
+    assert_eq!(stored.bytes().await.unwrap(), "small");
 }
 
 // r[verify control.same-origin]
@@ -459,6 +505,7 @@ fn writable_mappings_and_the_control_plane_are_validated() {
                         replace: "/x/$1".into(),
                     }],
                     writable: true,
+                    cache_control: None,
                     auth: None,
                 }],
             },
@@ -473,6 +520,7 @@ fn writable_mappings_and_the_control_plane_are_validated() {
                     cert: "tls.crt".into(),
                     key: "tls.key".into(),
                 },
+                timeouts: Default::default(),
                 refresh: None,
             },
         )]),
@@ -492,6 +540,8 @@ fn writable_mappings_and_the_control_plane_are_validated() {
             oidc: None,
         }),
         serve_backends: None,
+        health: None,
+        http: Default::default(),
     };
     let errors = config
         .validate()
@@ -543,10 +593,55 @@ fn writable_mappings_and_the_control_plane_are_validated() {
     assert_eq!(
         errors,
         [
-            "`oidc.issuer` is `id.example.com`, which isn't a URL",
+            "`oidc.issuer` is `id.example.com`, which isn't an HTTPS URL, or an HTTP one to this host",
             "`oidc.client_id` must be set",
             "`oidc.groups` must allow at least one group in",
             "`oidc.session_ttl` must be positive",
         ]
     );
+}
+
+// r[verify control.headers]
+#[tokio::test]
+async fn pages_cant_be_framed_by_other_sites() {
+    let (app, _) = node("headers").await;
+    let page = signed_in("GET", "/").header(header::ACCEPT, "text/html");
+    let unauthenticated = Request::builder().uri("/v1/backends");
+    for answer in [
+        send(&app, page, Body::empty()).await,
+        send(&app, unauthenticated, Body::empty()).await,
+    ] {
+        let header = |name| answer.headers.get(name).unwrap().to_str().unwrap();
+        assert_eq!(header(header::X_FRAME_OPTIONS), "DENY");
+        assert_eq!(
+            header(header::CONTENT_SECURITY_POLICY),
+            "frame-ancestors 'none'"
+        );
+        assert_eq!(header(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+        assert_eq!(header(header::REFERRER_POLICY), "no-referrer");
+    }
+}
+
+// r[verify control.auth-limits]
+#[tokio::test]
+async fn clients_failing_to_sign_in_are_slowed_down() {
+    let (app, _) = node("auth-limits").await;
+    let from = |addr: &str, password: &str| {
+        let addr: std::net::SocketAddr = addr.parse().unwrap();
+        Request::builder()
+            .uri("/v1/backends")
+            .header(header::AUTHORIZATION, basic("admin", password))
+            .extension(axum::extract::ConnectInfo(addr))
+    };
+    for _ in 0..10 {
+        let answer = send(&app, from("10.0.0.1:5000", "wrong"), Body::empty()).await;
+        assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+    }
+    // Further attempts from the same address are refused, even with the right password...
+    let answer = send(&app, from("10.0.0.1:5001", PASSWORD), Body::empty()).await;
+    assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(answer.headers.contains_key(header::RETRY_AFTER));
+    // ...but not from others.
+    let answer = send(&app, from("10.0.0.2:5000", PASSWORD), Body::empty()).await;
+    assert_eq!(answer.status, StatusCode::OK);
 }

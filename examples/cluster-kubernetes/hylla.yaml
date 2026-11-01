@@ -1,0 +1,160 @@
+# A starting point for running a hylla cluster in Kubernetes: three pods in a StatefulSet,
+# each with its own disk cache, finding each other through a headless service, and talking
+# over mutual TLS with certificates from cert-manager.
+#
+#   kubectl create namespace hylla
+#   kubectl -n hylla create configmap hylla-config --from-file=config.styx
+#   kubectl -n hylla create secret generic hylla-secrets --from-file=secrets.styx
+#   kubectl -n hylla apply -f hylla.yaml
+#
+# The Certificate needs a cert-manager CA issuer of the cluster's own, named
+# hylla-cluster-ca here: any certificate it issues for hylla.cluster is a node.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hylla
+spec:
+  selector:
+    app: hylla
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Gossip between the nodes. Headless, so its name returns every pod, ready or not, since
+# nodes must find each other before they're ready.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hylla-cluster
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: hylla
+  ports:
+    - name: cluster
+      port: 7946
+      targetPort: cluster
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: hylla-cluster
+spec:
+  secretName: hylla-cluster-tls
+  dnsNames:
+    - hylla.cluster
+  # A node is both a server and a client of the others.
+  usages:
+    - server auth
+    - client auth
+  issuerRef:
+    name: hylla-cluster-ca
+    kind: Issuer
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hylla
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: hylla
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hylla
+spec:
+  serviceName: hylla-cluster
+  replicas: 3
+  # All nodes start together; they don't depend on each other to start.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: hylla
+  template:
+    metadata:
+      labels:
+        app: hylla
+    spec:
+      # Above http.shutdown_timeout, so requests finish and the cache is written to disk.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        # The image's nonroot user, so it can write the disk cache.
+        runAsUser: 65532
+        fsGroup: 65532
+      containers:
+        - name: hylla
+          image: cstruct/hylla:0.1
+          args: ["--config", "/etc/hylla/config.styx", "--secrets", "/etc/hylla/secrets/secrets.styx"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # How the other nodes reach this one.
+            - name: HYLLA__CLUSTER__ADVERTISE
+              value: "$(POD_IP):7946"
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: health
+              containerPort: 8081
+            - name: cluster
+              containerPort: 7946
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "1"
+              # The memory cache, plus room for the process.
+              memory: 1536Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/hylla/config.styx
+              subPath: config.styx
+              readOnly: true
+            - name: secrets
+              mountPath: /etc/hylla/secrets
+              readOnly: true
+            - name: tls
+              mountPath: /etc/hylla/tls
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/hylla
+      volumes:
+        - name: config
+          configMap:
+            name: hylla-config
+        - name: secrets
+          secret:
+            secretName: hylla-secrets
+        # Mounted as a directory, not with subPath, so rotated certificates show up.
+        - name: tls
+          secret:
+            secretName: hylla-cluster-tls
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            # A little more than cache.disk.capacity_mib.
+            storage: 22Gi

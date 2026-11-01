@@ -25,15 +25,6 @@ impl fmt::Display for InvalidTemplate {
     }
 }
 
-/// Why a template couldn't be filled in from a token's claims.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RenderError {
-    /// The claim is missing, or isn't a string or number.
-    MissingClaim(String),
-    /// The claim's value isn't a single path segment, such as `a/b` or `..`.
-    UnsafeClaim(String),
-}
-
 impl PathTemplate {
     pub fn parse(template: &str) -> Result<Self, InvalidTemplate> {
         if !template.starts_with('/') {
@@ -85,25 +76,46 @@ impl PathTemplate {
     }
 
     // r[impl auth.claim-values]
-    /// The path prefix for a token, given its claims as strings.
+    // r[impl auth.list-claims]
+    /// Whether `path` is under a prefix the template renders to, given the values of each
+    /// claim: one for most claims, and each item for lists.
     ///
-    /// Claim values must be single path segments, so a claim can't widen the prefix.
-    pub fn render(&self, claim: impl Fn(&str) -> Option<String>) -> Result<String, RenderError> {
-        let mut path = String::new();
-        for part in &self.parts {
-            match part {
-                Part::Literal(literal) => path.push_str(literal),
-                Part::Claim(name) => {
-                    let value =
-                        claim(name).ok_or_else(|| RenderError::MissingClaim(name.clone()))?;
-                    if value.is_empty() || value == "." || value == ".." || value.contains('/') {
-                        return Err(RenderError::UnsafeClaim(name.clone()));
-                    }
-                    path.push_str(&value);
-                }
-            }
-        }
-        Ok(path)
+    /// Values must be single path segments, so a claim can't widen the prefix; others are
+    /// skipped.
+    pub fn allows(&self, path: &str, claim: impl Fn(&str) -> Vec<String>) -> bool {
+        let values = self
+            .parts
+            .iter()
+            .map(|part| match part {
+                Part::Literal(_) => Vec::new(),
+                Part::Claim(name) => claim(name)
+                    .into_iter()
+                    .filter(|value| {
+                        !value.is_empty() && value != "." && value != ".." && !value.contains('/')
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        matches(&self.parts, &values, path)
+    }
+}
+
+/// Whether `rest` is under the prefix `parts` render to, with `values` for each part.
+fn matches(parts: &[Part], values: &[Vec<String>], rest: &str) -> bool {
+    let Some((part, others)) = parts.split_first() else {
+        return rest.is_empty() || rest.starts_with('/');
+    };
+    let next = |rest: &str| matches(others, &values[1..], rest);
+    match part {
+        // As in `under_prefix`, a trailing `/` matches the end of the path too.
+        Part::Literal(literal) if others.is_empty() => rest
+            .strip_prefix(literal.trim_end_matches('/'))
+            .is_some_and(next),
+        Part::Literal(literal) => rest.strip_prefix(literal.as_str()).is_some_and(next),
+        // Values can be prefixes of each other, so each one that fits is tried.
+        Part::Claim(_) => values[0]
+            .iter()
+            .any(|value| rest.strip_prefix(value.as_str()).is_some_and(next)),
     }
 }
 
@@ -117,33 +129,40 @@ pub fn under_prefix(path: &str, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{InvalidTemplate, PathTemplate, RenderError, under_prefix};
+    use super::{InvalidTemplate, PathTemplate, under_prefix};
 
-    fn claims(name: &str) -> Option<String> {
-        match name {
-            "sub" => Some("acme".into()),
-            "region" => Some("eu".into()),
-            "evil" => Some("../other".into()),
-            "nested" => Some("a/b".into()),
-            _ => None,
-        }
+    fn claims(name: &str) -> Vec<String> {
+        let values: &[&str] = match name {
+            "sub" => &["acme"],
+            "region" => &["eu"],
+            "evil" => &["../other"],
+            "nested" => &["a/b"],
+            "empty" => &[""],
+            "groups" => &["red", "../blue", "", "green", "a/b"],
+            _ => &[],
+        };
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn allows(template: &str, path: &str) -> bool {
+        PathTemplate::parse(template).unwrap().allows(path, claims)
     }
 
     // r[verify config.auth.paths]
     #[test]
-    fn templates_parse_and_render() {
-        let render = |template| PathTemplate::parse(template).unwrap().render(claims);
-        assert_eq!(render("/tenant/${sub}"), Ok("/tenant/acme".into()));
-        assert_eq!(
-            render("/${region}/${sub}-files"),
-            Ok("/eu/acme-files".into())
-        );
-        assert_eq!(render("/price$$/${sub}"), Ok("/price$/acme".into()));
-        assert_eq!(render("/shared"), Ok("/shared".into()));
-        assert_eq!(
-            render("/${missing}"),
-            Err(RenderError::MissingClaim("missing".into()))
-        );
+    fn templates_parse_and_match() {
+        assert!(allows("/tenant/${sub}", "/tenant/acme/x.pdf"));
+        assert!(allows("/tenant/${sub}", "/tenant/acme"));
+        assert!(!allows("/tenant/${sub}", "/tenant/acme2/x.pdf"));
+        assert!(!allows("/tenant/${sub}", "/tenant/other/x.pdf"));
+        assert!(allows("/${region}/${sub}-files", "/eu/acme-files/x"));
+        assert!(!allows("/${region}/${sub}-files", "/eu/acme/x"));
+        assert!(allows("/price$$/${sub}", "/price$/acme/x"));
+        assert!(allows("/shared", "/shared/x"));
+        assert!(allows("/tenant/${sub}/", "/tenant/acme/x"));
+        assert!(allows("/", "/anything"));
+        assert!(!allows("/${missing}", "/x"));
+        assert!(!allows("/${missing}/x", "/x"));
 
         let invalid = |template| PathTemplate::parse(template).unwrap_err();
         assert!(matches!(invalid("tenant/${sub}"), InvalidTemplate(_)));
@@ -156,15 +175,31 @@ mod tests {
     // r[verify auth.claim-values]
     #[test]
     fn claims_must_be_single_segments() {
-        let render = |template| PathTemplate::parse(template).unwrap().render(claims);
-        assert_eq!(
-            render("/tenant/${evil}"),
-            Err(RenderError::UnsafeClaim("evil".into()))
-        );
-        assert_eq!(
-            render("/tenant/${nested}"),
-            Err(RenderError::UnsafeClaim("nested".into()))
-        );
+        assert!(!allows("/tenant/${evil}", "/tenant/../other/x"));
+        assert!(!allows("/tenant/${evil}", "/other/x"));
+        assert!(!allows("/tenant/${nested}", "/tenant/a/b/x"));
+        assert!(!allows("/tenant/${empty}", "/tenant/x"));
+        assert!(!allows("/tenant/${empty}", "/tenant/"));
+    }
+
+    // r[verify auth.list-claims]
+    #[test]
+    fn list_claims_allow_any_of_their_items() {
+        assert!(allows("/teams/${groups}", "/teams/red/x"));
+        assert!(allows("/teams/${groups}", "/teams/green/x"));
+        assert!(!allows("/teams/${groups}", "/teams/blue/x"));
+        assert!(!allows("/teams/${groups}", "/teams/a/b/x"));
+        assert!(!allows("/teams/${groups}", "/teams/x"));
+        // Items are tried in every place, even when one item is a prefix of another.
+        let prefixes = |name: &str| match name {
+            "a" => vec!["x".to_string(), "xy".to_string()],
+            "b" => vec!["z".to_string()],
+            _ => Vec::new(),
+        };
+        let template = PathTemplate::parse("/${a}${b}/${a}").unwrap();
+        assert!(template.allows("/xyz/x/file", prefixes));
+        assert!(template.allows("/xz/xy", prefixes));
+        assert!(!template.allows("/xyz/y", prefixes));
     }
 
     #[test]

@@ -11,6 +11,12 @@ whose password matches its argon2 hash. Otherwise, a browser loading a page MUST
 sign in through the provider when one is configured, coming back to the page, and anything
 else MUST be refused with 401 and a `WWW-Authenticate` challenge.
 
+r[control.auth-limits]
+Passwords MUST be checked on threads other than those serving requests, a few at a time. A
+client address with 10 failed sign-ins within a minute MUST be answered with 429 and a
+`Retry-After` until the minute has passed, also with the right password, and every failed
+sign-in MUST be logged with the `hylla::audit` target.
+
 ## Signing in through an OpenID provider
 
 r[control.oidc.login]
@@ -19,6 +25,32 @@ code flow, with the client id, the redirect URI `{url}/auth/callback`, the `open
 and the configured ones, and a fresh state, nonce and S256 PKCE challenge. The state MUST
 be set in an HTTP-only cookie binding the sign-in to the browser, which MUST finish it
 within ten minutes.
+
+r[control.oidc.return-to]
+Signing in MUST only return to a path of the control plane: printable ASCII without
+spaces, starting with a single `/` and without `\`. Anything else MUST return to `/`.
+
+r[control.oidc.keys]
+The provider's discovery document and keys MUST be read once for concurrent sign-ins, and
+read again after an hour or when an ID token names an unknown key, but not more than once
+every 30 seconds. When the provider can't be reached then, what it said before MUST still
+be used, for the keys it had.
+
+r[control.oidc.id-token-key]
+An ID token without a key id MUST only be checked with the provider's key when it has just
+one, and a token signed with another algorithm than its key is for MUST be refused.
+
+r[control.oidc.errors]
+Why signing in failed or the provider couldn't be reached MUST be logged, not told to
+whoever is signing in.
+
+r[control.oidc.cookies]
+Over HTTPS, the session cookie MUST be named with the `__Host-` prefix and the login cookie
+with `__Secure-`.
+
+r[control.oidc.pending-limit]
+Sign-ins in progress MUST be dropped after 10 minutes, and the oldest when 10000 are in
+progress, so starting sign-ins can't grow memory without bound.
 
 r[control.oidc.issuer]
 The provider's discovery document MUST name the configured issuer.
@@ -68,6 +100,21 @@ The control plane MUST upload, delete and move the objects of writable mappings 
 refusing others with 403, and only under the mapping's path prefix: paths leaving it, such
 as with `..` segments, MUST be refused with 400. Uploads larger than the configured limit
 MUST be refused with 413.
+
+r[control.upload-streaming]
+Uploads MUST be sent on to the backend as they arrive, in parts once they're larger than a
+part, never held in memory whole, and MUST be refused with 413 once they're larger than
+`max_upload_mib`, aborting what was sent.
+
+r[control.headers]
+Every answer of the control plane MUST forbid other sites from framing it, with
+`X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`, and set
+`X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+
+r[control.audit]
+Every change made through the control plane, and every refused or failed one, MUST be
+logged with the `hylla::audit` target: who made it and how they signed in, what was
+changed, the size of uploads, and the outcome.
 
 r[control.invalidate]
 After an object is changed through the control plane, its cached metadata MUST be

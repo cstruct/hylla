@@ -3,6 +3,8 @@ name = "hylla-config"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+# Built into the binary, not published on its own.
+publish = false
 
 [dependencies]
 ordna-core = "0.1.3"

@@ -36,6 +36,7 @@ fn s3() -> Backend {
         endpoint: None,
         access_key_id: "test".into(),
         secret_access_key: "test".into(),
+        timeouts: Default::default(),
         refresh: None,
     }
 }
@@ -52,6 +53,7 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
                     backend: "shield".into(),
                     rewrites: Vec::new(),
                     writable: false,
+                    cache_control: None,
                     auth: None,
                 }],
             },
@@ -67,6 +69,8 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
         cluster: None,
         control: None,
         serve_backends: serve,
+        health: None,
+        http: Default::default(),
     }
 }
 
@@ -89,8 +93,23 @@ impl Drop for Upstream {
 /// An upstream node whose certificate is issued by `pki` for `host`.
 async fn upstream(pki: &Pki, host: &str) -> Upstream {
     let memory = Arc::new(InMemory::new());
+    let attributes = object_store::Attributes::from_iter([
+        (
+            object_store::Attribute::ContentType,
+            object_store::AttributeValue::from("text/css"),
+        ),
+        (object_store::Attribute::ContentEncoding, "br".into()),
+        (object_store::Attribute::CacheControl, "max-age=60".into()),
+    ]);
     memory
-        .put(&Path::from("app.css"), content().into())
+        .put_opts(
+            &Path::from("app.css"),
+            content().into(),
+            object_store::PutOptions {
+                attributes,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     let store = Flaky::new(memory);
@@ -138,6 +157,7 @@ fn downstream_config(upstream: &Upstream, pki: &Pki, name: &str, backend: &str) 
             cert: issued.cert,
             key: issued.key,
         },
+        timeouts: Default::default(),
         refresh: Some(Refresh {
             concurrency: 2,
             rules: vec![RefreshRule {
@@ -208,6 +228,10 @@ async fn nodes_read_through_another_nodes_cache() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, content());
     assert_eq!(headers[header::CONTENT_LENGTH], "3000");
+    // r[verify server.object-headers]
+    assert_eq!(headers[header::CONTENT_TYPE], "text/css");
+    assert_eq!(headers[header::CONTENT_ENCODING], "br");
+    assert_eq!(headers[header::CACHE_CONTROL], "max-age=60");
     let fetched = upstream.store.requests();
     assert!(fetched > 0);
 
@@ -328,4 +352,87 @@ async fn nodes_without_the_right_certificates_are_refused() {
         .send()
         .await;
     assert!(plain.is_err(), "{plain:?}");
+}
+
+// r[verify backend.timeouts]
+// r[verify config.backends.timeouts]
+#[tokio::test]
+async fn hung_hylla_backends_time_out() {
+    // Accepts connections, and never answers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let pki = Pki::new("hung");
+    let issued = pki.issue(CLIENT_NAME);
+    let backend = Backend::Hylla {
+        url: format!("https://localhost:{}", addr.port()),
+        backend: "assets".into(),
+        tls: HyllaTls {
+            ca: pki.ca(),
+            cert: issued.cert,
+            key: issued.key,
+        },
+        timeouts: hylla_config::BackendTimeouts {
+            connect: Interval::from_secs(1),
+            request: Interval::from_secs(1),
+            ..Default::default()
+        },
+        refresh: None,
+    };
+    let config = config(HashMap::from([("shield".into(), backend)]), None);
+    let stores = hylla_server::backend::stores(&config).unwrap();
+    let started = std::time::Instant::now();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stores["shield"].head(&Path::from("app.css")),
+    )
+    .await
+    .expect("the request timed out on its own");
+    assert!(read.is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    hold.abort();
+}
+
+// r[verify backend.retries]
+// r[verify config.backends.timeouts]
+#[tokio::test]
+async fn failing_backends_are_retried_a_few_times() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // An S3 endpoint that's always unavailable.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let router = axum::Router::new().fallback({
+        let attempts = attempts.clone();
+        move || async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let backend = Backend::S3 {
+        bucket: "assets".into(),
+        region: "eu-north-1".into(),
+        endpoint: Some(format!("http://{addr}")),
+        access_key_id: "test".into(),
+        secret_access_key: "test".into(),
+        timeouts: hylla_config::BackendTimeouts {
+            retries: 2,
+            ..Default::default()
+        },
+        refresh: None,
+    };
+    let config = config(HashMap::from([("assets".into(), backend)]), None);
+    let stores = hylla_server::backend::stores(&config).unwrap();
+    let started = std::time::Instant::now();
+    assert!(stores["assets"].head(&Path::from("app.css")).await.is_err());
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    server.abort();
 }

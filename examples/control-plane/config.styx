@@ -1,0 +1,38 @@
+// The control plane: a web UI and JSON API for the people running hylla, to see how the
+// backends are doing, browse the mappings, and change the objects of writable ones.
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (cache.example.com)
+    mappings (
+      // Objects under /uploads can be uploaded, deleted and moved through the control
+      // plane. Writable mappings can't have rewrites. Public listeners never write.
+      {path_prefix /uploads, backend assets, writable true}
+      {path_prefix /, backend assets}
+    )
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+  }
+}
+control {
+  // Keep it on a private network, or behind a proxy that terminates TLS: Basic auth
+  // credentials are sent as they are.
+  listen 127.0.0.1:9090
+  max_upload_mib 1024
+  // Optional: people sign in through an OpenID provider, such as Konklav.
+  oidc {
+    issuer https://id.example.com
+    client_id hylla
+    // The control plane as browsers reach it. The provider redirects back to
+    // {url}/auth/callback.
+    url https://hylla-control.example.com
+    // People in at least one of these groups get in.
+    groups (hylla-admin)
+    session_ttl 8h
+  }
+}

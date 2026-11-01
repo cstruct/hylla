@@ -16,6 +16,10 @@ either, the standard `OTEL_EXPORTER_OTLP_*` environment variables MUST apply.
 
 ## Metrics
 
+r[telemetry.version]
+hylla's version MUST be exported as the `service.version` resource attribute, and logged at
+startup.
+
 r[telemetry.metrics]
 When metrics are enabled, they MUST be exported periodically over OTLP, with the configured
 service name and resource attributes, and the configured headers.
@@ -25,8 +29,9 @@ Metric attributes MUST be low-cardinality: servers, mappings by path prefix, bac
 operations and outcomes, never object keys or request paths.
 
 r[telemetry.metrics.requests]
-The duration of every request MUST be recorded as `http.server.request.duration`, with its
-method, status code, and the server and mapping that served it, when any.
+The duration of every request, until its body is sent, MUST be recorded as
+`http.server.request.duration`, with its method, `_OTHER` for methods other than `GET` and
+`HEAD`, its status code, and the server and mapping that served it, when any.
 
 r[telemetry.metrics.cache]
 Chunk lookups MUST be counted by whether they hit the cache, and metadata lookups by how they
@@ -41,7 +46,8 @@ The objects refresh runs handle MUST be counted by backend, rule and outcome.
 
 r[telemetry.metrics.cluster]
 The live members of the cluster MUST be reported, and updates sent and received, chunks pulled
-from other nodes or backends, and failed gossip exchanges counted.
+from other nodes or backends, failed gossip exchanges, and updates and pulls dropped because
+their queue was full counted.
 
 ## Traces
 
@@ -54,7 +60,9 @@ The configured share of traces hylla starts MUST be sampled, and traces continue
 caller MUST follow the caller's sampling decision.
 
 r[telemetry.traces.propagation]
-Requests MUST continue the trace their W3C `traceparent` header names, if any.
+Requests to public listeners MUST continue the trace their W3C `traceparent` header names,
+if any, only when configured to follow callers, since anyone can send one. Requests between
+nodes MUST continue it either way.
 
 r[telemetry.traces.requests]
 Every request MUST be a server span named by its method and mapping, recording its status
@@ -78,7 +86,8 @@ headers. Gossip MUST NOT be traced.
 
 r[telemetry.logs]
 Logs MUST be written to stderr, filtered by the configured level, or by `RUST_LOG` when set,
-and an invalid level MUST be refused.
+and an invalid level MUST be refused. Audit events, of the `hylla::audit` target, MUST be
+kept at `info` whatever the level, unless the level names that target itself.
 
 r[telemetry.logs.json]
 In the JSON format, every event MUST be one JSON object on a line of its own, with its time,

@@ -7,7 +7,7 @@
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -17,25 +17,28 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, Request, State},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
     routing::{any, get, post, put},
 };
 use base64::Engine;
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use http::{HeaderMap, Method, StatusCode, header};
 use hylla_control::{
     BackendInfo, CallInfo, ControlPlane, Listing, MappingInfo, ObjectEntry, Viewer,
 };
 use leptos::prelude::{LeptosOptions, provide_context};
 use leptos_axum::{LeptosRoutes, generate_route_list, handle_server_fns_with_context};
-use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
+use object_store::{
+    ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart, path::Path as ObjectPath,
+};
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
 use crate::{
     App,
-    oidc::{self, Oidc, SignInError},
+    oidc::{Oidc, SignInError},
     spans, status,
 };
 
@@ -48,6 +51,15 @@ struct Bundle;
 
 /// How long a verified password is remembered, so argon2 doesn't run for every request.
 const VERIFIED_FOR: Duration = Duration::from_secs(600);
+/// The log target of audit events.
+pub(crate) const AUDIT_TARGET: &str = "hylla::audit";
+/// How many failed sign-ins a client address may have within `FAILURE_WINDOW`.
+const MAX_FAILURES: u32 = 10;
+const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// How many client addresses' failures are remembered.
+const MAX_FAILING_CLIENTS: usize = 10_000;
+/// How many passwords are checked at a time, each with argon2's memory.
+const HASHING: usize = 4;
 
 /// The control plane's settings, with its users' password hashes checked.
 pub struct ControlSettings {
@@ -59,6 +71,18 @@ pub struct ControlSettings {
     verified: Mutex<HashMap<Vec<u8>, (Instant, String)>>,
     /// Signing in through an OpenID provider, if configured.
     oidc: Option<Oidc>,
+    /// Failed sign-ins by client address: since when, and how many.
+    failures: Mutex<HashMap<Option<IpAddr>, (Instant, u32)>>,
+    /// Held while checking a password.
+    hashing: Semaphore,
+}
+
+/// What checking an `Authorization` header found.
+enum Checked {
+    User(String),
+    Refused,
+    /// Too many failed sign-ins from the client: try again after this long.
+    Limited(Duration),
 }
 
 impl ControlSettings {
@@ -79,12 +103,51 @@ impl ControlSettings {
                 .unwrap_or(usize::MAX),
             verified: Mutex::default(),
             oidc: config.oidc.as_ref().map(Oidc::new).transpose()?,
+            failures: Mutex::default(),
+            hashing: Semaphore::new(HASHING),
         })
+    }
+
+    // r[impl control.auth-limits]
+    /// Checks an `Authorization` header from `client`, unless the client failed too often.
+    async fn check(&self, authorization: &str, client: Option<IpAddr>) -> Checked {
+        let limited = {
+            let failures = self.failures.lock().expect("not poisoned");
+            failures.get(&client).and_then(|(since, count)| {
+                let left = FAILURE_WINDOW.checked_sub(since.elapsed())?;
+                (*count >= MAX_FAILURES).then_some(left)
+            })
+        };
+        if let Some(left) = limited {
+            return Checked::Limited(left);
+        }
+        if let Some(user) = self.verify(authorization).await {
+            return Checked::User(user);
+        }
+        let user = basic_user(authorization).unwrap_or_default();
+        tracing::warn!(
+            target: AUDIT_TARGET,
+            user,
+            client = client.map(|client| client.to_string()),
+            "refused a sign-in: wrong user name or password"
+        );
+        let mut failures = self.failures.lock().expect("not poisoned");
+        if failures.len() >= MAX_FAILING_CLIENTS {
+            failures.retain(|_, (since, _)| since.elapsed() < FAILURE_WINDOW);
+        }
+        if failures.len() < MAX_FAILING_CLIENTS {
+            let entry = failures.entry(client).or_insert((Instant::now(), 0));
+            if entry.0.elapsed() >= FAILURE_WINDOW {
+                *entry = (Instant::now(), 0);
+            }
+            entry.1 += 1;
+        }
+        Checked::Refused
     }
 
     // r[impl control.auth]
     /// The user whose name and password an `Authorization` header holds, if any.
-    fn check(&self, authorization: &str) -> Option<String> {
+    async fn verify(&self, authorization: &str) -> Option<String> {
         let key = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, authorization.as_bytes())
             .as_ref()
             .to_vec();
@@ -106,15 +169,20 @@ impl ControlSettings {
             })
             .and_then(|decoded| String::from_utf8(decoded).ok())?;
         let (user, password) = credentials.split_once(':')?;
-        let valid = self
-            .users
-            .get(user)
-            .and_then(|hash| PasswordHash::new(hash).ok())
-            .is_some_and(|hash| {
+        let hash = self.users.get(user)?.clone();
+        let password = password.to_string();
+        // argon2 takes a while and much memory: on blocking threads, a few at a time, so
+        // guessing passwords can't stall the threads serving requests.
+        let _hashing = self.hashing.acquire().await.ok()?;
+        let valid = tokio::task::spawn_blocking(move || {
+            PasswordHash::new(&hash).is_ok_and(|hash| {
                 Argon2::default()
                     .verify_password(password.as_bytes(), &hash)
                     .is_ok()
-            });
+            })
+        })
+        .await
+        .unwrap_or(false);
         if !valid {
             return None;
         }
@@ -123,6 +191,15 @@ impl ControlSettings {
         verified.insert(key, (Instant::now(), user.to_string()));
         Some(user.to_string())
     }
+}
+
+/// The user name in a Basic `Authorization` header, for logging.
+fn basic_user(authorization: &str) -> Option<String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(authorization.strip_prefix("Basic ")?.trim())
+        .ok()?;
+    let credentials = String::from_utf8(decoded).ok()?;
+    Some(credentials.split_once(':')?.0.to_string())
 }
 
 /// A mapping of a server, for the control plane.
@@ -187,6 +264,10 @@ enum ControlError {
     InvalidPath(String),
     NotFound,
     Backend(object_store::Error),
+    /// An upload larger than `max_upload_mib`.
+    TooLarge,
+    /// Reading an upload from the client failed.
+    Upload(String),
 }
 
 impl std::fmt::Display for ControlError {
@@ -201,6 +282,8 @@ impl std::fmt::Display for ControlError {
             Self::InvalidPath(path) => write!(f, "`{path}` isn't a path within the mapping"),
             Self::NotFound => write!(f, "no such object"),
             Self::Backend(error) => write!(f, "the backend failed: {error}"),
+            Self::TooLarge => write!(f, "the upload is larger than `max_upload_mib`"),
+            Self::Upload(error) => write!(f, "reading the upload failed: {error}"),
         }
     }
 }
@@ -213,6 +296,8 @@ impl ControlError {
             Self::Rewrites => StatusCode::CONFLICT,
             Self::InvalidPath(_) => StatusCode::BAD_REQUEST,
             Self::Backend(_) => StatusCode::BAD_GATEWAY,
+            Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::Upload(_) => StatusCode::BAD_REQUEST,
         }
     }
 }
@@ -231,6 +316,68 @@ impl From<object_store::Error> for ControlError {
         }
     }
 }
+
+tokio::task_local! {
+    /// Who the request being handled is from, for the audit log.
+    static VIEWER: Viewer;
+}
+
+// r[impl control.audit]
+/// Logs a change made through the control plane: who made it, how they signed in, what
+/// they changed, and whether it worked.
+fn audit(
+    action: &'static str,
+    server: &str,
+    index: usize,
+    path: &str,
+    to: Option<&str>,
+    size: Option<usize>,
+    result: &Result<(), ControlError>,
+) {
+    let (user, signed_in_with) = VIEWER
+        .try_with(|viewer| {
+            let with = if viewer.signed_in_with_provider {
+                "oidc"
+            } else {
+                "basic"
+            };
+            (viewer.name.clone(), with)
+        })
+        .unwrap_or_else(|_| (String::new(), "none"));
+    match result {
+        Ok(()) => tracing::info!(
+            target: AUDIT_TARGET,
+            action,
+            user,
+            signed_in_with,
+            server,
+            mapping = index,
+            path,
+            to,
+            size,
+            "changed an object"
+        ),
+        Err(error) => tracing::warn!(
+            target: AUDIT_TARGET,
+            action,
+            user,
+            signed_in_with,
+            server,
+            mapping = index,
+            path,
+            to,
+            size,
+            %error,
+            "failed to change an object"
+        ),
+    }
+}
+
+/// Uploads are sent to backends in parts of this size once they're larger.
+const PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// How many parts of an upload are sent at once.
+const PARTS_IN_FLIGHT: usize = 4;
 
 /// What the control plane does, for both the UI and the JSON API.
 struct Plane {
@@ -349,29 +496,115 @@ impl Plane {
         })
     }
 
-    async fn put(
+    // r[impl control.upload-streaming]
+    /// Uploads `body` as an object: in one request when it's small, and otherwise in parts
+    /// as it arrives, so uploads are never held in memory whole.
+    async fn put<E: std::fmt::Display>(
         &self,
         server: &str,
         index: usize,
         path: &str,
-        bytes: Bytes,
+        body: impl Stream<Item = Result<Bytes, E>> + Unpin,
+    ) -> Result<(), ControlError> {
+        let mut size = 0;
+        let result = self.put_counted(server, index, path, body, &mut size).await;
+        audit("upload", server, index, path, None, Some(size), &result);
+        result
+    }
+
+    async fn put_counted<E: std::fmt::Display>(
+        &self,
+        server: &str,
+        index: usize,
+        path: &str,
+        body: impl Stream<Item = Result<Bytes, E>> + Unpin,
+        counted: &mut usize,
     ) -> Result<(), ControlError> {
         let mapping = self.writable(server, index)?;
         let key = mapping.key(path)?;
         let store = self.store(mapping)?;
-        spans::backend_call(
-            &mapping.backend,
-            "put",
-            Some(&key),
-            store.put(&key, bytes.into()),
-        )
-        .await?;
+        let max = self
+            .app
+            .control
+            .as_ref()
+            .map_or(usize::MAX, |settings| settings.max_upload);
+        let mut body = body;
+        let mut buffered = Vec::new();
+        let (mut size, mut buffered_size) = (0usize, 0usize);
+        let mut upload: Option<WriteMultipart> = None;
+        let result = async {
+            while let Some(bytes) = body.next().await {
+                let bytes = bytes.map_err(|error| ControlError::Upload(error.to_string()))?;
+                size += bytes.len();
+                *counted = size;
+                if size > max {
+                    return Err(ControlError::TooLarge);
+                }
+                if let Some(upload) = &mut upload {
+                    upload.wait_for_capacity(PARTS_IN_FLIGHT).await?;
+                    upload.put(bytes);
+                    continue;
+                }
+                buffered_size += bytes.len();
+                buffered.push(bytes);
+                if buffered_size >= PART_SIZE {
+                    let started = spans::backend_call(
+                        &mapping.backend,
+                        "put_multipart",
+                        Some(&key),
+                        store.put_multipart(&key),
+                    )
+                    .await?;
+                    let mut started = WriteMultipart::new_with_chunk_size(started, PART_SIZE);
+                    for bytes in buffered.drain(..) {
+                        started.put(bytes);
+                    }
+                    upload = Some(started);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        match (result, upload) {
+            (Ok(()), Some(upload)) => {
+                spans::backend_call(&mapping.backend, "put", Some(&key), upload.finish()).await?;
+            }
+            (Ok(()), None) => {
+                let payload = PutPayload::from_iter(buffered);
+                spans::backend_call(
+                    &mapping.backend,
+                    "put",
+                    Some(&key),
+                    store.put(&key, payload),
+                )
+                .await?;
+            }
+            (Err(error), upload) => {
+                if let Some(upload) = upload
+                    && let Err(abort) = upload.abort().await
+                {
+                    tracing::warn!(%key, "aborting an upload failed: {abort}");
+                }
+                return Err(error);
+            }
+        }
         // r[impl control.invalidate]
         self.app.cache.forget_everywhere(&mapping.backend, &key);
         Ok(())
     }
 
     async fn delete(&self, server: &str, index: usize, path: &str) -> Result<(), ControlError> {
+        let result = self.delete_object(server, index, path).await;
+        audit("delete", server, index, path, None, None, &result);
+        result
+    }
+
+    async fn delete_object(
+        &self,
+        server: &str,
+        index: usize,
+        path: &str,
+    ) -> Result<(), ControlError> {
         let mapping = self.writable(server, index)?;
         let key = mapping.key(path)?;
         let store = self.store(mapping)?;
@@ -381,6 +614,18 @@ impl Plane {
     }
 
     async fn rename(
+        &self,
+        server: &str,
+        index: usize,
+        from: &str,
+        to: &str,
+    ) -> Result<(), ControlError> {
+        let result = self.rename_object(server, index, from, to).await;
+        audit("move", server, index, from, Some(to), None, &result);
+        result
+    }
+
+    async fn rename_object(
         &self,
         server: &str,
         index: usize,
@@ -517,6 +762,24 @@ pub fn router(app: &Arc<App>, settings: &Arc<ControlSettings>) -> Router {
             authenticate,
         ))
         .merge(auth)
+        .layer(middleware::map_response(security_headers))
+}
+
+// r[impl control.headers]
+/// Keeps other sites from framing the control plane, which would let them trick someone
+/// signed in into clicking its buttons, and browsers from guessing content types or sending
+/// its URLs elsewhere.
+async fn security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::REFERRER_POLICY, "no-referrer"),
+    ] {
+        headers.insert(name, http::HeaderValue::from_static(value));
+    }
+    response
 }
 
 /// The value of a request's cookie.
@@ -564,7 +827,7 @@ async fn login(
             [(
                 header::SET_COOKIE,
                 set_cookie(
-                    oidc::LOGIN_COOKIE,
+                    oidc.login_cookie(),
                     &state,
                     "/auth",
                     Duration::from_secs(600),
@@ -574,11 +837,13 @@ async fn login(
             Redirect::to(&url),
         )
             .into_response(),
+        // r[impl control.oidc.errors]
+        // Details are for the logs: whoever asks hasn't signed in.
         Err(error) => {
             tracing::warn!("starting a sign-in failed: {error:#}");
             (
                 StatusCode::BAD_GATEWAY,
-                format!("the provider can't be reached: {error:#}\n"),
+                "the provider can't be reached; the control plane's logs say why\n",
             )
                 .into_response()
         }
@@ -594,9 +859,9 @@ async fn callback(
         return StatusCode::NOT_FOUND.into_response();
     };
     let secure = oidc.secure_cookies();
-    let forget_login = set_cookie(oidc::LOGIN_COOKIE, "", "/auth", Duration::ZERO, secure);
+    let forget_login = set_cookie(oidc.login_cookie(), "", "/auth", Duration::ZERO, secure);
     match oidc
-        .finish(&query, cookie(&headers, oidc::LOGIN_COOKIE))
+        .finish(&query, cookie(&headers, oidc.login_cookie()))
         .await
     {
         Ok((session, return_to)) => {
@@ -607,7 +872,7 @@ async fn callback(
             cookies.append(
                 header::SET_COOKIE,
                 header_value(&set_cookie(
-                    oidc::SESSION_COOKIE,
+                    oidc.session_cookie(),
                     &session,
                     "/",
                     ttl,
@@ -623,12 +888,13 @@ async fn callback(
                 SignInError::Failed(_) => StatusCode::BAD_GATEWAY,
             };
             tracing::warn!("a sign-in failed: {error}");
-            (
-                status,
-                [(header::SET_COOKIE, forget_login)],
-                format!("{error}\n"),
-            )
-                .into_response()
+            let body = match &error {
+                SignInError::Failed(_) => {
+                    "signing in failed; the control plane's logs say why\n".to_string()
+                }
+                error => format!("{error}\n"),
+            };
+            (status, [(header::SET_COOKIE, forget_login)], body).into_response()
         }
     }
 }
@@ -640,12 +906,12 @@ async fn logout(State(settings): State<Arc<ControlSettings>>, headers: HeaderMap
     let Some(oidc) = &settings.oidc else {
         return Redirect::to("/").into_response();
     };
-    let to = oidc.end(cookie(&headers, oidc::SESSION_COOKIE)).await;
+    let to = oidc.end(cookie(&headers, oidc.session_cookie())).await;
     (
         [(
             header::SET_COOKIE,
             set_cookie(
-                oidc::SESSION_COOKIE,
+                oidc.session_cookie(),
                 "",
                 "/",
                 Duration::ZERO,
@@ -671,11 +937,14 @@ pub async fn start(
         .with_context(|| format!("binding the control plane on {}", settings.listen))?;
     tracing::info!(listen = %settings.listen, "control plane listening");
     let router = router(app, settings);
-    Ok(tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, router).await {
-            tracing::error!("control plane failed: {error}");
-        }
-    }))
+    Ok(tokio::spawn(crate::listen::serve(
+        listener,
+        router,
+        None,
+        app.limits.clone(),
+        app.shutdown(),
+        "control plane",
+    )))
 }
 
 async fn authenticate(
@@ -685,7 +954,7 @@ async fn authenticate(
 ) -> Response {
     // r[impl control.oidc.session]
     let session = settings.oidc.as_ref().and_then(|oidc| {
-        let cookie = cookie(request.headers(), oidc::SESSION_COOKIE)?;
+        let cookie = cookie(request.headers(), oidc.session_cookie())?;
         oidc.session(cookie)
     });
     let viewer = match session {
@@ -693,15 +962,34 @@ async fn authenticate(
             name: session.name,
             signed_in_with_provider: true,
         }),
-        None => request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| settings.check(value))
-            .map(|name| Viewer {
-                name,
-                signed_in_with_provider: false,
-            }),
+        None => {
+            let authorization = request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok());
+            let client = request
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ConnectInfo(addr)| addr.ip());
+            match authorization {
+                Some(authorization) => match settings.check(authorization, client).await {
+                    Checked::User(name) => Some(Viewer {
+                        name,
+                        signed_in_with_provider: false,
+                    }),
+                    Checked::Refused => None,
+                    Checked::Limited(left) => {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [(header::RETRY_AFTER, (left.as_secs() + 1).to_string())],
+                            "too many failed sign-ins, try again later\n",
+                        )
+                            .into_response();
+                    }
+                },
+                None => None,
+            }
+        }
     };
     let Some(viewer) = viewer else {
         // Browsers loading a page sign in through the provider; anything else, such as
@@ -730,7 +1018,7 @@ async fn authenticate(
         )
             .into_response();
     };
-    request.extensions_mut().insert(viewer);
+    request.extensions_mut().insert(viewer.clone());
     let changes = !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
@@ -738,7 +1026,7 @@ async fn authenticate(
     if changes && cross_site(request.headers()) {
         return (StatusCode::FORBIDDEN, "cross-site requests are refused\n").into_response();
     }
-    next.run(request).await
+    VIEWER.scope(viewer, next.run(request)).await
 }
 
 // r[impl control.same-origin]
@@ -801,9 +1089,11 @@ async fn list(
 async fn upload(
     State(plane): State<Arc<Plane>>,
     Path((server, index, path)): Path<(String, usize, String)>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> Result<StatusCode, ControlError> {
-    plane.put(&server, index, &path, body).await?;
+    plane
+        .put(&server, index, &path, body.into_data_stream())
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -863,10 +1153,9 @@ async fn upload_form(
         else {
             continue;
         };
-        let bytes = field.bytes().await.map_err(bad_form)?;
         let path = format!("{}{name}", query.prefix);
         plane
-            .put(&server, index, &path, bytes)
+            .put(&server, index, &path, field)
             .await
             .map_err(IntoResponse::into_response)?;
     }

@@ -113,6 +113,7 @@ async fn node_with(
                     backend: "assets".into(),
                     rewrites: Vec::new(),
                     writable: control.is_some(),
+                    cache_control: None,
                     auth: None,
                 }],
             },
@@ -125,6 +126,7 @@ async fn node_with(
                 endpoint: None,
                 access_key_id: "test".into(),
                 secret_access_key: "test".into(),
+                timeouts: Default::default(),
                 refresh: Some(Refresh {
                     concurrency: 2,
                     rules: vec![RefreshRule {
@@ -147,6 +149,8 @@ async fn node_with(
         telemetry: Default::default(),
         control,
         serve_backends: None,
+        health: None,
+        http: Default::default(),
         cluster: Some(Cluster {
             listen: addr,
             advertise: None,
@@ -154,6 +158,7 @@ async fn node_with(
             gossip_interval: Interval(Duration::from_millis(50)),
             failure_timeout: Interval(Duration::from_millis(500)),
             key: key.into(),
+            previous_keys: Vec::new(),
             tls,
             share: ClusterShare::default(),
         }),
@@ -519,4 +524,59 @@ async fn nodes_without_a_certificate_for_the_cluster_are_refused() {
     for intruder in &intruders {
         assert_eq!(intruder.app.cluster_members(), vec![intruder.addr]);
     }
+}
+
+// r[verify cluster.gossip-timeout]
+#[tokio::test]
+async fn a_node_that_never_answers_doesnt_split_the_others() {
+    // Accepts connections and never answers, as a node that hangs or a stale address that
+    // drops packets does.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hung = listener.local_addr().unwrap();
+    let hold = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let memory = backend().await;
+    let a = node(&memory, vec![hung.to_string()], KEY).await;
+    let b = node(&memory, vec![a.addr.to_string(), hung.to_string()], KEY).await;
+    for node in [&a, &b] {
+        eventually("both nodes to join", async || {
+            node.app.cluster_members().len() == 2
+        })
+        .await;
+    }
+    // For several failure timeouts, neither loses the other.
+    for _ in 0..80 {
+        assert_eq!(a.app.cluster_members().len(), 2);
+        assert_eq!(b.app.cluster_members().len(), 2);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    hold.abort();
+}
+
+// r[verify cluster.auth.responses]
+#[tokio::test]
+async fn unsigned_answers_are_refused() {
+    // Answers gossip with a member that doesn't exist, without signing it, as anyone on the
+    // network path could.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forger = listener.local_addr().unwrap();
+    let fake = free_addr();
+    let router = axum::Router::new().route(
+        "/cluster/gossip",
+        axum::routing::post(move || async move {
+            axum::Json(serde_json::json!({
+                "members": [{"id": format!("{fake}-1"), "addr": fake, "heartbeat": 1_000_000}]
+            }))
+        }),
+    );
+    let serving = tokio::spawn(async move { axum::serve(listener, router).await });
+    let memory = backend().await;
+    let a = node(&memory, vec![forger.to_string()], KEY).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(a.app.cluster_members(), vec![a.addr]);
+    serving.abort();
 }

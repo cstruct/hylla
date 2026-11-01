@@ -9,43 +9,27 @@
 
 use std::{
     collections::HashMap,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
 use base64::Engine;
 use hylla_config::ControlOidc;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
-use serde::Deserialize;
+use jsonwebtoken::{Algorithm, Validation};
 use serde_json::Value;
-use tokio::sync::RwLock;
+
+use crate::provider::{self, Discovery, Provider, Said, Source};
 
 /// The cookie binding a sign-in to the browser that started it.
-pub const LOGIN_COOKIE: &str = "hylla_login";
+const LOGIN_COOKIE: &str = "hylla_login";
 /// The cookie naming a session.
-pub const SESSION_COOKIE: &str = "hylla_session";
+const SESSION_COOKIE: &str = "hylla_session";
 /// How long a sign-in may take at the provider.
 const LOGIN_TTL: Duration = Duration::from_secs(600);
-/// How long the provider's discovery document and keys are used before they're read again.
-const PROVIDER_TTL: Duration = Duration::from_secs(3600);
 
-/// The endpoints the provider's discovery document names.
-#[derive(Debug, Clone, Deserialize)]
-struct Discovery {
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    jwks_uri: String,
-    userinfo_endpoint: Option<String>,
-    end_session_endpoint: Option<String>,
-}
-
-struct Provider {
-    discovery: Discovery,
-    keys: JwkSet,
-    read: Instant,
-}
+/// The most sign-ins in progress at a time.
+const MAX_PENDING: usize = 10_000;
 
 /// A sign-in started at the provider.
 struct Pending {
@@ -91,8 +75,7 @@ impl std::fmt::Display for SignInError {
 
 pub struct Oidc {
     config: ControlOidc,
-    client: reqwest::Client,
-    provider: RwLock<Option<Provider>>,
+    provider: Provider,
     pending: Mutex<HashMap<String, Pending>>,
     /// Sessions by the SHA-256 of their cookie's value.
     sessions: Mutex<HashMap<Vec<u8>, Session>>,
@@ -121,10 +104,7 @@ impl Oidc {
     pub fn new(config: &ControlOidc) -> anyhow::Result<Self> {
         Ok(Self {
             config: config.clone(),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()?,
-            provider: RwLock::default(),
+            provider: Provider::new(Source::Issuer(config.issuer.clone()))?,
             pending: Mutex::default(),
             sessions: Mutex::default(),
         })
@@ -148,49 +128,40 @@ impl Oidc {
         self.config.url.starts_with("https://")
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
-        let response = self.client.get(url).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            bail!("{url} answered {status}");
+    // r[impl control.oidc.cookies]
+    /// The name of the login cookie: over HTTPS, `__Secure-` prefixed, so browsers only take
+    /// it from a secure origin.
+    pub fn login_cookie(&self) -> &'static str {
+        if self.secure_cookies() {
+            "__Secure-hylla_login"
+        } else {
+            LOGIN_COOKIE
         }
-        Ok(serde_json::from_slice(&response.bytes().await?)?)
     }
 
-    /// The provider's endpoints and keys, read again when they're old, or when `kid` isn't
-    /// among the keys, as after the provider rotated them.
-    async fn discovery_and_keys(&self, kid: Option<&str>) -> anyhow::Result<(Discovery, JwkSet)> {
-        {
-            let provider = self.provider.read().await;
-            if let Some(provider) = provider.as_ref()
-                && provider.read.elapsed() < PROVIDER_TTL
-                && kid.is_none_or(|kid| provider.keys.find(kid).is_some())
-            {
-                return Ok((provider.discovery.clone(), provider.keys.clone()));
-            }
+    /// The name of the session cookie: over HTTPS, `__Host-` prefixed, so it can't be set by
+    /// another host of the domain, or for a path or domain of its own.
+    pub fn session_cookie(&self) -> &'static str {
+        if self.secure_cookies() {
+            "__Host-hylla_session"
+        } else {
+            SESSION_COOKIE
         }
-        let issuer = self.config.issuer.trim_end_matches('/');
-        let discovery: Discovery = self
-            .get_json(&format!("{issuer}/.well-known/openid-configuration"))
-            .await
-            .context("reading the provider's discovery document")?;
-        // r[impl control.oidc.issuer]
-        if discovery.issuer.trim_end_matches('/') != issuer {
-            bail!(
-                "the provider says its issuer is `{}`, not `{issuer}`",
-                discovery.issuer
-            );
-        }
-        let keys: JwkSet = self
-            .get_json(&discovery.jwks_uri)
-            .await
-            .context("reading the provider's keys")?;
-        *self.provider.write().await = Some(Provider {
-            discovery: discovery.clone(),
-            keys: keys.clone(),
-            read: Instant::now(),
-        });
-        Ok((discovery, keys))
+    }
+
+    /// The provider's endpoints and what it said, with its keys, read again when they're
+    /// old, or when `kid` isn't among the keys, as after the provider rotated them.
+    // r[impl control.oidc.keys]
+    async fn discovery_and_keys(
+        &self,
+        kid: Option<&str>,
+    ) -> anyhow::Result<(Discovery, Arc<Said>)> {
+        let said = self.provider.said(kid).await?;
+        let discovery = said
+            .discovery
+            .clone()
+            .context("the provider has no discovery document")?;
+        Ok((discovery, said))
     }
 
     // r[impl control.oidc.login]
@@ -205,8 +176,11 @@ impl Oidc {
             .collect::<Vec<_>>()
             .join(" ");
         let redirect_uri = self.redirect_uri();
+        let authorization_endpoint = discovery
+            .authorization_endpoint
+            .context("the provider names no authorization endpoint")?;
         let url = with_query(
-            &discovery.authorization_endpoint,
+            &authorization_endpoint,
             &[
                 ("response_type", "code"),
                 ("client_id", &self.config.client_id),
@@ -218,9 +192,8 @@ impl Oidc {
                 ("code_challenge_method", "S256"),
             ],
         );
-        let mut pending = self.pending.lock().expect("not poisoned");
-        pending.retain(|_, pending| pending.started.elapsed() < LOGIN_TTL);
-        pending.insert(
+        insert_pending(
+            &mut self.pending.lock().expect("not poisoned"),
             state.clone(),
             Pending {
                 verifier,
@@ -228,6 +201,7 @@ impl Oidc {
                 return_to: safe_return_to(return_to),
                 started: Instant::now(),
             },
+            MAX_PENDING,
         );
         Ok((url, state))
     }
@@ -318,7 +292,10 @@ impl Oidc {
             ("redirect_uri", &redirect_uri),
             ("code_verifier", &pending.verifier),
         ];
-        let mut request = self.client.post(&discovery.token_endpoint);
+        let token_endpoint = discovery
+            .token_endpoint
+            .context("the provider names no token endpoint")?;
+        let mut request = self.provider.client().post(&token_endpoint);
         match &self.config.client_secret {
             Some(secret) => request = request.basic_auth(&self.config.client_id, Some(secret)),
             None => form.push(("client_id", &self.config.client_id)),
@@ -332,7 +309,8 @@ impl Oidc {
             .context("exchanging the code")?;
         let status = response.status();
         let body: Value =
-            serde_json::from_slice(&response.bytes().await?).context("reading the tokens")?;
+            serde_json::from_slice(&crate::limited::read(response, crate::limited::JSON).await?)
+                .context("reading the tokens")?;
         if !status.is_success() {
             bail!("the provider refused the code: {status} {body}");
         }
@@ -368,13 +346,8 @@ impl Oidc {
                 header.alg
             );
         }
-        let (discovery, keys) = self.discovery_and_keys(header.kid.as_deref()).await?;
-        let jwk = match &header.kid {
-            Some(kid) => keys.find(kid),
-            None => keys.keys.first(),
-        }
-        .context("the ID token's key isn't among the provider's keys")?;
-        let key = DecodingKey::from_jwk(jwk).context("reading the provider's key")?;
+        let (discovery, said) = self.discovery_and_keys(header.kid.as_deref()).await?;
+        let key = provider::key(&said.keys, &header).context("checking the ID token's key")?;
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&discovery.issuer]);
         validation.set_audience(&[&self.config.client_id]);
@@ -398,7 +371,8 @@ impl Oidc {
             return Ok(None);
         };
         let response = self
-            .client
+            .provider
+            .client()
             .get(endpoint)
             .bearer_auth(access_token)
             .send()
@@ -408,7 +382,8 @@ impl Oidc {
             bail!("the user info endpoint answered {}", response.status());
         }
         Ok(Some(
-            serde_json::from_slice(&response.bytes().await?).context("reading the user info")?,
+            serde_json::from_slice(&crate::limited::read(response, crate::limited::JSON).await?)
+                .context("reading the user info")?,
         ))
     }
 
@@ -465,10 +440,39 @@ fn groups(claims: &serde_json::Map<String, Value>, claim: &str) -> Option<Vec<St
     }
 }
 
+// r[impl control.oidc.pending-limit]
+/// Adds a sign-in in progress, dropping those that took too long, and the oldest when there
+/// are `max`: anyone can start signing in, so they can't grow without bound.
+fn insert_pending(
+    pending: &mut HashMap<String, Pending>,
+    state: String,
+    started: Pending,
+    max: usize,
+) {
+    pending.retain(|_, pending| pending.started.elapsed() < LOGIN_TTL);
+    if pending.len() >= max
+        && let Some(oldest) = pending
+            .iter()
+            .min_by_key(|(_, pending)| pending.started)
+            .map(|(state, _)| state.clone())
+    {
+        pending.remove(&oldest);
+    }
+    pending.insert(state, started);
+}
+
 /// `return_to` if it's a path of the control plane, so signing in can't redirect elsewhere,
 /// or `/`.
+// r[impl control.oidc.return-to]
 fn safe_return_to(return_to: &str) -> String {
-    if return_to.starts_with('/') && !return_to.starts_with("//") && !return_to.contains('\\') {
+    // Browsers drop tabs and newlines from URLs, so `/\t/evil.example` would go to
+    // `//evil.example`: only printable ASCII, without spaces, is let through.
+    let printable = return_to.bytes().all(|byte| byte.is_ascii_graphic());
+    if printable
+        && return_to.starts_with('/')
+        && !return_to.starts_with("//")
+        && !return_to.contains('\\')
+    {
         return_to.to_string()
     } else {
         "/".to_string()
@@ -477,8 +481,132 @@ fn safe_return_to(return_to: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{groups, safe_return_to};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
+    use super::{LOGIN_TTL, Oidc, Pending, groups, insert_pending, safe_return_to};
+
+    fn config(url: &str, issuer: &str) -> hylla_config::ControlOidc {
+        hylla_config::ControlOidc {
+            issuer: issuer.into(),
+            client_id: "hylla".into(),
+            client_secret: None,
+            url: url.into(),
+            groups: vec!["hylla-admin".into()],
+            groups_claim: "groups".into(),
+            scopes: Vec::new(),
+            session_ttl: hylla_config::Interval::from_secs(3600),
+        }
+    }
+
+    // r[verify control.oidc.cookies]
+    #[test]
+    fn cookies_are_prefixed_over_https() {
+        let oidc = Oidc::new(&config("https://hylla.internal", "https://id.example")).unwrap();
+        assert_eq!(oidc.session_cookie(), "__Host-hylla_session");
+        assert_eq!(oidc.login_cookie(), "__Secure-hylla_login");
+        // Browsers refuse prefixed cookies without `Secure`, which plain HTTP can't have.
+        let oidc = Oidc::new(&config("http://127.0.0.1:9090", "https://id.example")).unwrap();
+        assert_eq!(oidc.session_cookie(), "hylla_session");
+        assert_eq!(oidc.login_cookie(), "hylla_login");
+    }
+
+    // r[verify control.oidc.keys]
+    #[tokio::test]
+    async fn the_provider_is_read_once_and_used_while_it_is_down() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+
+        #[derive(Default)]
+        struct Fake {
+            issuer: std::sync::OnceLock<String>,
+            reads: AtomicUsize,
+            down: AtomicBool,
+        }
+        async fn discovery(
+            State(fake): State<Arc<Fake>>,
+        ) -> Result<Json<serde_json::Value>, StatusCode> {
+            fake.reads.fetch_add(1, Ordering::SeqCst);
+            if fake.down.load(Ordering::SeqCst) {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            // Slow, so concurrent sign-ins overlap.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let issuer = fake.issuer.get().unwrap();
+            Ok(Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+            })))
+        }
+        async fn jwks() -> Json<serde_json::Value> {
+            Json(serde_json::json!({"keys": [{
+                "kty": "oct", "kid": "a", "k": "c2VjcmV0"
+            }]}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let fake = Arc::new(Fake::default());
+        fake.issuer.set(issuer.clone()).unwrap();
+        let router = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery))
+            .route("/jwks", get(jwks))
+            .with_state(fake.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+
+        let mut oidc = Oidc::new(&config("http://127.0.0.1:9090", &issuer)).unwrap();
+        oidc.provider.ttl = Duration::from_millis(200);
+        oidc.provider.reread_after = Duration::ZERO;
+        let oidc = Arc::new(oidc);
+        let reads = (0..10).map(|_| {
+            let oidc = oidc.clone();
+            async move { oidc.discovery_and_keys(None).await.map(|_| ()) }
+        });
+        for read in futures::future::join_all(reads).await {
+            read.unwrap();
+        }
+        assert_eq!(fake.reads.load(Ordering::SeqCst), 1);
+
+        // Past the TTL, with the provider down, what it said is still used, for keys it had.
+        fake.down.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        oidc.discovery_and_keys(Some("a")).await.unwrap();
+        assert!(fake.reads.load(Ordering::SeqCst) > 1);
+        let (_, said) = oidc.discovery_and_keys(Some("rotated")).await.unwrap();
+        assert!(said.keys.find("rotated").is_none());
+        server.abort();
+    }
+
+    // r[verify control.oidc.pending-limit]
+    #[test]
+    fn sign_ins_in_progress_are_limited() {
+        let started = |at: Instant| Pending {
+            verifier: String::new(),
+            nonce: String::new(),
+            return_to: "/".into(),
+            started: at,
+        };
+        let now = Instant::now();
+        let mut pending = HashMap::new();
+        if let Some(expired) = now.checked_sub(LOGIN_TTL) {
+            pending.insert("expired".to_string(), started(expired));
+        }
+        for (index, state) in ["a", "b", "c"].into_iter().enumerate() {
+            let at = now + std::time::Duration::from_millis(index as u64);
+            insert_pending(&mut pending, state.into(), started(at), 2);
+        }
+        let mut states = pending.keys().cloned().collect::<Vec<_>>();
+        states.sort();
+        assert_eq!(states, ["b", "c"]);
+    }
+
+    // r[verify control.oidc.return-to]
     #[test]
     fn signing_in_only_returns_to_the_control_plane() {
         assert_eq!(safe_return_to("/mappings?x=1"), "/mappings?x=1");
@@ -486,6 +614,12 @@ mod tests {
             "https://evil.example",
             "//evil.example",
             "/\\evil.example",
+            "/\t/evil.example",
+            "/\n/evil.example",
+            "/\r\n/evil.example",
+            "/ /evil.example",
+            "/mappings\u{7f}",
+            "/caf\u{e9}",
             "",
         ] {
             assert_eq!(safe_return_to(elsewhere), "/", "{elsewhere}");
