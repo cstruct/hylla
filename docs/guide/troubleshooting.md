@@ -66,6 +66,23 @@ expected: the cache is in memory only.
   `jwks_uri` can be reached from hylla, and that the discovery document's `issuer` is the
   verifier's, character for character.
 
+## 401, 403 or 503 with Konklav
+
+- 401 `Bearer`: the request has no `Authorization: Bearer` header.
+- 401 `invalid_token`: Konklav's relying SDK refused the token: it isn't signed with
+  Konklav's keys, has expired, its session has ended, or it lacks the configured `issuer` or
+  `audience`.
+- 401 `insufficient_user_authentication`: Konklav wants the caller to sign in again, or with
+  more factors, before it allows the request.
+- 403 `insufficient_scope`: the caller doesn't hold the rule's actions at its scope, the
+  token's kind doesn't fit, as for one without a tenant, or no rule matches the path. With
+  a registered scope kind, an object Konklav has no record of is denied too.
+- 400: the path has `.` or `..` segments.
+- 503: hylla couldn't ask Konklav, or it didn't decide within `timeout`. Check that
+  `relying_url` and `subject_url` can be reached from hylla, and that `key_id` and `secret`
+  are a secret key credential of a service principal. Set `telemetry.logs.level` to
+  `info,hylla_server=debug` to see why each request was refused.
+
 ## Cluster nodes don't find each other
 
 `hylla.cluster.members` says how many nodes a node sees. Check that:

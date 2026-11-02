@@ -15,6 +15,12 @@ pub enum ValidationError {
     NoMappings,
     /// A server has no server names.
     NoServerNames { server: String },
+    /// A server name is an invalid wildcard.
+    InvalidServerName {
+        server: String,
+        server_name: String,
+        reason: String,
+    },
     /// A mapping's path prefix doesn't start with `/`.
     RelativePath {
         server: String,
@@ -42,6 +48,14 @@ pub enum ValidationError {
         mapping: usize,
         reason: String,
     },
+    /// A mapping's `konklav` has no provider to decide it, or invalid rules.
+    InvalidMappingKonklav {
+        server: String,
+        mapping: usize,
+        reason: String,
+    },
+    /// The Konklav provider's settings are invalid.
+    InvalidKonklav { reason: String },
     /// A backend's refresh settings are invalid.
     InvalidRefresh {
         backend: String,
@@ -54,6 +68,12 @@ pub enum ValidationError {
     InvalidBackend { backend: String, reason: String },
     /// The settings of serving backends to other nodes are invalid.
     InvalidServeBackends { reason: String },
+    /// A mapping's site settings are invalid.
+    InvalidSite {
+        server: String,
+        mapping: usize,
+        reason: String,
+    },
     /// A mapping can't be writable.
     InvalidWritable {
         server: String,
@@ -94,6 +114,22 @@ impl fmt::Display for ValidationError {
                 "no server maps requests to a backend: configure a server with at least one mapping"
             ),
             Self::NoServerNames { server } => write!(f, "server `{server}` has no server names"),
+            Self::InvalidServerName {
+                server,
+                server_name,
+                reason,
+            } => write!(
+                f,
+                "server name `{server_name}` of server `{server}` is invalid: {reason}"
+            ),
+            Self::InvalidSite {
+                server,
+                mapping,
+                reason,
+            } => write!(
+                f,
+                "site of mapping {mapping} of server `{server}` is invalid: {reason}"
+            ),
             Self::RelativePath {
                 server,
                 mapping,
@@ -140,6 +176,15 @@ impl fmt::Display for ValidationError {
                 f,
                 "auth of mapping {mapping} of server `{server}` is invalid: {reason}"
             ),
+            Self::InvalidMappingKonklav {
+                server,
+                mapping,
+                reason,
+            } => write!(
+                f,
+                "konklav of mapping {mapping} of server `{server}` is invalid: {reason}"
+            ),
+            Self::InvalidKonklav { reason } => write!(f, "invalid konklav config: {reason}"),
             Self::InvalidVerifier { verifier, reason } => {
                 write!(f, "auth verifier `{verifier}` is invalid: {reason}")
             }
@@ -218,14 +263,93 @@ impl Config {
                     server: name.clone(),
                 });
             }
+            // r[impl config.validate.wildcards]
+            for server_name in &server.server_names {
+                let reason = match crate::wildcard_suffix(server_name) {
+                    Some(suffix) if suffix.contains('*') => {
+                        Some("`*` can only be its whole first label")
+                    }
+                    Some(suffix)
+                        if suffix.split('.').filter(|label| !label.is_empty()).count() < 2 =>
+                    {
+                        Some("a wildcard needs at least two labels after it, as in `*.example.com`")
+                    }
+                    Some(_) => None,
+                    None if server_name.contains('*') => {
+                        Some("`*` can only be its whole first label, as in `*.example.com`")
+                    }
+                    None => None,
+                };
+                if let Some(reason) = reason {
+                    errors.push(ValidationError::InvalidServerName {
+                        server: name.clone(),
+                        server_name: server_name.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+            }
             // r[impl config.validate.unique-hosts]
+            // Wildcards are compared like other names, so two servers can't share one either.
             for server_name in &server.server_names {
                 hosts
                     .entry((server.listen, server_name.to_lowercase()))
                     .or_default()
                     .push(name.clone());
             }
+            let has_wildcard = server
+                .server_names
+                .iter()
+                .any(|server_name| crate::wildcard_suffix(server_name).is_some());
             for (index, mapping) in server.mappings.iter().enumerate() {
+                // r[impl config.validate.site+2]
+                if let Some(site) = &mapping.site {
+                    let mut error = |reason: String| {
+                        errors.push(ValidationError::InvalidSite {
+                            server: name.clone(),
+                            mapping: index,
+                            reason,
+                        })
+                    };
+                    if !mapping.rewrites.is_empty() {
+                        error("a site can't have rewrites: it builds its keys itself".into());
+                    }
+                    if mapping.writable {
+                        error(
+                            "a site can't be writable: write its builds and aliases through \
+                             a mapping without a site"
+                                .into(),
+                        );
+                    }
+                    match &site.alias {
+                        Some(alias) if !crate::is_alias_name(alias) => error(format!(
+                            "`{alias}` isn't an alias name: 1 to 63 lowercase letters, digits \
+                             and `-`, not starting or ending with `-`, and not a SHA"
+                        )),
+                        Some(_) => {}
+                        None if !has_wildcard => error(
+                            "without `alias`, the build is chosen by the host, which needs a \
+                             wildcard server name such as `*.example.com`"
+                                .into(),
+                        ),
+                        None => {}
+                    }
+                    for reason in site_prefix_reasons(&site.builds, &site.aliases) {
+                        error(reason);
+                    }
+                    let documents = [
+                        ("index", Some(&site.index)),
+                        ("fallback", site.fallback.as_ref()),
+                    ];
+                    for (setting, key) in documents {
+                        if let Some(key) = key
+                            && (key.is_empty() || key.starts_with('/'))
+                        {
+                            error(format!(
+                                "`{setting}` must be a key within a build, such as `index.html`"
+                            ));
+                        }
+                    }
+                }
                 // r[impl config.validate.writable]
                 if mapping.writable {
                     let mut error = |reason: &str| {
@@ -273,6 +397,16 @@ impl Config {
                         }
                     }
                 }
+                // r[impl config.validate.konklav]
+                if let Some(konklav) = &mapping.konklav {
+                    for reason in self.mapping_konklav_reasons(mapping, konklav) {
+                        errors.push(ValidationError::InvalidMappingKonklav {
+                            server: name.clone(),
+                            mapping: index,
+                            reason,
+                        });
+                    }
+                }
                 // r[impl config.validate.absolute-paths]
                 if !mapping.path_prefix.starts_with('/') {
                     errors.push(ValidationError::RelativePath {
@@ -306,9 +440,11 @@ impl Config {
         }
         // r[impl config.validate.verifiers]
         errors.extend(self.validate_verifiers());
+        // r[impl config.validate.konklav]
+        errors.extend(self.validate_konklav());
         // r[impl config.validate.cache]
         errors.extend(self.validate_cache());
-        // r[impl config.validate.refresh]
+        // r[impl config.validate.refresh+2]
         errors.extend(self.validate_refresh());
         // r[impl config.validate.cluster]
         errors.extend(self.validate_cluster());
@@ -338,6 +474,88 @@ impl Config {
         } else {
             Err(errors)
         }
+    }
+}
+
+impl Config {
+    fn validate_konklav(&self) -> Vec<ValidationError> {
+        let Some(konklav) = &self.konklav else {
+            return Vec::new();
+        };
+        let mut reasons = Vec::new();
+        for (field, url) in [
+            ("relying_url", &konklav.relying_url),
+            ("subject_url", &konklav.subject_url),
+        ] {
+            if !is_secure_url(url) {
+                reasons.push(format!(
+                    "`{field}` is `{url}`, which isn't an HTTPS URL, or an HTTP one to this host"
+                ));
+            }
+        }
+        for (field, value) in [
+            ("key_id", &konklav.key_id),
+            ("secret", &konklav.secret),
+            ("issuer", &konklav.issuer),
+            ("audience", &konklav.audience),
+        ] {
+            if value.trim().is_empty() {
+                reasons.push(format!("`{field}` must not be empty"));
+            }
+        }
+        if konklav.timeout.duration().is_zero() {
+            reasons.push("`timeout` must be positive".to_string());
+        }
+        reasons
+            .into_iter()
+            .map(|reason| ValidationError::InvalidKonklav { reason })
+            .collect()
+    }
+
+    /// Why a mapping's `konklav` is invalid.
+    fn mapping_konklav_reasons(
+        &self,
+        mapping: &crate::Mapping,
+        konklav: &crate::MappingKonklav,
+    ) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.konklav.is_none() {
+            reasons.push("there's no top-level `konklav` to decide its rules".to_string());
+        }
+        if konklav.rules.is_empty() {
+            reasons.push("it has no rules, so every request would be refused".to_string());
+        }
+        for (index, rule) in konklav.rules.iter().enumerate() {
+            let mut reason = |reason: String| reasons.push(format!("rule {index}: {reason}"));
+            if rule.actions.is_empty() || rule.actions.iter().any(|action| action.is_empty()) {
+                reason("`actions` must name at least one action, none of them empty".to_string());
+            }
+            let pattern = match crate::PathPattern::parse(&rule.path) {
+                Ok(pattern) => pattern,
+                Err(invalid) => {
+                    reason(invalid.to_string());
+                    continue;
+                }
+            };
+            if !pattern.can_match_under(&mapping.path_prefix) {
+                reason(format!(
+                    "`{}` can't match paths under the mapping's prefix `{}`",
+                    rule.path, mapping.path_prefix
+                ));
+            }
+            if let Some(scope) = &rule.scope {
+                if scope.kind.is_empty() {
+                    reason("the scope's `kind` must not be empty".to_string());
+                }
+                if !pattern.captures().any(|capture| capture == scope.id) {
+                    reason(format!(
+                        "the scope's `id` is `{}`, which `{}` doesn't capture",
+                        scope.id, rule.path
+                    ));
+                }
+            }
+        }
+        reasons
     }
 }
 
@@ -397,10 +615,27 @@ impl Config {
             for (index, rule) in refresh.rules.iter().enumerate() {
                 let rule_error = |reason: &str| (Some(index), reason.to_string());
                 let mut reasons = Vec::new();
-                match (&rule.prefix, &rule.key) {
-                    (Some(_), Some(_)) | (None, None) => {
-                        reasons.push(rule_error("set exactly one of `prefix` and `key`"))
+                let covers = [
+                    rule.prefix.is_some(),
+                    rule.key.is_some(),
+                    rule.alias.is_some(),
+                ];
+                if covers.into_iter().filter(|set| *set).count() != 1 {
+                    reasons.push(rule_error("set exactly one of `prefix`, `key` and `alias`"));
+                }
+                // r[impl config.validate.refresh-alias]
+                if let Some(alias) = &rule.alias {
+                    if !crate::is_alias_name(&alias.name) {
+                        reasons.push(rule_error(
+                            "`alias.name` isn't an alias name: 1 to 63 lowercase letters, \
+                             digits and `-`, not starting or ending with `-`, and not a SHA",
+                        ));
                     }
+                    for reason in site_prefix_reasons(&alias.builds, &alias.aliases) {
+                        reasons.push((Some(index), format!("alias: {reason}")));
+                    }
+                }
+                match (&rule.prefix, &rule.key) {
                     (Some(path), None) | (None, Some(path)) if path.starts_with('/') => reasons
                         .push(rule_error(
                             "keys and prefixes are backend keys, which don't start with `/`",
@@ -426,6 +661,23 @@ impl Config {
         }
         errors
     }
+}
+
+/// Reasons the prefixes of a site's builds and aliases are invalid.
+fn site_prefix_reasons(builds: &str, aliases: &str) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for (setting, prefix) in [("builds", builds), ("aliases", aliases)] {
+        if prefix.is_empty() || prefix.starts_with('/') || !prefix.ends_with('/') {
+            reasons.push(format!(
+                "`{setting}` must be a key prefix such as `{setting}/`, not starting with `/` \
+                 and ending with `/`"
+            ));
+        }
+    }
+    if builds.starts_with(aliases) || aliases.starts_with(builds) {
+        reasons.push("`builds` and `aliases` can't overlap".into());
+    }
+    reasons
 }
 
 /// Reasons TLS files are invalid: every one must be set.

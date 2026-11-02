@@ -55,6 +55,8 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    konklav: None,
+                    site: None,
                 }],
             },
         )]),
@@ -65,6 +67,7 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
             ..Cache::default()
         },
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         cluster: None,
         control: None,
@@ -163,6 +166,7 @@ fn downstream_config(upstream: &Upstream, pki: &Pki, name: &str, backend: &str) 
             rules: vec![RefreshRule {
                 prefix: Some(String::new()),
                 key: None,
+                alias: None,
                 every: Interval::from_secs(3600),
                 mode: RefreshMode::Preload,
                 max_objects: Some(10),

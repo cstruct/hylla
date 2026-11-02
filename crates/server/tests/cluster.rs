@@ -114,6 +114,8 @@ async fn node_with(
                     writable: control.is_some(),
                     cache_control: None,
                     auth: None,
+                    konklav: None,
+                    site: None,
                 }],
             },
         )]),
@@ -131,6 +133,7 @@ async fn node_with(
                     rules: vec![RefreshRule {
                         prefix: Some(String::new()),
                         key: None,
+                        alias: None,
                         every: Interval::from_secs(3600),
                         mode: RefreshMode::Preload,
                         max_objects: Some(10),
@@ -145,6 +148,7 @@ async fn node_with(
             ..Cache::default()
         },
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         control,
         serve_backends: None,

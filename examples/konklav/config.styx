@@ -1,0 +1,61 @@
+// Objects readable by whoever Konklav says holds `object:read` on them, and reports by
+// whoever holds `report:read` in their tenant. Konklav decides through its relying SDK,
+// from entitlements it keeps fresh from Konklav's change feed.
+servers {
+  files {
+    listen 0.0.0.0:8080
+    server_names (files.example.com)
+    mappings (
+      {
+        path_prefix /object
+        backend files
+        konklav {
+          // The first rule whose path matches decides; requests none matches get 403.
+          rules (
+            {
+              // Quoted, since `{` isn't allowed in a bare value.
+              path "/object/{object_id}/*"
+              actions (object:read)
+              // `object:read` at the object the path names, such as `o-1` for
+              // /object/o-1/report.pdf. Declare `object` as a registered scope kind in
+              // Konklav's catalog, and record each object there, so Konklav knows its
+              // tenant and refuses callers from others.
+              scope {kind object, id object_id}
+            }
+          )
+          // Responses are `Cache-Control: private`, the default, so shared caches in front
+          // of hylla don't hand them to others.
+        }
+      }
+      {
+        path_prefix /reports
+        backend files
+        konklav {
+          rules (
+            // Without a scope, the actions are needed tenant-wide.
+            {path /reports/*, actions (report:read)}
+          )
+        }
+      }
+      {path_prefix /public, backend files}
+    )
+  }
+}
+// Where Konklav is, and what its access tokens must say. hylla logs in as a service
+// principal with a secret key, whose secret is in the secrets file.
+konklav {
+  relying_url https://konklav.internal:8081
+  subject_url https://konklav.internal:8080
+  key_id 0193a2f0-0000-7000-8000-0000000000aa
+  issuer https://id.example.com
+  audience files.example.com
+  // Requests Konklav doesn't decide in time get 503.
+  timeout 5s
+}
+backends {
+  files {
+    type s3
+    bucket example-files
+    region eu-north-1
+  }
+}

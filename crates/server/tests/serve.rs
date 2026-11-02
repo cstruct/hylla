@@ -36,6 +36,8 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)]) -> Mapping {
         writable: false,
         cache_control: None,
         auth: None,
+        konklav: None,
+        site: None,
     }
 }
 
@@ -79,6 +81,7 @@ fn config_with_refresh(cache: Cache, refresh: Option<Refresh>) -> Config {
         )]),
         cache,
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         control: None,
         serve_backends: None,
@@ -515,6 +518,7 @@ fn rule(prefix: Option<&str>, key: Option<&str>, mode: RefreshMode) -> RefreshRu
     RefreshRule {
         prefix: prefix.map(Into::into),
         key: key.map(Into::into),
+        alias: None,
         every: Interval::from_secs(3600),
         mode,
         max_objects: None,

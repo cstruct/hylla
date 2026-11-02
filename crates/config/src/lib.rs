@@ -30,8 +30,10 @@
 
 mod interval;
 mod load;
+mod pattern;
 mod router;
 mod show;
+mod site;
 mod template;
 mod validate;
 
@@ -44,8 +46,10 @@ pub use load::{
     ConfigError, ConfigFiles, ENV_PREFIX, Inspected, Loaded, Origin, SourceError, inspect,
     inspect_with_env, load, load_with_env,
 };
+pub use pattern::{InvalidPattern, PathPattern};
 pub use router::{Route, Router};
 pub use show::{ExplainError, explain, render};
+pub use site::{is_alias_name, is_sha, wildcard_suffix};
 pub use template::{InvalidTemplate, PathTemplate, under_prefix};
 pub use validate::{ValidationError, is_secure_url};
 
@@ -102,6 +106,69 @@ config_tree! {
                     /// caches in front of hylla don't serve them to others.
                     #[facet(default = true)]
                     pub private: bool,
+                }>,
+                // r[impl config.konklav.mappings]
+                /// Leaves authorization to Konklav: requests must carry an access token
+                /// holding the actions of the first rule matching their path. Requests no
+                /// rule matches are refused.
+                pub konklav: Option<pub struct MappingKonklav {
+                    /// The rules, in order: the first whose path matches decides.
+                    pub rules: Vec<pub struct KonklavRule {
+                        /// The request path pattern, such as `/object/{object_id}/*`:
+                        /// `{name}` captures one segment, and a final `*` matches the rest.
+                        pub path: String,
+                        /// The actions required, such as `object:read`.
+                        pub actions: Vec<String>,
+                        /// The scope the actions are required at. Without it, they're
+                        /// required tenant-wide.
+                        pub scope: Option<pub struct KonklavScope {
+                            /// The scope kind, such as `object`.
+                            pub kind: String,
+                            /// The name of the capture that is the scope's id, such as
+                            /// `object_id`.
+                            pub id: String,
+                        }>,
+                    }>,
+                    /// Whether responses are marked `Cache-Control: private`, so shared
+                    /// caches in front of hylla don't serve them to others.
+                    #[facet(default = true)]
+                    pub private: bool,
+                }>,
+                // r[impl config.site]
+                /// Serves frontend builds, one per commit, chosen by SHA or by alias, rather
+                /// than mapping paths to keys.
+                pub site: Option<pub struct Site {
+                    // r[impl config.site.prefixes]
+                    /// The backend key prefix builds are stored under, each in a directory
+                    /// named by its commit's SHA.
+                    #[facet(default = String::from("builds/"))]
+                    pub builds: String,
+                    /// The backend key prefix aliases are stored under, each an object whose
+                    /// body is the SHA it points at.
+                    #[facet(default = String::from("aliases/"))]
+                    pub aliases: String,
+                    // r[impl config.site.alias]
+                    /// The alias always served, such as `live`. Without it, the build is chosen
+                    /// by the label a wildcard server name matched.
+                    pub alias: Option<String>,
+                    // r[impl config.site.index]
+                    /// The object served for paths ending with `/`.
+                    #[facet(default = String::from("index.html"))]
+                    pub index: String,
+                    // r[impl config.site.fallback]
+                    /// The object served for page loads of paths the build doesn't have, such as
+                    /// `index.html` for single page apps.
+                    pub fallback: Option<String>,
+                    // r[impl config.site.redirect]
+                    /// Whether requests choosing an alias by their host are redirected to the
+                    /// build's SHA host, so a browser stays on one build while the alias moves.
+                    #[facet(default = true)]
+                    pub redirect: bool,
+                    // r[impl config.site.alias-cache-control]
+                    /// The `Cache-Control` of responses served through an alias without
+                    /// redirecting, since the same URL serves another build once it moves.
+                    #[facet(default = String::from("no-cache"))]
+                    pub alias_cache_control: String,
                 }>,
             }>,
         }>,
@@ -376,6 +443,27 @@ config_tree! {
             #[facet(default = Interval::from_secs(20))]
             pub shutdown_timeout: Interval,
         },
+        // r[impl config.konklav.provider]
+        /// Konklav, deciding requests for mappings with `konklav`. Optional.
+        pub konklav: Option<pub struct Konklav {
+            /// The URL of Konklav's relying surface, such as `https://konklav:8081`.
+            pub relying_url: String,
+            /// The URL of Konklav's subject-facing surface, where hylla logs in, such as
+            /// `https://konklav:8080`.
+            pub subject_url: String,
+            /// The id of hylla's service principal's secret key credential.
+            pub key_id: String,
+            /// The secret of that credential.
+            #[config(secret)]
+            pub secret: String,
+            /// The `iss` access tokens must have.
+            pub issuer: String,
+            /// The `aud` access tokens must have.
+            pub audience: String,
+            /// How long a decision may take before the request is refused, such as `5s`.
+            #[facet(default = Interval::from_secs(5))]
+            pub timeout: Interval,
+        }>,
         // r[impl config.auth.verifiers]
         /// JWT verifiers by name, used by mappings' `auth`.
         #[facet(default)]
@@ -710,7 +798,7 @@ pub struct Refresh {
     pub rules: Vec<RefreshRule>,
 }
 
-// r[impl config.refresh.rules]
+// r[impl config.refresh.rules+2]
 /// Refreshes the objects under a key prefix, or a single key, of a backend.
 #[config]
 #[derive(Debug, Clone, PartialEq)]
@@ -720,6 +808,8 @@ pub struct RefreshRule {
     pub prefix: Option<String>,
     /// A single backend key, such as `css/app.css`.
     pub key: Option<String>,
+    /// The build an alias points at, read again on every run, such as the live site's.
+    pub alias: Option<RefreshAlias>,
     /// How often to refresh, such as `15m`. The first refresh runs at startup.
     pub every: Interval,
     #[facet(default)]
@@ -728,6 +818,21 @@ pub struct RefreshRule {
     pub max_objects: Option<u64>,
     /// The most data one preload fetches, in MiB.
     pub max_mib: Option<u64>,
+}
+
+// r[impl config.refresh.alias]
+/// The alias a refresh rule follows, covering the build it points at.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshAlias {
+    /// The alias, such as `live`.
+    pub name: String,
+    /// The backend key prefix builds are stored under, as the site's `builds`.
+    #[facet(default = String::from("builds/"))]
+    pub builds: String,
+    /// The backend key prefix aliases are stored under, as the site's `aliases`.
+    #[facet(default = String::from("aliases/"))]
+    pub aliases: String,
 }
 
 // r[impl config.refresh.modes]

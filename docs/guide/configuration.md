@@ -56,6 +56,11 @@ Servers by name. A request goes to the server on the address it came in on whose
 `server_names` contain its `Host` header, compared without case or port; other hosts get
 404. Several servers can share a listen address.
 
+A server name can be a wildcard, such as `*.preview.example.com`, matching exactly one label
+in front of it: `pr1873.preview.example.com`, but not `preview.example.com` or
+`a.b.preview.example.com`. Exact names win over wildcards, so `www.example.com` and
+`*.example.com` can share an address. [Sites](#sites) choose their build by that label.
+
 | Setting | Default | |
 |---|---|---|
 | `listen` | required | The address and port, such as `0.0.0.0:8080` |
@@ -72,6 +77,8 @@ Each mapping:
 | `cache_control` | none | The `Cache-Control` of objects stored without one, such as `public, max-age=300`. Objects keep their own `Cache-Control`, `Content-Encoding`, `Content-Disposition` and `Content-Language` |
 | `writable` | `false` | Whether the [control plane](control-plane.md) may change its objects. Writable mappings can't have rewrites |
 | `auth` | none | Requires a JWT, see below |
+| `konklav` | none | Leaves authorization to Konklav, see [`konklav`](#konklav) |
+| `site` | none | Serves frontend builds by commit, see [sites](#sites) |
 
 The path is percent-decoded before it's matched, rewritten and checked. The backend key is
 the rewritten path without its leading `/`: without rewrites, `/assets/app.css` is the key
@@ -84,6 +91,86 @@ A mapping's `auth`:
 | `verifier` | required | The name of a verifier in `auth` |
 | `paths` | none | Backend path prefixes a token may read, with claims filled in, such as `/tenants/${tenant_id}`. A list claim allows a prefix for each item: `/teams/${groups}` allows every group's. Without any, a valid token reads anything the mapping serves |
 | `private` | `true` | Whether responses are marked `Cache-Control: private` |
+
+#### Sites
+
+A mapping with a `site` serves static frontend builds, one per commit, rather than mapping
+paths to keys. CI uploads each build under its commit's full SHA, and points aliases such as
+`pr1873` or `live` at builds by writing the SHA into a small object:
+
+```text
+builds/3f2a…e1/index.html       a build, never changed once uploaded
+builds/3f2a…e1/assets/app-4b1c.js
+aliases/pr1873                  body: 3f2a…e1
+aliases/live                    body: 9c07…d4
+```
+
+On a server with a wildcard name, the label in front of it chooses the build:
+`3f2a…e1.preview.example.com` serves that build, and `pr1873.preview.example.com/settings`
+redirects with 307 to `//3f2a…e1.preview.example.com/settings`, so a browser stays on one
+build for the whole session while the alias moves. A site with `alias` always serves that
+alias, without redirecting, as for the live site.
+
+Aliases are objects, read through the cache like any other, so moving one needs no config
+reload: it's picked up within `metadata_ttl`, or at once on every node when written through
+a writable mapping of the [control plane](control-plane.md). Builds and aliases are written
+through such a mapping, or straight to the bucket; site mappings themselves can't be
+writable or listed.
+
+| Setting | Default | |
+|---|---|---|
+| `builds` | `builds/` | The key prefix builds are stored under |
+| `aliases` | `aliases/` | The key prefix aliases are stored under |
+| `alias` | none | The alias always served, such as `live`. Without it, the server needs a wildcard name |
+| `index` | `index.html` | The object served for paths ending with `/` |
+| `fallback` | none | The object served for page loads of paths the build doesn't have, such as `index.html` for single page apps. Scripts, images and other requests still get 404 |
+| `redirect` | `true` | Whether aliases in the host redirect to the build's SHA host |
+| `alias_cache_control` | `no-cache` | The `Cache-Control` of responses served through an alias without redirecting, replacing the object's own |
+
+With `auth`, a token must be allowed the key of what it's served, such as
+`/builds/${build}`. A redirect needs both the alias, such as `/aliases/${alias}`, and the
+build it points at, so tokens can't learn where aliases point without being let into the
+build.
+
+To warm a build before anyone asks for it, as when `live` moves, give the backend a refresh
+rule following the alias. It reads the alias on every run and preloads the build it points
+at, listing it once per run when nothing changed:
+
+```styx
+refresh {rules ({alias {name live}, every 30s, mode preload, max_mib 512})}
+```
+
+A page loaded before `live` moves can still ask for an asset of its own build, which the
+new one doesn't have. If asset names carry a hash of their content, as most bundlers' do,
+upload every build's assets to one shared prefix and serve it with a mapping ahead of the
+site's, so only pages are per build:
+
+```styx
+mappings (
+  {path_prefix /assets, backend frontend, cache_control "public, max-age=31536000, immutable"}
+  {path_prefix /, backend frontend, site {alias live, fallback index.html}}
+)
+```
+
+SHAs are 40 or 64 lowercase hexadecimal characters. Alias names are 1 to 63 lowercase
+letters, digits and `-`, so each can be a host label. Upload builds with a long
+`Cache-Control`, such as `public, max-age=31536000, immutable`: SHA hosts serve it as is.
+[examples/sites](../../examples/sites) puts it together.
+
+```styx
+servers {
+  previews {
+    listen 0.0.0.0:8080
+    server_names (*.preview.example.com)
+    mappings ({path_prefix /, backend frontend, site {fallback index.html}})
+  }
+  live {
+    listen 0.0.0.0:8080
+    server_names (www.example.com)
+    mappings ({path_prefix /, backend frontend, site {alias live, fallback index.html}})
+  }
+}
+```
 
 ### `auth`
 
@@ -117,6 +204,91 @@ Keys from a provider are read when the first token needs them, and read again af
 hour, or when a token names a key they don't have, as after the provider rotated its keys,
 but not more than once every 30 seconds. While the provider can't be reached, the keys it
 had are still used. Until they've been read once, requests are answered with 503.
+
+### `konklav`
+
+[Konklav](https://github.com/cstruct/konklav) decides requests for mappings with `konklav`,
+by the actions its roles grant the caller of their access token. hylla asks through
+Konklav's relying SDK, which decides locally from entitlements it keeps fresh from Konklav's
+change feed.
+
+| Setting | Default | |
+|---|---|---|
+| `relying_url` | required | Konklav's relying surface, such as `https://konklav:8081` |
+| `subject_url` | required | Konklav's subject-facing surface, where hylla logs in, such as `https://konklav:8080` |
+| `key_id` | required | The id of a secret key credential of hylla's service principal |
+| `secret` | required, **secret** | That credential's secret |
+| `issuer` | required | The `iss` access tokens must have |
+| `audience` | required | The `aud` access tokens must have |
+| `timeout` | `5s` | How long a decision may take before the request gets 503 |
+
+The URLs must be HTTPS ones, or HTTP ones to this host. hylla starts without waiting for
+Konklav; until it's reached, requests for its mappings get 503.
+
+A mapping's `konklav`:
+
+| Setting | Default | |
+|---|---|---|
+| `rules` | required | Which actions each path needs, in order: the first rule whose `path` matches decides. Requests no rule matches get 403 |
+| `private` | `true` | Whether responses are marked `Cache-Control: private` |
+
+Each rule:
+
+| Setting | Default | |
+|---|---|---|
+| `path` | required | A pattern for the request path, such as `"/object/{object_id}/*"`. `{name}` matches one segment and captures it, and a final `*` the rest of the path, including nothing. Quote patterns with `{` |
+| `actions` | required | The actions needed, such as `(object:read)` |
+| `scope` | none | The scope the actions are needed at: `{kind object, id object_id}` needs them at the scope `object` whose id is the capture `object_id`. Without it, they're needed tenant-wide |
+
+```styx
+konklav {
+  relying_url https://konklav.internal:8081
+  subject_url https://konklav.internal:8080
+  key_id 0193a2f0-0000-7000-8000-0000000000aa
+  issuer https://id.example.com
+  audience files.example.com
+}
+servers {
+  files {
+    // ...
+    mappings (
+      {
+        path_prefix /object
+        backend files
+        konklav {
+          rules (
+            {
+              path "/object/{object_id}/*"
+              actions (object:read)
+              scope {kind object, id object_id}
+            }
+          )
+        }
+      }
+    )
+  }
+}
+```
+
+Patterns match the request path, percent-decoded, before rewrites. A request for
+`/object/o-1/report.pdf` needs `object:read` at the object `o-1`. Konklav decides who owns
+a scope: the token's tenant, or, for a scope kind registered in Konklav's catalog, the
+tenant the object is recorded in, so a caller can't read another tenant's object by its id.
+An allow that relies on a share with attributes, such as a date range, is refused, since
+hylla can't narrow what it serves to them.
+
+Decisions aren't cached by hylla. Konklav's relying SDK caches what it decides from, and
+Konklav's change feed tells it of changes, so a revoked grant stops working within about a
+second. While the feed is down or lagging, every request is asked of Konklav's check API.
+Requests are decided even when their object is cached, and when Konklav can't decide, they
+get 503: nothing is served without a decision.
+
+A mapping can have both `auth` and `konklav`. `auth` checks the bearer token first, and
+only the requests it allows are asked of Konklav, with the same token. Responses are private
+when either asks for it.
+
+On a [site](#sites), Konklav is asked about the request path before the build is chosen, so
+an alias isn't read for requests it refuses; `auth` then checks the build's keys as usual.
 
 ### `backends`
 
@@ -171,7 +343,7 @@ Each rule:
 
 | Setting | Default | |
 |---|---|---|
-| `prefix` or `key` | one required | A directory-like key prefix such as `css/` (`""` for everything), or a single key |
+| `prefix`, `key` or `alias` | one required | A directory-like key prefix such as `css/` (`""` for everything), a single key, or the build an alias points at, such as `{name live}`, read again on every run. An `alias` can set the `builds` and `aliases` prefixes too, as a [site](#sites)'s |
 | `every` | required | How often, such as `15m`. The first run is at startup |
 | `mode` | `revalidate` | `revalidate` checks cached objects, `preload` fetches objects that aren't cached, `both` does both, and `disabled` nothing |
 | `max_objects`, `max_mib` | none | Caps on what one run preloads; preloading needs at least one |

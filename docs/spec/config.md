@@ -140,9 +140,10 @@ r[config.refresh]
 A backend MAY have a `refresh` section with `rules` and a `concurrency`, defaulting to 4,
 limiting how many objects are refreshed at the same time.
 
-r[config.refresh.rules]
-A refresh rule MUST cover either a backend key `prefix` (directory-like, empty for the
-whole backend) or a single backend `key`, and run `every` interval.
+r[config.refresh.rules+2]
+A refresh rule MUST cover one of a backend key `prefix` (directory-like, empty for the
+whole backend), a single backend `key`, or the build an `alias` points at (see
+`config.refresh.alias`), and run `every` interval.
 
 r[config.refresh.modes]
 A refresh rule's `mode` MUST be `disabled`, `revalidate` (the default), `preload` or
@@ -152,10 +153,10 @@ r[config.durations]
 Durations, such as `every`, `metadata_ttl` and `stale_if_error`, MUST be written like
 `90s`, `15m` or `1h 30m`.
 
-r[config.validate.refresh]
-A refresh with a `concurrency` of zero, and rules setting both or neither of `prefix` and
-`key`, a key or prefix starting with `/`, an empty key, a zero interval, or preloading
-without `max_objects` or `max_mib`, MUST be reported as invalid.
+r[config.validate.refresh+2]
+A refresh with a `concurrency` of zero, and rules setting more or fewer than one of
+`prefix`, `key` and `alias`, a key or prefix starting with `/`, an empty key, a zero
+interval, or preloading without `max_objects` or `max_mib`, MUST be reported as invalid.
 
 r[config.backends.secrets]
 Backend credentials MUST be secret, so they can only be set by the secrets file.
@@ -227,6 +228,29 @@ r[config.validate.verifiers]
 A verifier with both a `public_key` and a `jwks_uri`, or with none of `public_key`,
 `jwks_uri` and `issuer`, or whose `jwks_uri`, or `issuer` it reads its keys through, isn't
 an HTTPS URL, or an HTTP one to a loopback address, MUST be reported as invalid.
+
+## Konklav
+
+r[config.konklav.provider]
+Konklav MUST be configured in an optional top-level `konklav` section with the `relying_url`
+and `subject_url` of its relying and subject-facing surfaces, the `key_id` and secret
+`secret` of the service principal's secret key, the `issuer` and `audience` access tokens
+must have, and a `timeout` for decisions defaulting to `5s`.
+
+r[config.konklav.mappings]
+A mapping MAY have a `konklav` section with its `rules`, in order, and a `private` flag
+defaulting to true. Each rule MUST have a `path` pattern starting with `/`, its `actions`,
+and optionally a `scope` with the scope's `kind` and the name of the capture that is its
+`id`, such as `{path "/object/{object_id}/*", actions (object:read), scope {kind object, id
+object_id}}`.
+
+r[config.validate.konklav]
+A `konklav` section whose URLs aren't HTTPS URLs, or HTTP ones to a loopback address, or
+with an empty `key_id`, `secret`, `issuer` or `audience`, or a zero `timeout`, MUST be
+reported as invalid. So MUST a mapping's `konklav` without a top-level `konklav` section,
+without rules, or with a rule whose path doesn't parse, can't match paths under the mapping's
+prefix, or captures a name twice, whose actions are empty, or whose scope has an empty kind or
+names a capture its path doesn't have.
 
 ## Serving backends
 

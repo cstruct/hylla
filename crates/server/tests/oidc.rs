@@ -253,6 +253,8 @@ async fn node_with_issuer(issuer: &str) -> Arc<App> {
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    konklav: None,
+                    site: None,
                 }],
             },
         )]),
@@ -270,6 +272,7 @@ async fn node_with_issuer(issuer: &str) -> Arc<App> {
         )]),
         cache: Default::default(),
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         cluster: None,
         control: Some(Control {

@@ -137,6 +137,8 @@ mod tests {
             writable: false,
             cache_control: None,
             auth: None,
+            konklav: None,
+            site: None,
         }
     }
 

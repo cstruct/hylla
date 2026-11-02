@@ -18,6 +18,7 @@ use opentelemetry::KeyValue;
 use tracing::{Instrument, field::Empty};
 
 use crate::auth::{self, CompiledAuth, Verifiers};
+use crate::konklav::{CompiledKonklav, Konklav};
 
 use crate::{
     RefreshReport,
@@ -29,7 +30,9 @@ use crate::{
     listen,
     metrics::{self, METRICS},
     range::{self, RequestedRange},
-    refresh, spans, telemetry,
+    refresh,
+    site::{self, Site},
+    spans, telemetry,
     upstream::{self, Upstream},
 };
 
@@ -75,16 +78,34 @@ struct Server {
     prefixes: Vec<String>,
     /// The `Cache-Control` of each mapping's objects without one, by mapping index.
     cache_controls: Vec<Option<String>>,
+    /// The exact host names it answers to, lowercased.
     names: Vec<String>,
+    /// The host names its wildcards match one label in front of, lowercased.
+    wildcards: Vec<String>,
     router: MappingRouter,
     /// The auth of each mapping, by mapping index.
     auth: Vec<Option<CompiledAuth>>,
+    /// The Konklav rules of each mapping, by mapping index.
+    konklav: Vec<Option<CompiledKonklav>>,
+    /// The site of each mapping, by mapping index.
+    sites: Vec<Option<Site>>,
+}
+
+/// The server a request's host matched.
+struct Matched<'a> {
+    server: &'a Server,
+    /// The host, as the request gave it, with its port.
+    host: String,
+    /// The label a wildcard server name matched, lowercased.
+    label: Option<String>,
 }
 
 impl App {
     /// Builds the app from a validated config and the backends' object stores.
     pub async fn new(config: &Config, stores: Stores) -> anyhow::Result<Arc<Self>> {
         let verifiers = Verifiers::new(&config.auth)?;
+        // r[impl konklav.optional]
+        let konklav = config.konklav.as_ref().map(Konklav::start);
         let mut listeners = BTreeMap::<SocketAddr, Vec<Arc<Server>>>::new();
         let mut servers = config.servers.iter().collect::<Vec<_>>();
         servers.sort_by_key(|(name, _)| *name);
@@ -102,6 +123,22 @@ impl App {
                         .as_ref()
                         .map(|auth| verifiers.mapping(auth))
                         .transpose()
+                        .with_context(|| format!("server `{name}`, mapping {index}"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let konklav = server
+                .mappings
+                .iter()
+                .enumerate()
+                .map(|(index, mapping)| {
+                    let Some(rules) = &mapping.konklav else {
+                        return Ok(None);
+                    };
+                    konklav
+                        .as_ref()
+                        .context("there's no top-level `konklav` to decide its rules")
+                        .and_then(|konklav| konklav.mapping(rules))
+                        .map(Some)
                         .with_context(|| format!("server `{name}`, mapping {index}"))
                 })
                 .collect::<anyhow::Result<_>>()?;
@@ -123,10 +160,23 @@ impl App {
                     names: server
                         .server_names
                         .iter()
+                        .filter(|name| hylla_config::wildcard_suffix(name).is_none())
                         .map(|name| name.to_lowercase())
+                        .collect(),
+                    wildcards: server
+                        .server_names
+                        .iter()
+                        .filter_map(|name| hylla_config::wildcard_suffix(name))
+                        .map(str::to_lowercase)
                         .collect(),
                     router,
                     auth,
+                    konklav,
+                    sites: server
+                        .mappings
+                        .iter()
+                        .map(|mapping| mapping.site.clone().map(Site::new))
+                        .collect(),
                 }));
         }
         let refresh = config
@@ -159,6 +209,7 @@ impl App {
                     backend: mapping.backend.clone(),
                     writable: mapping.writable,
                     rewrites: !mapping.rewrites.is_empty(),
+                    site: mapping.site.is_some(),
                 });
             }
         }
@@ -426,23 +477,43 @@ impl App {
     }
 
     // r[impl server.hosts]
-    fn server(&self, listen: SocketAddr, request: &Request) -> Option<&Server> {
+    // r[impl site.hosts.wildcard]
+    // r[impl site.hosts.precedence]
+    fn server(&self, listen: SocketAddr, request: &Request) -> Option<Matched<'_>> {
         // HTTP/2 requests carry their host in `:authority`, which ends up in the URI.
-        let host = match request.headers().get(header::HOST) {
+        let given = match request.headers().get(header::HOST) {
             Some(host) => host.to_str().ok()?,
-            None => request.uri().host()?,
+            None => {
+                let authority = request.uri().authority()?.as_str();
+                authority.rsplit('@').next().unwrap_or(authority)
+            }
         };
         // Strip the port, keeping bracketed IPv6 addresses intact.
-        let host = match host.rsplit_once(':') {
+        let host = match given.rsplit_once(':') {
             Some((name, port)) if !port.contains(']') => name,
-            _ => host,
+            _ => given,
         }
         .to_lowercase();
-        self.listeners
-            .get(&listen)?
-            .iter()
-            .find(|server| server.names.contains(&host))
-            .map(Arc::as_ref)
+        let servers = self.listeners.get(&listen)?;
+        let (server, label) = match servers.iter().find(|server| server.names.contains(&host)) {
+            Some(server) => (server, None),
+            None => {
+                // Wildcards match exactly one label in front of their name.
+                let (label, rest) = host.split_once('.')?;
+                if label.is_empty() {
+                    return None;
+                }
+                let server = servers
+                    .iter()
+                    .find(|server| server.wildcards.iter().any(|suffix| suffix == rest))?;
+                (server, Some(label.to_string()))
+            }
+        };
+        Some(Matched {
+            server,
+            host: given.to_string(),
+            label,
+        })
     }
 }
 
@@ -551,7 +622,12 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
         }
     };
     let app = &listener.app;
-    let Some(server) = app.server(listener.listen, &request) else {
+    let Some(Matched {
+        server,
+        host,
+        label,
+    }) = app.server(listener.listen, &request)
+    else {
         return (StatusCode::NOT_FOUND, "unknown host\n").into_response();
     };
     labels.server = Some(server.name.clone());
@@ -566,28 +642,51 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
         return (StatusCode::NOT_FOUND, "no mapping\n").into_response();
     };
     labels.mapping = server.prefixes.get(route.mapping).cloned();
-    let key = route.path.trim_start_matches('/');
-
-    // r[impl auth.mappings]
     let auth = server.auth.get(route.mapping).and_then(Option::as_ref);
-    let private = auth.is_some_and(|auth| auth.private);
-    if let Some(auth) = auth
-        && let Err(refusal) = auth.check(request.headers(), &format!("/{key}")).await
-    {
-        match &refusal {
-            auth::Refusal::InvalidToken(reason) => {
-                tracing::debug!(reason, "refused an invalid token");
-            }
-            auth::Refusal::KeysUnavailable(reason) => {
-                tracing::debug!(reason, "refused a token, without keys to check it with");
-            }
-            _ => {}
+    let konklav = server.konklav.get(route.mapping).and_then(Option::as_ref);
+    // r[impl konklav.private]
+    let private =
+        auth.is_some_and(|auth| auth.private) || konklav.is_some_and(|konklav| konklav.private);
+
+    if let Some(site) = server.sites.get(route.mapping).and_then(Option::as_ref) {
+        // r[impl konklav.sites]
+        // Konklav goes by the request path alone, so it decides before the build is chosen,
+        // which `auth` checks the keys of.
+        if let Some(refused) = check_konklav(konklav, request.headers(), &path).await {
+            return mark_private(refused, private);
         }
-        METRICS
-            .auth_refusals
-            .add(1, &[KeyValue::new("hylla.reason", refusal.reason())]);
-        let (status, headers) = auth::refusal_response(&refusal);
-        return mark_private((status, headers).into_response(), private);
+        let prefix = server.prefixes[route.mapping].trim_end_matches('/');
+        let document = route.path.strip_prefix(prefix).unwrap_or(&route.path);
+        let response = serve_site(
+            app,
+            site,
+            route.backend,
+            SiteRequest {
+                host: &host,
+                label: label.as_deref(),
+                document,
+                headers: request.headers(),
+                uri: request.uri(),
+                head,
+                auth,
+                cache_control: server
+                    .cache_controls
+                    .get(route.mapping)
+                    .and_then(Option::as_deref),
+            },
+        )
+        .await;
+        return mark_private(response, private);
+    }
+
+    let key = route.path.trim_start_matches('/');
+    // r[impl konklav.with-auth+2]
+    // `auth` goes first, so Konklav is only asked about tokens it allows.
+    if let Some(refused) = check_auth(auth, request.headers(), key).await {
+        return mark_private(refused, private);
+    }
+    if let Some(refused) = check_konklav(konklav, request.headers(), &path).await {
+        return mark_private(refused, private);
     }
 
     let request_headers = request.headers();
@@ -616,6 +715,139 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
     }
     .await;
     mark_private(response, private)
+}
+
+// r[impl auth.mappings]
+/// Checks a request's token against `auth`, for backend key `key`, answering with the
+/// refusal when it doesn't pass.
+async fn check_auth(
+    auth: Option<&CompiledAuth>,
+    headers: &HeaderMap,
+    key: &str,
+) -> Option<Response> {
+    let refusal = auth?.check(headers, &format!("/{key}")).await.err()?;
+    Some(refused(&refusal))
+}
+
+// r[impl konklav.mappings]
+/// Asks Konklav about a request for the decoded request path `path`, by the mapping's
+/// rules, answering with the refusal when it isn't allowed.
+async fn check_konklav(
+    konklav: Option<&CompiledKonklav>,
+    headers: &HeaderMap,
+    path: &str,
+) -> Option<Response> {
+    let refusal = konklav?.check(headers, path).await.err()?;
+    Some(refused(&refusal))
+}
+
+/// Logs and counts a refusal, and answers with it.
+fn refused(refusal: &auth::Refusal) -> Response {
+    match refusal {
+        auth::Refusal::InvalidToken(reason) => {
+            tracing::debug!(reason, "refused an invalid token");
+        }
+        auth::Refusal::KeysUnavailable(reason) => {
+            tracing::debug!(reason, "refused a token, without keys to check it with");
+        }
+        auth::Refusal::DecisionUnavailable(reason) => {
+            tracing::debug!(reason, "refused a request Konklav couldn't decide");
+        }
+        _ => {}
+    }
+    METRICS
+        .auth_refusals
+        .add(1, &[KeyValue::new("hylla.reason", refusal.reason())]);
+    let (status, headers) = auth::refusal_response(refusal);
+    (status, headers).into_response()
+}
+
+/// A request to a site.
+struct SiteRequest<'a> {
+    /// The host, as the request gave it, with its port.
+    host: &'a str,
+    /// The label a wildcard server name matched.
+    label: Option<&'a str>,
+    /// The request's path within the mapping.
+    document: &'a str,
+    headers: &'a HeaderMap,
+    uri: &'a http::Uri,
+    head: bool,
+    auth: Option<&'a CompiledAuth>,
+    /// The mapping's `Cache-Control` of objects without one.
+    cache_control: Option<&'a str>,
+}
+
+/// Serves a request to a site from the build it chooses, redirecting requests through an
+/// alias in their host to the build's own host.
+async fn serve_site(
+    app: &Arc<App>,
+    site: &Site,
+    backend: &str,
+    request: SiteRequest<'_>,
+) -> Response {
+    let Some(store) = app.stores.get(backend) else {
+        return (StatusCode::BAD_GATEWAY, "backend unavailable\n").into_response();
+    };
+    let build = match site.build(app, backend, store, request.label).await {
+        Ok(build) => build,
+        Err(failure) => return failure.into_response(),
+    };
+    let headers = request.headers;
+    // r[impl site.auth]
+    let key = site.key(&build.sha, request.document);
+    // r[impl site.redirect.missing-build]
+    // Redirected without checking the build exists: its host answers 404 if it doesn't.
+    if let Some(alias) = &build.alias
+        && build.from_host
+        && site.config().redirect
+    {
+        // Only to tokens allowed into the build too, so they can't learn where aliases point.
+        let alias_key = format!("{}{alias}", site.config().aliases);
+        for key in [&alias_key, &key] {
+            if let Some(refused) = check_auth(request.auth, headers, key).await {
+                return refused;
+            }
+        }
+        let path_and_query = request
+            .uri
+            .path_and_query()
+            .map_or("/", |path| path.as_str());
+        return site::redirect(request.host, path_and_query, &build.sha);
+    }
+    if let Some(refused) = check_auth(request.auth, headers, &key).await {
+        return refused;
+    }
+    // r[impl site.conditional]
+    // Served as any other object, so conditional and range requests go by its own ETag.
+    let serve = |key: &str| {
+        serve_object(
+            app,
+            backend,
+            store,
+            ObjectPath::from(key),
+            headers,
+            request.head,
+            request.cache_control,
+        )
+    };
+    let mut response = serve(&key).await;
+    // r[impl site.fallback.missing]
+    if response.status() == StatusCode::NOT_FOUND
+        && site::is_page_load(headers)
+        && let Some(fallback) = site.fallback_key(&build.sha)
+        && check_auth(request.auth, headers, &fallback).await.is_none()
+    {
+        response = serve(&fallback).await;
+    }
+    // r[impl site.alias-cache-control]
+    if build.alias.is_some() {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header_value(&site.config().alias_cache_control),
+        );
+    }
+    response
 }
 
 // r[impl auth.private]

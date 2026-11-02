@@ -41,6 +41,8 @@ async fn node() -> Arc<App> {
         writable,
         cache_control: None,
         auth: None,
+        konklav: None,
+        site: None,
     };
     let config = Config {
         servers: HashMap::from([(
@@ -65,6 +67,7 @@ async fn node() -> Arc<App> {
         )]),
         cache: Default::default(),
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         cluster: None,
         control: Some(Control {
