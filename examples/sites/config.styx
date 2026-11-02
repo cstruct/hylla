@@ -10,7 +10,12 @@ servers {
   live {
     listen 0.0.0.0:8080
     server_names (www.example.com example.com)
-    mappings ({path_prefix /, backend frontend, site {alias live, fallback index.html}})
+    mappings (
+      // Hashed assets of every build share one prefix, so pages loaded before `live` moves
+      // keep finding theirs.
+      {path_prefix /assets, backend frontend, cache_control "public, max-age=31536000, immutable"}
+      {path_prefix /, backend frontend, site {alias live, fallback index.html}}
+    )
   }
   ci {
     listen 127.0.0.1:8090
@@ -23,6 +28,8 @@ backends {
     type s3
     bucket frontend
     region eu-north-1
+    // Warms the build `live` points at, within a run of it moving.
+    refresh {rules ({alias {name live}, every 30s, mode preload, max_mib 512})}
   }
 }
 control {

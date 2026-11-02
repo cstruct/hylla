@@ -316,19 +316,8 @@ impl Config {
                         ),
                         None => {}
                     }
-                    for (setting, prefix) in [("builds", &site.builds), ("aliases", &site.aliases)]
-                    {
-                        if prefix.is_empty() || prefix.starts_with('/') || !prefix.ends_with('/') {
-                            error(format!(
-                                "`{setting}` must be a key prefix such as `{setting}/`, not \
-                                 starting with `/` and ending with `/`"
-                            ));
-                        }
-                    }
-                    if site.builds.starts_with(&site.aliases)
-                        || site.aliases.starts_with(&site.builds)
-                    {
-                        error("`builds` and `aliases` can't overlap".into());
+                    for reason in site_prefix_reasons(&site.builds, &site.aliases) {
+                        error(reason);
                     }
                     let documents = [
                         ("index", Some(&site.index)),
@@ -426,7 +415,7 @@ impl Config {
         errors.extend(self.validate_verifiers());
         // r[impl config.validate.cache]
         errors.extend(self.validate_cache());
-        // r[impl config.validate.refresh]
+        // r[impl config.validate.refresh+2]
         errors.extend(self.validate_refresh());
         // r[impl config.validate.cluster]
         errors.extend(self.validate_cluster());
@@ -515,10 +504,27 @@ impl Config {
             for (index, rule) in refresh.rules.iter().enumerate() {
                 let rule_error = |reason: &str| (Some(index), reason.to_string());
                 let mut reasons = Vec::new();
-                match (&rule.prefix, &rule.key) {
-                    (Some(_), Some(_)) | (None, None) => {
-                        reasons.push(rule_error("set exactly one of `prefix` and `key`"))
+                let covers = [
+                    rule.prefix.is_some(),
+                    rule.key.is_some(),
+                    rule.alias.is_some(),
+                ];
+                if covers.into_iter().filter(|set| *set).count() != 1 {
+                    reasons.push(rule_error("set exactly one of `prefix`, `key` and `alias`"));
+                }
+                // r[impl config.validate.refresh-alias]
+                if let Some(alias) = &rule.alias {
+                    if !crate::is_alias_name(&alias.name) {
+                        reasons.push(rule_error(
+                            "`alias.name` isn't an alias name: 1 to 63 lowercase letters, \
+                             digits and `-`, not starting or ending with `-`, and not a SHA",
+                        ));
                     }
+                    for reason in site_prefix_reasons(&alias.builds, &alias.aliases) {
+                        reasons.push((Some(index), format!("alias: {reason}")));
+                    }
+                }
+                match (&rule.prefix, &rule.key) {
                     (Some(path), None) | (None, Some(path)) if path.starts_with('/') => reasons
                         .push(rule_error(
                             "keys and prefixes are backend keys, which don't start with `/`",
@@ -544,6 +550,23 @@ impl Config {
         }
         errors
     }
+}
+
+/// Reasons the prefixes of a site's builds and aliases are invalid.
+fn site_prefix_reasons(builds: &str, aliases: &str) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for (setting, prefix) in [("builds", builds), ("aliases", aliases)] {
+        if prefix.is_empty() || prefix.starts_with('/') || !prefix.ends_with('/') {
+            reasons.push(format!(
+                "`{setting}` must be a key prefix such as `{setting}/`, not starting with `/` \
+                 and ending with `/`"
+            ));
+        }
+    }
+    if builds.starts_with(aliases) || aliases.starts_with(builds) {
+        reasons.push("`builds` and `aliases` can't overlap".into());
+    }
+    reasons
 }
 
 /// Reasons TLS files are invalid: every one must be set.

@@ -8,7 +8,7 @@ use object_store::path::Path as ObjectPath;
 
 use crate::{
     app::App,
-    cache::{ObjectMeta, ReadError},
+    cache::{ObjectCache, ObjectMeta, ReadError},
 };
 
 /// The largest alias, in bytes: a SHA and some whitespace.
@@ -79,11 +79,7 @@ impl Site {
         })
     }
 
-    // r[impl site.alias-object]
-    // r[impl site.alias-stale]
-    /// The SHA alias `name` points at, read through the cache, so it's checked against its
-    /// ETag after the metadata TTL, served stale through outages, and forgotten when changed
-    /// through a control plane.
+    /// The SHA alias `name` points at, remembering it by the alias's ETag.
     async fn resolve(
         &self,
         app: &Arc<App>,
@@ -92,84 +88,21 @@ impl Site {
         name: &str,
     ) -> Result<String, Failure> {
         let key = format!("{}{name}", self.config.aliases);
-        let path = ObjectPath::from(key.as_str());
-        // The alias may change between reading its metadata and its body, once.
-        for _ in 0..2 {
-            let meta = match app.cache.metadata(backend, store.clone(), &path).await {
-                Ok((meta, _)) => meta,
-                // r[impl site.alias-missing]
-                Err(ReadError::NotFound) => return Err(Failure::NotFound),
-                Err(ReadError::Backend(error) | ReadError::Changed(error)) => {
-                    tracing::warn!(backend, alias = name, "alias metadata: {error:#}");
-                    return Err(Failure::BadGateway);
-                }
-            };
-            // r[impl site.alias-cached]
-            if let Some(etag) = &meta.etag
-                && let Some((cached_etag, sha)) = self.shas.lock().expect("not poisoned").get(&key)
-                && cached_etag == etag
-            {
-                return Ok(sha.clone());
-            }
-            match self.read(app, backend, store, &path, &meta).await {
-                Ok(sha) => {
-                    if let Some(etag) = meta.etag {
-                        let mut shas = self.shas.lock().expect("not poisoned");
-                        if shas.len() >= MAX_CACHED_ALIASES && !shas.contains_key(&key) {
-                            shas.clear();
-                        }
-                        shas.insert(key, (etag, sha.clone()));
-                    }
-                    return Ok(sha);
-                }
-                Err(Read::Changed) => continue,
-                Err(Read::Failed(response)) => return Err(response),
-            }
-        }
-        tracing::warn!(backend, alias = name, "the alias keeps changing");
-        Err(Failure::BadGateway)
-    }
-
-    // r[impl site.alias-invalid]
-    /// Reads the SHA in the body of the alias at `path`.
-    async fn read(
-        &self,
-        app: &Arc<App>,
-        backend: &str,
-        store: &Arc<dyn object_store::ObjectStore>,
-        path: &ObjectPath,
-        meta: &ObjectMeta,
-    ) -> Result<String, Read> {
-        let invalid = |reason: &str| {
-            tracing::warn!(backend, alias = %path, "invalid alias: {reason}");
-            Read::Failed(Failure::BadGateway)
+        // r[impl site.alias-cached]
+        let known = |etag: &str| {
+            let shas = self.shas.lock().expect("not poisoned");
+            let (cached_etag, sha) = shas.get(&key)?;
+            (cached_etag == etag).then(|| sha.clone())
         };
-        if meta.size > MAX_ALIAS_BYTES {
-            return Err(invalid("it's larger than 1 KiB"));
-        }
-        let mut body = Vec::new();
-        for index in 0..app.cache.chunk_count(meta.size) {
-            match app
-                .cache
-                .chunk(backend, store.clone(), path, meta, index)
-                .await
-            {
-                Ok(bytes) => body.extend_from_slice(&bytes),
-                Err(ReadError::Changed(_)) => return Err(Read::Changed),
-                Err(ReadError::NotFound) => return Err(Read::Changed),
-                Err(ReadError::Backend(error)) => {
-                    tracing::warn!(backend, alias = %path, "alias body: {error:#}");
-                    return Err(Read::Failed(Failure::BadGateway));
-                }
+        let (sha, etag) = read_alias(&app.cache, backend, store, &key, known).await?;
+        if let Some(etag) = etag {
+            let mut shas = self.shas.lock().expect("not poisoned");
+            if shas.len() >= MAX_CACHED_ALIASES && !shas.contains_key(&key) {
+                shas.clear();
             }
+            shas.insert(key, (etag, sha.clone()));
         }
-        let sha = std::str::from_utf8(&body)
-            .map(str::trim)
-            .map_err(|_| invalid("it isn't UTF-8"))?;
-        if !hylla_config::is_sha(sha) {
-            return Err(invalid("its body isn't a SHA"));
-        }
-        Ok(sha.to_string())
+        Ok(sha)
     }
 
     // r[impl site.keys]
@@ -190,6 +123,80 @@ impl Site {
         let fallback = self.config.fallback.as_deref()?;
         Some(format!("{}{sha}/{fallback}", self.config.builds))
     }
+}
+
+// r[impl site.alias-object]
+// r[impl site.alias-stale]
+/// The SHA the alias at backend key `key` points at, with the ETag it was read at, read
+/// through the cache, so it's checked against its ETag after the metadata TTL, served stale
+/// through outages, and forgotten when changed through a control plane. `known` gives the
+/// SHA already read for an ETag, so the body isn't read again.
+pub(crate) async fn read_alias(
+    cache: &Arc<ObjectCache>,
+    backend: &str,
+    store: &Arc<dyn object_store::ObjectStore>,
+    key: &str,
+    known: impl Fn(&str) -> Option<String>,
+) -> Result<(String, Option<String>), Failure> {
+    let path = ObjectPath::from(key);
+    // The alias may change between reading its metadata and its body, once.
+    for _ in 0..2 {
+        let meta = match cache.metadata(backend, store.clone(), &path).await {
+            Ok((meta, _)) => meta,
+            // r[impl site.alias-missing]
+            Err(ReadError::NotFound) => return Err(Failure::NotFound),
+            Err(ReadError::Backend(error) | ReadError::Changed(error)) => {
+                tracing::warn!(backend, alias = key, "alias metadata: {error:#}");
+                return Err(Failure::BadGateway);
+            }
+        };
+        if let Some(sha) = meta.etag.as_deref().and_then(&known) {
+            return Ok((sha, meta.etag));
+        }
+        match read_body(cache, backend, store, &path, &meta).await {
+            Ok(sha) => return Ok((sha, meta.etag)),
+            Err(Read::Changed) => continue,
+            Err(Read::Failed(failure)) => return Err(failure),
+        }
+    }
+    tracing::warn!(backend, alias = key, "the alias keeps changing");
+    Err(Failure::BadGateway)
+}
+
+// r[impl site.alias-invalid]
+/// Reads the SHA in the body of the alias at `path`.
+async fn read_body(
+    cache: &ObjectCache,
+    backend: &str,
+    store: &Arc<dyn object_store::ObjectStore>,
+    path: &ObjectPath,
+    meta: &ObjectMeta,
+) -> Result<String, Read> {
+    let invalid = |reason: &str| {
+        tracing::warn!(backend, alias = %path, "invalid alias: {reason}");
+        Read::Failed(Failure::BadGateway)
+    };
+    if meta.size > MAX_ALIAS_BYTES {
+        return Err(invalid("it's larger than 1 KiB"));
+    }
+    let mut body = Vec::new();
+    for index in 0..cache.chunk_count(meta.size) {
+        match cache.chunk(backend, store.clone(), path, meta, index).await {
+            Ok(bytes) => body.extend_from_slice(&bytes),
+            Err(ReadError::Changed(_) | ReadError::NotFound) => return Err(Read::Changed),
+            Err(ReadError::Backend(error)) => {
+                tracing::warn!(backend, alias = %path, "alias body: {error:#}");
+                return Err(Read::Failed(Failure::BadGateway));
+            }
+        }
+    }
+    let sha = std::str::from_utf8(&body)
+        .map(str::trim)
+        .map_err(|_| invalid("it isn't UTF-8"))?;
+    if !hylla_config::is_sha(sha) {
+        return Err(invalid("its body isn't a SHA"));
+    }
+    Ok(sha.to_string())
 }
 
 /// Why a request's build couldn't be chosen.

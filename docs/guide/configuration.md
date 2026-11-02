@@ -126,6 +126,31 @@ writable or listed.
 | `redirect` | `true` | Whether aliases in the host redirect to the build's SHA host |
 | `alias_cache_control` | `no-cache` | The `Cache-Control` of responses served through an alias without redirecting, replacing the object's own |
 
+With `auth`, a token must be allowed the key of what it's served, such as
+`/builds/${build}`. A redirect needs both the alias, such as `/aliases/${alias}`, and the
+build it points at, so tokens can't learn where aliases point without being let into the
+build.
+
+To warm a build before anyone asks for it, as when `live` moves, give the backend a refresh
+rule following the alias. It reads the alias on every run and preloads the build it points
+at, listing it once per run when nothing changed:
+
+```styx
+refresh {rules ({alias {name live}, every 30s, mode preload, max_mib 512})}
+```
+
+A page loaded before `live` moves can still ask for an asset of its own build, which the
+new one doesn't have. If asset names carry a hash of their content, as most bundlers' do,
+upload every build's assets to one shared prefix and serve it with a mapping ahead of the
+site's, so only pages are per build:
+
+```styx
+mappings (
+  {path_prefix /assets, backend frontend, cache_control "public, max-age=31536000, immutable"}
+  {path_prefix /, backend frontend, site {alias live, fallback index.html}}
+)
+```
+
 SHAs are 40 or 64 lowercase hexadecimal characters. Alias names are 1 to 63 lowercase
 letters, digits and `-`, so each can be a host label. Upload builds with a long
 `Cache-Control`, such as `public, max-age=31536000, immutable`: SHA hosts serve it as is.
@@ -232,7 +257,7 @@ Each rule:
 
 | Setting | Default | |
 |---|---|---|
-| `prefix` or `key` | one required | A directory-like key prefix such as `css/` (`""` for everything), or a single key |
+| `prefix`, `key` or `alias` | one required | A directory-like key prefix such as `css/` (`""` for everything), a single key, or the build an alias points at, such as `{name live}`, read again on every run. An `alias` can set the `builds` and `aliases` prefixes too, as a [site](#sites)'s |
 | `every` | required | How often, such as `15m`. The first run is at startup |
 | `mode` | `revalidate` | `revalidate` checks cached objects, `preload` fetches objects that aren't cached, `both` does both, and `disabled` nothing |
 | `max_objects`, `max_mib` | none | Caps on what one run preloads; preloading needs at least one |

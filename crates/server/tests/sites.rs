@@ -6,7 +6,8 @@ use axum::body::{Body, to_bytes};
 use common::Flaky;
 use http::{Request, StatusCode, header};
 use hylla_config::{
-    Backend, Cache, Config, Control, ControlUser, Interval, Mapping, Server, Site, ValidationError,
+    Backend, Cache, Config, Control, ControlUser, Interval, JwtAlgorithm, Mapping, MappingAuth,
+    Refresh, RefreshAlias, RefreshMode, RefreshRule, Server, Site, ValidationError, Verifier,
 };
 use hylla_server::App;
 use object_store::{
@@ -156,6 +157,11 @@ async fn put(store: &InMemory, key: &str, body: &str, content_type: &str) {
 }
 
 async fn app(metadata_ttl: u64) -> (Arc<App>, Arc<InMemory>, Arc<Flaky>) {
+    app_with(config(metadata_ttl)).await
+}
+
+/// An app with `config`, in front of the builds and aliases of the tests.
+async fn app_with(config: Config) -> (Arc<App>, Arc<InMemory>, Arc<Flaky>) {
     let memory = Arc::new(InMemory::new());
     for (sha, page) in [(PR, "pr"), (LIVE, "live")] {
         put(
@@ -190,7 +196,6 @@ async fn app(metadata_ttl: u64) -> (Arc<App>, Arc<InMemory>, Arc<Flaky>) {
         put(&memory, &format!("aliases/{alias}"), &body, "text/plain").await;
     }
     let flaky = Flaky::new(memory.clone());
-    let config = config(metadata_ttl);
     config.validate().unwrap();
     let stores = HashMap::from([(
         "frontend".to_string(),
@@ -597,4 +602,162 @@ fn wildcards_are_validated() {
         errors.iter().any(|error| error.contains("all answer to")),
         "{errors:?}"
     );
+}
+
+fn token(claims: serde_json::Value) -> String {
+    let mut claims = claims;
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    claims["exp"] = serde_json::json!(expires);
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_ec_pem(include_bytes!("keys/es256-private.pem")).unwrap(),
+    )
+    .unwrap()
+}
+
+// r[verify site.auth]
+#[tokio::test]
+async fn redirects_need_tokens_for_the_alias_and_the_build() {
+    let mut config = config(60);
+    config.auth = HashMap::from([(
+        "previews".to_string(),
+        Verifier {
+            algorithm: JwtAlgorithm::Es256,
+            public_key: Some(include_str!("keys/es256-public.pem").into()),
+            jwks_uri: None,
+            issuer: None,
+            audience: None,
+            leeway: Interval::from_secs(30),
+        },
+    )]);
+    let previews = config.servers.get_mut("previews").unwrap();
+    previews.mappings[0].auth = Some(MappingAuth {
+        verifier: "previews".into(),
+        paths: vec!["/aliases/${alias}".into(), "/builds/${build}".into()],
+        private: true,
+    });
+    let (app, _, _) = app_with(config).await;
+    let bearer = |claims| format!("Bearer {}", token(claims));
+    let both = bearer(serde_json::json!({"alias": "pr1873", "build": PR}));
+    let alias_only = bearer(serde_json::json!({"alias": "pr1873", "build": LIVE}));
+    let build_only = bearer(serde_json::json!({"alias": "live", "build": PR}));
+
+    let redirect = |token: String| {
+        let app = app.clone();
+        async move { get(&app, &preview("pr1873"), "/", &[("authorization", &token)]).await }
+    };
+    assert_eq!(redirect(both).await.status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(redirect(alias_only).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        redirect(build_only.clone()).await.status,
+        StatusCode::FORBIDDEN
+    );
+    let unauthenticated = get(&app, &preview("pr1873"), "/", &[]).await;
+    assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
+
+    // The build's own host only needs the build.
+    let page = get(&app, &preview(PR), "/", &[("authorization", &build_only)]).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert_eq!(
+        page.header(header::CACHE_CONTROL),
+        "private, max-age=31536000, immutable"
+    );
+    let other = get(&app, &preview(LIVE), "/", &[("authorization", &build_only)]).await;
+    assert_eq!(other.status, StatusCode::FORBIDDEN);
+}
+
+/// A config whose backend preloads the build `live` points at.
+fn following(alias: &str) -> Config {
+    let mut config = config(0);
+    let Backend::S3 { refresh, .. } = config.backends.get_mut("frontend").unwrap() else {
+        unreachable!()
+    };
+    *refresh = Some(Refresh {
+        concurrency: 4,
+        rules: vec![RefreshRule {
+            prefix: None,
+            key: None,
+            alias: Some(RefreshAlias {
+                name: alias.into(),
+                builds: "builds/".into(),
+                aliases: "aliases/".into(),
+            }),
+            every: Interval::from_secs(60),
+            mode: RefreshMode::Preload,
+            max_objects: Some(100),
+            max_mib: None,
+        }],
+    });
+    config
+}
+
+// r[verify refresh.alias]
+// r[verify config.refresh.alias]
+#[tokio::test]
+async fn refresh_rules_preload_the_build_an_alias_points_at() {
+    let (app, memory, flaky) = app_with(following("live")).await;
+    let report = app.refresh("frontend", 0).await.unwrap();
+    assert_eq!((report.listed, report.preloaded), (2, 2), "{report:?}");
+    let before = flaky.requests();
+    let page = get(&app, "www.example.com", "/assets/app.js", &[]).await;
+    assert_eq!(page.body, "live.js");
+    // Only the alias's and the script's metadata are checked: nothing is fetched.
+    assert!(flaky.requests() - before <= 2);
+
+    // Moving the alias preloads the other build on the next run.
+    put(&memory, "aliases/live", PR, "text/plain").await;
+    let report = app.refresh("frontend", 0).await.unwrap();
+    assert_eq!((report.listed, report.preloaded), (2, 2), "{report:?}");
+    let report = app.refresh("frontend", 0).await.unwrap();
+    assert_eq!((report.listed, report.preloaded), (2, 0), "{report:?}");
+}
+
+// r[verify refresh.alias.invalid]
+#[tokio::test]
+async fn refresh_rules_fail_without_a_valid_alias() {
+    for alias in ["missing", "broken"] {
+        let (app, _, _) = app_with(following(alias)).await;
+        let error = app.refresh("frontend", 0).await.unwrap_err();
+        assert!(error.to_string().contains(alias), "{error:#}");
+    }
+}
+
+// r[verify config.validate.refresh-alias]
+#[test]
+fn alias_refresh_rules_are_validated() {
+    let with = |change: fn(&mut RefreshRule)| {
+        let mut config = following("live");
+        let Backend::S3 { refresh, .. } = config.backends.get_mut("frontend").unwrap() else {
+            unreachable!()
+        };
+        change(&mut refresh.as_mut().unwrap().rules[0]);
+        invalid(&config)
+    };
+    assert!(with(|_| {}).is_empty());
+    for (change, expected) in [
+        (
+            (|rule: &mut RefreshRule| rule.alias.as_mut().unwrap().name = "Live".into())
+                as fn(&mut RefreshRule),
+            "isn't an alias name",
+        ),
+        (
+            |rule| rule.alias.as_mut().unwrap().builds = "aliases/".into(),
+            "can't overlap",
+        ),
+        (
+            |rule| rule.prefix = Some("builds/".into()),
+            "exactly one of `prefix`, `key` and `alias`",
+        ),
+    ] {
+        let errors = with(change);
+        assert!(
+            errors.iter().any(|error| error.contains(expected)),
+            "{expected}: {errors:?}"
+        );
+    }
 }

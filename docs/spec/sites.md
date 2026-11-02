@@ -159,26 +159,76 @@ Conditional and range requests MUST be answered as for any other object, by the 
 object served, so an unchanged file is answered with 304 also after an alias moves to
 another build.
 
+r[site.auth]
+On a site mapping with `auth`, a request MUST only be served an object, or the fallback in
+its place, whose backend key its token may read. A redirect MUST only be answered when its
+token may read both the alias and the key the request would be served on the build's host,
+so a token can't learn where an alias points without being allowed into the build either.
+Other requests MUST be refused as for any mapping with `auth`.
+
 r[site.browse]
 The control plane MUST refuse to list a site mapping with 409, as for mappings with
 rewrites. Builds and aliases MUST be written through a writable mapping without a site
 covering the same backend keys, whose changes are forgotten on every node by
 `cluster.share-forgets`.
 
+## Preloading builds
+
+Preloading is opt in: a backend's refresh rule can follow an alias, warming the build it
+points at before anyone asks for it.
+
+```styx
+backends {
+  frontend {
+    type s3
+    bucket frontend
+    region eu-north-1
+    refresh {
+      rules ({alias {name live}, every 30s, mode preload, max_mib 512})
+    }
+  }
+}
+```
+
+r[config.refresh.alias]
+A refresh rule's `alias` MUST name the alias it follows, with `name`, and the `builds` and
+`aliases` prefixes it's read with, defaulting to `builds/` and `aliases/` as a site's do.
+
+r[config.validate.refresh-alias]
+A refresh rule whose `alias` has an invalid name, or prefixes that would be invalid for a
+site, MUST be reported as invalid.
+
+r[refresh.alias]
+Each run of a rule following an alias MUST read the alias as a site does, through the
+cache, then cover the objects under the prefix of the build it points at as a prefix rule
+does, so moving an alias preloads its build on the rule's next run, and an unchanged build
+costs one listing.
+
+r[refresh.alias.invalid]
+A run whose alias is missing, or isn't a SHA, MUST fail, covering nothing.
+
+## Assets across builds
+
+A page loaded before `live` moves can still ask for an asset of the build it came from,
+which the new build doesn't have. Sites don't need to do anything about it: builds whose
+asset names carry a hash of their content can upload their assets to one prefix shared by
+every build, served by a mapping without a site ahead of the site's, so only each build's
+pages are per build.
+
+```styx
+mappings (
+  {path_prefix /assets, backend frontend, cache_control "public, max-age=31536000, immutable"}
+  {path_prefix /, backend frontend, site {alias live, fallback index.html}}
+)
+```
+
 ## Open questions
 
 These aren't requirements yet.
 
-- **Moving the live site mid-session.** `www.example.com` can't redirect to a SHA host
-  without the address bar showing it, so a page loaded before `live` moves can ask for an
-  asset the new build doesn't have. A site could serve missing paths from the build an alias
-  pointed at before, kept for a while, or CI could upload each build's assets to a shared
-  prefix too.
 - **Origins per build.** Each SHA host is its own origin, so `localStorage`, cookies set
   without a `Domain` and service workers don't carry over from one preview build to the
   next, and an OpenID provider needs a wildcard redirect URI to sign in on previews.
-- **Preloading.** A refresh rule covers fixed keys, so it can't follow `live` to warm the
-  build it points at. A rule could take an alias and preload its build when it moves.
 - **Indexing.** Preview hosts could be answered with `X-Robots-Tag: noindex`.
 - **Short SHAs.** Only full SHAs are accepted, since a backend can't look up a key by a
   prefix of it cheaply. CI can write an alias per short SHA if links need them.

@@ -468,7 +468,7 @@ backends {
 "#;
 
 // r[verify config.refresh]
-// r[verify config.refresh.rules]
+// r[verify config.refresh.rules+2]
 // r[verify config.refresh.modes]
 // r[verify config.durations]
 #[test]
@@ -491,6 +491,7 @@ fn backends_configure_refresh_rules() {
             RefreshRule {
                 prefix: Some("css/".into()),
                 key: None,
+                alias: None,
                 every: minutes(15),
                 mode: RefreshMode::Revalidate,
                 max_objects: None,
@@ -499,6 +500,7 @@ fn backends_configure_refresh_rules() {
             RefreshRule {
                 prefix: None,
                 key: Some("index.html".into()),
+                alias: None,
                 every: minutes(90),
                 mode: RefreshMode::Both,
                 max_objects: Some(1),
@@ -507,6 +509,7 @@ fn backends_configure_refresh_rules() {
             RefreshRule {
                 prefix: Some(String::new()),
                 key: None,
+                alias: None,
                 every: minutes(24 * 60),
                 mode: RefreshMode::Disabled,
                 max_objects: None,
@@ -530,7 +533,7 @@ fn backends_configure_refresh_rules() {
     assert_eq!(violations.decode_errors().len(), 1);
 }
 
-// r[verify config.validate.refresh]
+// r[verify config.validate.refresh+2]
 #[test]
 fn refresh_rules_are_validated() {
     let config = "
@@ -564,7 +567,7 @@ backends {
         errors,
         vec![
             "refresh of backend `assets` is invalid: `concurrency` must be positive",
-            "refresh rule 0 of backend `assets` is invalid: set exactly one of `prefix` and `key`",
+            "refresh rule 0 of backend `assets` is invalid: set exactly one of `prefix`, `key` and `alias`",
             "refresh rule 1 of backend `assets` is invalid: keys and prefixes are backend keys, \
              which don't start with `/`",
             "refresh rule 1 of backend `assets` is invalid: `every` must be positive",
@@ -1650,6 +1653,7 @@ http {
 // r[verify config.site.index]
 // r[verify config.site.redirect]
 // r[verify config.site.alias-cache-control]
+// r[verify config.refresh.alias]
 #[test]
 fn sites_have_defaults() {
     let config = "servers {
@@ -1664,7 +1668,14 @@ fn sites_have_defaults() {
     mappings ({path_prefix /, backend assets, site {alias live, builds web/, fallback index.html}})
   }
 }
-backends {assets {type s3, bucket assets, region eu-north-1}}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+    refresh {rules ({alias {name live}, every 30s, mode preload, max_mib 64})}
+  }
+}
 ";
     let files = Files::new("sites", config, MINIMAL_SECRETS);
     let config = files.load(&[]).unwrap().into_config();
@@ -1680,4 +1691,14 @@ backends {assets {type s3, bucket assets, region eu-north-1}}
     assert_eq!(live.alias.as_deref(), Some("live"));
     assert_eq!(live.builds, "web/");
     assert_eq!(live.fallback.as_deref(), Some("index.html"));
+    let rule = &config.backends["assets"].refresh().unwrap().rules[0];
+    let alias = rule.alias.as_ref().unwrap();
+    assert_eq!(
+        (
+            alias.name.as_str(),
+            alias.builds.as_str(),
+            alias.aliases.as_str()
+        ),
+        ("live", "builds/", "aliases/")
+    );
 }

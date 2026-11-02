@@ -145,6 +145,7 @@ fn config(cluster: Option<Cluster>) -> Config {
                     rules: vec![RefreshRule {
                         prefix: Some(String::new()),
                         key: None,
+                        alias: None,
                         every: Interval::from_secs(3600),
                         mode: RefreshMode::Both,
                         max_objects: Some(10),

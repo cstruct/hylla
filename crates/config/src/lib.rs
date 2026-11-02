@@ -748,7 +748,7 @@ pub struct Refresh {
     pub rules: Vec<RefreshRule>,
 }
 
-// r[impl config.refresh.rules]
+// r[impl config.refresh.rules+2]
 /// Refreshes the objects under a key prefix, or a single key, of a backend.
 #[config]
 #[derive(Debug, Clone, PartialEq)]
@@ -758,6 +758,8 @@ pub struct RefreshRule {
     pub prefix: Option<String>,
     /// A single backend key, such as `css/app.css`.
     pub key: Option<String>,
+    /// The build an alias points at, read again on every run, such as the live site's.
+    pub alias: Option<RefreshAlias>,
     /// How often to refresh, such as `15m`. The first refresh runs at startup.
     pub every: Interval,
     #[facet(default)]
@@ -766,6 +768,21 @@ pub struct RefreshRule {
     pub max_objects: Option<u64>,
     /// The most data one preload fetches, in MiB.
     pub max_mib: Option<u64>,
+}
+
+// r[impl config.refresh.alias]
+/// The alias a refresh rule follows, covering the build it points at.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshAlias {
+    /// The alias, such as `live`.
+    pub name: String,
+    /// The backend key prefix builds are stored under, as the site's `builds`.
+    #[facet(default = String::from("builds/"))]
+    pub builds: String,
+    /// The backend key prefix aliases are stored under, as the site's `aliases`.
+    #[facet(default = String::from("aliases/"))]
+    pub aliases: String,
 }
 
 // r[impl config.refresh.modes]

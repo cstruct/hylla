@@ -516,6 +516,7 @@ fn rule(prefix: Option<&str>, key: Option<&str>, mode: RefreshMode) -> RefreshRu
     RefreshRule {
         prefix: prefix.map(Into::into),
         key: key.map(Into::into),
+        alias: None,
         every: Interval::from_secs(3600),
         mode,
         max_objects: None,

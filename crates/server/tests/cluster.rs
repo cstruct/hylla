@@ -133,6 +133,7 @@ async fn node_with(
                     rules: vec![RefreshRule {
                         prefix: Some(String::new()),
                         key: None,
+                        alias: None,
                         every: Interval::from_secs(3600),
                         mode: RefreshMode::Preload,
                         max_objects: Some(10),

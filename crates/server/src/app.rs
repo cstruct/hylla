@@ -738,15 +738,20 @@ async fn serve_site(
         Err(failure) => return failure.into_response(),
     };
     let headers = request.headers;
+    // r[impl site.auth]
+    let key = site.key(&build.sha, request.document);
     // r[impl site.redirect.missing-build]
     // Redirected without checking the build exists: its host answers 404 if it doesn't.
     if let Some(alias) = &build.alias
         && build.from_host
         && site.config().redirect
     {
+        // Only to tokens allowed into the build too, so they can't learn where aliases point.
         let alias_key = format!("{}{alias}", site.config().aliases);
-        if let Some(refused) = check_auth(request.auth, headers, &alias_key).await {
-            return refused;
+        for key in [&alias_key, &key] {
+            if let Some(refused) = check_auth(request.auth, headers, key).await {
+                return refused;
+            }
         }
         let path_and_query = request
             .uri
@@ -754,7 +759,6 @@ async fn serve_site(
             .map_or("/", |path| path.as_str());
         return site::redirect(request.host, path_and_query, &build.sha);
     }
-    let key = site.key(&build.sha, request.document);
     if let Some(refused) = check_auth(request.auth, headers, &key).await {
         return refused;
     }
