@@ -30,6 +30,7 @@
 
 mod interval;
 mod load;
+mod pattern;
 mod router;
 mod show;
 mod site;
@@ -45,6 +46,7 @@ pub use load::{
     ConfigError, ConfigFiles, ENV_PREFIX, Inspected, Loaded, Origin, SourceError, inspect,
     inspect_with_env, load, load_with_env,
 };
+pub use pattern::{InvalidPattern, PathPattern};
 pub use router::{Route, Router};
 pub use show::{ExplainError, explain, render};
 pub use site::{is_alias_name, is_sha, wildcard_suffix};
@@ -100,6 +102,33 @@ config_tree! {
                     /// valid token may read anything the mapping serves.
                     #[facet(default)]
                     pub paths: Vec<String>,
+                    /// Whether responses are marked `Cache-Control: private`, so shared
+                    /// caches in front of hylla don't serve them to others.
+                    #[facet(default = true)]
+                    pub private: bool,
+                }>,
+                // r[impl config.konklav.mappings]
+                /// Leaves authorization to Konklav: requests must carry an access token
+                /// holding the actions of the first rule matching their path. Requests no
+                /// rule matches are refused.
+                pub konklav: Option<pub struct MappingKonklav {
+                    /// The rules, in order: the first whose path matches decides.
+                    pub rules: Vec<pub struct KonklavRule {
+                        /// The request path pattern, such as `/object/{object_id}/*`:
+                        /// `{name}` captures one segment, and a final `*` matches the rest.
+                        pub path: String,
+                        /// The actions required, such as `object:read`.
+                        pub actions: Vec<String>,
+                        /// The scope the actions are required at. Without it, they're
+                        /// required tenant-wide.
+                        pub scope: Option<pub struct KonklavScope {
+                            /// The scope kind, such as `object`.
+                            pub kind: String,
+                            /// The name of the capture that is the scope's id, such as
+                            /// `object_id`.
+                            pub id: String,
+                        }>,
+                    }>,
                     /// Whether responses are marked `Cache-Control: private`, so shared
                     /// caches in front of hylla don't serve them to others.
                     #[facet(default = true)]
@@ -414,6 +443,27 @@ config_tree! {
             #[facet(default = Interval::from_secs(20))]
             pub shutdown_timeout: Interval,
         },
+        // r[impl config.konklav.provider]
+        /// Konklav, deciding requests for mappings with `konklav`. Optional.
+        pub konklav: Option<pub struct Konklav {
+            /// The URL of Konklav's relying surface, such as `https://konklav:8081`.
+            pub relying_url: String,
+            /// The URL of Konklav's subject-facing surface, where hylla logs in, such as
+            /// `https://konklav:8080`.
+            pub subject_url: String,
+            /// The id of hylla's service principal's secret key credential.
+            pub key_id: String,
+            /// The secret of that credential.
+            #[config(secret)]
+            pub secret: String,
+            /// The `iss` access tokens must have.
+            pub issuer: String,
+            /// The `aud` access tokens must have.
+            pub audience: String,
+            /// How long a decision may take before the request is refused, such as `5s`.
+            #[facet(default = Interval::from_secs(5))]
+            pub timeout: Interval,
+        }>,
         // r[impl config.auth.verifiers]
         /// JWT verifiers by name, used by mappings' `auth`.
         #[facet(default)]

@@ -30,6 +30,7 @@ fn mapping(path_prefix: &str, writable: bool) -> Mapping {
         writable,
         cache_control: None,
         auth: None,
+        konklav: None,
         site: None,
     }
 }
@@ -84,6 +85,7 @@ async fn node(backend: &str) -> (Arc<App>, Arc<InMemory>) {
         )]),
         cache: Default::default(),
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         cluster: None,
         control: Some(Control {
@@ -508,6 +510,7 @@ fn writable_mappings_and_the_control_plane_are_validated() {
                     writable: true,
                     cache_control: None,
                     auth: None,
+                    konklav: None,
                     site: None,
                 }],
             },
@@ -528,6 +531,7 @@ fn writable_mappings_and_the_control_plane_are_validated() {
         )]),
         cache: Default::default(),
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         cluster: None,
         control: Some(Control {

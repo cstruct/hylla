@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use hylla_config::{
-    Backend, ConfigError, ConfigFiles, DiskCache, Interval, JwtAlgorithm, Mapping, MappingAuth,
-    Origin, OtlpProtocol, RefreshMode, RefreshRule, Rewrite, Route, Router, ValidationError,
-    WritePolicy, load_with_env,
+    Backend, ConfigError, ConfigFiles, DiskCache, Interval, JwtAlgorithm, KonklavRule,
+    KonklavScope, Mapping, MappingAuth, MappingKonklav, Origin, OtlpProtocol, RefreshMode,
+    RefreshRule, Rewrite, Route, Router, ValidationError, WritePolicy, load_with_env,
 };
 use ordna_core::{ConfigLoadError, ConfigPath, ConfigValueSource};
 use ordna_source_env::EnvSource;
@@ -169,6 +169,7 @@ fn loads_servers_and_backends() {
                 writable: false,
                 cache_control: None,
                 auth: None,
+                konklav: None,
                 site: None,
             },
             Mapping {
@@ -178,6 +179,7 @@ fn loads_servers_and_backends() {
                 writable: false,
                 cache_control: None,
                 auth: None,
+                konklav: None,
                 site: None,
             },
         ]
@@ -1646,6 +1648,164 @@ http {
             "invalid health config: `listen` is 0.0.0.0:8080, which server `public` listens on too",
         )
     }));
+}
+
+const KONKLAV: &str = r#"
+servers {
+  public {
+    listen 0.0.0.0:8080
+    server_names (files.example.com)
+    mappings (
+      {
+        path_prefix /object
+        backend assets
+        konklav {
+          rules (
+            {
+              path "/object/{object_id}/*"
+              actions (object:read)
+              scope {kind object, id object_id}
+            }
+          )
+        }
+      }
+      {
+        path_prefix /reports
+        backend assets
+        konklav {
+          rules ({path /reports/*, actions (report:read report:list)})
+          private false
+        }
+      }
+      {path_prefix /, backend assets}
+    )
+  }
+}
+backends {
+  assets {
+    type s3
+    bucket assets
+    region eu-north-1
+  }
+}
+konklav {
+  relying_url https://konklav.internal:8081
+  subject_url https://konklav.internal:8080
+  key_id 0193a2f0-0000-7000-8000-0000000000aa
+  issuer https://id.example.com
+  audience files.example.com
+}
+"#;
+
+const KONKLAV_SECRETS: &str =
+    "backends {assets {access_key_id a, secret_access_key b}}\nkonklav {secret s3cr3t}\n";
+
+// r[verify config.konklav.provider]
+// r[verify config.konklav.mappings]
+#[test]
+fn mappings_configure_konklav() {
+    let files = Files::new("konklav", KONKLAV, KONKLAV_SECRETS);
+    let config = files.load(&[]).unwrap().into_config();
+
+    let konklav = config.konklav.as_ref().unwrap();
+    assert_eq!(konklav.relying_url, "https://konklav.internal:8081");
+    assert_eq!(konklav.subject_url, "https://konklav.internal:8080");
+    assert_eq!(konklav.key_id, "0193a2f0-0000-7000-8000-0000000000aa");
+    assert_eq!(konklav.secret, "s3cr3t");
+    assert_eq!(konklav.issuer, "https://id.example.com");
+    assert_eq!(konklav.audience, "files.example.com");
+    assert_eq!(konklav.timeout, Interval::from_secs(5));
+
+    let mappings = &config.servers["public"].mappings;
+    assert_eq!(
+        mappings[0].konklav,
+        Some(MappingKonklav {
+            rules: vec![KonklavRule {
+                path: "/object/{object_id}/*".into(),
+                actions: vec!["object:read".into()],
+                scope: Some(KonklavScope {
+                    kind: "object".into(),
+                    id: "object_id".into(),
+                }),
+            }],
+            private: true,
+        })
+    );
+    assert_eq!(
+        mappings[1].konklav,
+        Some(MappingKonklav {
+            rules: vec![KonklavRule {
+                path: "/reports/*".into(),
+                actions: vec!["report:read".into(), "report:list".into()],
+                scope: None,
+            }],
+            private: false,
+        })
+    );
+    assert_eq!(mappings[2].konklav, None);
+
+    // The secret is secret.
+    let files = Files::new(
+        "konklav-secret",
+        &KONKLAV.replace("  audience files", "  secret s3cr3t\n  audience files"),
+        "backends {assets {access_key_id a, secret_access_key b}}",
+    );
+    assert!(files.load(&[]).is_err());
+}
+
+// r[verify config.validate.konklav]
+#[test]
+fn konklav_is_validated() {
+    let config = KONKLAV
+        .replace(
+            "relying_url https://konklav.internal:8081",
+            "relying_url http://konklav.internal:8081",
+        )
+        .replace("audience files.example.com", "audience \"\"\n  timeout 0s")
+        .replace(
+            "scope {kind object, id object_id}",
+            "scope {kind \"\", id object}",
+        )
+        .replace("actions (object:read)", "actions ()")
+        .replace("path /reports/*", "path /report/*");
+    let files = Files::new("konklav-invalid", &config, KONKLAV_SECRETS);
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(errors.len(), 7, "{errors:#?}");
+    assert!(errors[0].contains("mapping 0") && errors[0].contains("rule 0: `actions`"));
+    assert!(errors[1].contains("mapping 0") && errors[1].contains("`kind` must not be empty"));
+    assert!(errors[2].contains("mapping 0") && errors[2].contains("doesn't capture"));
+    assert!(errors[3].contains("mapping 1") && errors[3].contains("can't match paths under"));
+    assert!(errors[4].contains("`relying_url`"));
+    assert!(errors[5].contains("`audience` must not be empty"));
+    assert!(errors[6].contains("`timeout` must be positive"));
+
+    // Mappings need the provider, rules and patterns that parse.
+    let config = KONKLAV
+        .split("konklav {\n  relying_url")
+        .next()
+        .unwrap()
+        .replace(r#""/object/{object_id}/*""#, r#""/object/{object_id}/*/x""#)
+        .replace(
+            "rules ({path /reports/*, actions (report:read report:list)})",
+            "rules ()",
+        );
+    let files = Files::new(
+        "konklav-unconfigured",
+        &config,
+        "backends {assets {access_key_id a, secret_access_key b}}",
+    );
+    let Err(ConfigError::Invalid(errors)) = files.load(&[]) else {
+        panic!("expected validation errors");
+    };
+    let errors = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(errors.len(), 4, "{errors:#?}");
+    assert!(errors[0].contains("mapping 0") && errors[0].contains("no top-level `konklav`"));
+    assert!(errors[1].contains("mapping 0") && errors[1].contains("isn't its last segment"));
+    assert!(errors[2].contains("mapping 1") && errors[2].contains("no top-level `konklav`"));
+    assert!(errors[3].contains("mapping 1") && errors[3].contains("no rules"));
 }
 
 // r[verify config.site]

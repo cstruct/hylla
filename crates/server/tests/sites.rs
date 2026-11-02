@@ -47,6 +47,7 @@ fn mapping(site: Option<Site>, writable: bool) -> Mapping {
         cache_control: None,
         writable,
         auth: None,
+        konklav: None,
         site,
     }
 }
@@ -104,6 +105,7 @@ fn config(metadata_ttl: u64) -> Config {
             ..Cache::default()
         },
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         control: Some(Control {
             listen: "127.0.0.1:9090".parse().unwrap(),

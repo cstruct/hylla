@@ -48,6 +48,14 @@ pub enum ValidationError {
         mapping: usize,
         reason: String,
     },
+    /// A mapping's `konklav` has no provider to decide it, or invalid rules.
+    InvalidMappingKonklav {
+        server: String,
+        mapping: usize,
+        reason: String,
+    },
+    /// The Konklav provider's settings are invalid.
+    InvalidKonklav { reason: String },
     /// A backend's refresh settings are invalid.
     InvalidRefresh {
         backend: String,
@@ -168,6 +176,15 @@ impl fmt::Display for ValidationError {
                 f,
                 "auth of mapping {mapping} of server `{server}` is invalid: {reason}"
             ),
+            Self::InvalidMappingKonklav {
+                server,
+                mapping,
+                reason,
+            } => write!(
+                f,
+                "konklav of mapping {mapping} of server `{server}` is invalid: {reason}"
+            ),
+            Self::InvalidKonklav { reason } => write!(f, "invalid konklav config: {reason}"),
             Self::InvalidVerifier { verifier, reason } => {
                 write!(f, "auth verifier `{verifier}` is invalid: {reason}")
             }
@@ -380,6 +397,16 @@ impl Config {
                         }
                     }
                 }
+                // r[impl config.validate.konklav]
+                if let Some(konklav) = &mapping.konklav {
+                    for reason in self.mapping_konklav_reasons(mapping, konklav) {
+                        errors.push(ValidationError::InvalidMappingKonklav {
+                            server: name.clone(),
+                            mapping: index,
+                            reason,
+                        });
+                    }
+                }
                 // r[impl config.validate.absolute-paths]
                 if !mapping.path_prefix.starts_with('/') {
                     errors.push(ValidationError::RelativePath {
@@ -413,6 +440,8 @@ impl Config {
         }
         // r[impl config.validate.verifiers]
         errors.extend(self.validate_verifiers());
+        // r[impl config.validate.konklav]
+        errors.extend(self.validate_konklav());
         // r[impl config.validate.cache]
         errors.extend(self.validate_cache());
         // r[impl config.validate.refresh+2]
@@ -445,6 +474,88 @@ impl Config {
         } else {
             Err(errors)
         }
+    }
+}
+
+impl Config {
+    fn validate_konklav(&self) -> Vec<ValidationError> {
+        let Some(konklav) = &self.konklav else {
+            return Vec::new();
+        };
+        let mut reasons = Vec::new();
+        for (field, url) in [
+            ("relying_url", &konklav.relying_url),
+            ("subject_url", &konklav.subject_url),
+        ] {
+            if !is_secure_url(url) {
+                reasons.push(format!(
+                    "`{field}` is `{url}`, which isn't an HTTPS URL, or an HTTP one to this host"
+                ));
+            }
+        }
+        for (field, value) in [
+            ("key_id", &konklav.key_id),
+            ("secret", &konklav.secret),
+            ("issuer", &konklav.issuer),
+            ("audience", &konklav.audience),
+        ] {
+            if value.trim().is_empty() {
+                reasons.push(format!("`{field}` must not be empty"));
+            }
+        }
+        if konklav.timeout.duration().is_zero() {
+            reasons.push("`timeout` must be positive".to_string());
+        }
+        reasons
+            .into_iter()
+            .map(|reason| ValidationError::InvalidKonklav { reason })
+            .collect()
+    }
+
+    /// Why a mapping's `konklav` is invalid.
+    fn mapping_konklav_reasons(
+        &self,
+        mapping: &crate::Mapping,
+        konklav: &crate::MappingKonklav,
+    ) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if self.konklav.is_none() {
+            reasons.push("there's no top-level `konklav` to decide its rules".to_string());
+        }
+        if konklav.rules.is_empty() {
+            reasons.push("it has no rules, so every request would be refused".to_string());
+        }
+        for (index, rule) in konklav.rules.iter().enumerate() {
+            let mut reason = |reason: String| reasons.push(format!("rule {index}: {reason}"));
+            if rule.actions.is_empty() || rule.actions.iter().any(|action| action.is_empty()) {
+                reason("`actions` must name at least one action, none of them empty".to_string());
+            }
+            let pattern = match crate::PathPattern::parse(&rule.path) {
+                Ok(pattern) => pattern,
+                Err(invalid) => {
+                    reason(invalid.to_string());
+                    continue;
+                }
+            };
+            if !pattern.can_match_under(&mapping.path_prefix) {
+                reason(format!(
+                    "`{}` can't match paths under the mapping's prefix `{}`",
+                    rule.path, mapping.path_prefix
+                ));
+            }
+            if let Some(scope) = &rule.scope {
+                if scope.kind.is_empty() {
+                    reason("the scope's `kind` must not be empty".to_string());
+                }
+                if !pattern.captures().any(|capture| capture == scope.id) {
+                    reason(format!(
+                        "the scope's `id` is `{}`, which `{}` doesn't capture",
+                        scope.id, rule.path
+                    ));
+                }
+            }
+        }
+        reasons
     }
 }
 

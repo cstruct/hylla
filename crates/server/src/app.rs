@@ -18,6 +18,7 @@ use opentelemetry::KeyValue;
 use tracing::{Instrument, field::Empty};
 
 use crate::auth::{self, CompiledAuth, Verifiers};
+use crate::konklav::{CompiledKonklav, Konklav};
 
 use crate::{
     RefreshReport,
@@ -84,6 +85,8 @@ struct Server {
     router: MappingRouter,
     /// The auth of each mapping, by mapping index.
     auth: Vec<Option<CompiledAuth>>,
+    /// The Konklav rules of each mapping, by mapping index.
+    konklav: Vec<Option<CompiledKonklav>>,
     /// The site of each mapping, by mapping index.
     sites: Vec<Option<Site>>,
 }
@@ -101,6 +104,8 @@ impl App {
     /// Builds the app from a validated config and the backends' object stores.
     pub async fn new(config: &Config, stores: Stores) -> anyhow::Result<Arc<Self>> {
         let verifiers = Verifiers::new(&config.auth)?;
+        // r[impl konklav.optional]
+        let konklav = config.konklav.as_ref().map(Konklav::start);
         let mut listeners = BTreeMap::<SocketAddr, Vec<Arc<Server>>>::new();
         let mut servers = config.servers.iter().collect::<Vec<_>>();
         servers.sort_by_key(|(name, _)| *name);
@@ -118,6 +123,22 @@ impl App {
                         .as_ref()
                         .map(|auth| verifiers.mapping(auth))
                         .transpose()
+                        .with_context(|| format!("server `{name}`, mapping {index}"))
+                })
+                .collect::<anyhow::Result<_>>()?;
+            let konklav = server
+                .mappings
+                .iter()
+                .enumerate()
+                .map(|(index, mapping)| {
+                    let Some(rules) = &mapping.konklav else {
+                        return Ok(None);
+                    };
+                    konklav
+                        .as_ref()
+                        .context("there's no top-level `konklav` to decide its rules")
+                        .and_then(|konklav| konklav.mapping(rules))
+                        .map(Some)
                         .with_context(|| format!("server `{name}`, mapping {index}"))
                 })
                 .collect::<anyhow::Result<_>>()?;
@@ -150,6 +171,7 @@ impl App {
                         .collect(),
                     router,
                     auth,
+                    konklav,
                     sites: server
                         .mappings
                         .iter()
@@ -621,9 +643,18 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
     };
     labels.mapping = server.prefixes.get(route.mapping).cloned();
     let auth = server.auth.get(route.mapping).and_then(Option::as_ref);
-    let private = auth.is_some_and(|auth| auth.private);
+    let konklav = server.konklav.get(route.mapping).and_then(Option::as_ref);
+    // r[impl konklav.private]
+    let private =
+        auth.is_some_and(|auth| auth.private) || konklav.is_some_and(|konklav| konklav.private);
 
     if let Some(site) = server.sites.get(route.mapping).and_then(Option::as_ref) {
+        // r[impl konklav.sites]
+        // Konklav goes by the request path alone, so it decides before the build is chosen,
+        // which `auth` checks the keys of.
+        if let Some(refused) = check_konklav(konklav, request.headers(), &path).await {
+            return mark_private(refused, private);
+        }
         let prefix = server.prefixes[route.mapping].trim_end_matches('/');
         let document = route.path.strip_prefix(prefix).unwrap_or(&route.path);
         let response = serve_site(
@@ -649,7 +680,12 @@ async fn respond(listener: &Listener, request: Request, labels: &mut RequestLabe
     }
 
     let key = route.path.trim_start_matches('/');
+    // r[impl konklav.with-auth+2]
+    // `auth` goes first, so Konklav is only asked about tokens it allows.
     if let Some(refused) = check_auth(auth, request.headers(), key).await {
+        return mark_private(refused, private);
+    }
+    if let Some(refused) = check_konklav(konklav, request.headers(), &path).await {
         return mark_private(refused, private);
     }
 
@@ -690,20 +726,40 @@ async fn check_auth(
     key: &str,
 ) -> Option<Response> {
     let refusal = auth?.check(headers, &format!("/{key}")).await.err()?;
-    match &refusal {
+    Some(refused(&refusal))
+}
+
+// r[impl konklav.mappings]
+/// Asks Konklav about a request for the decoded request path `path`, by the mapping's
+/// rules, answering with the refusal when it isn't allowed.
+async fn check_konklav(
+    konklav: Option<&CompiledKonklav>,
+    headers: &HeaderMap,
+    path: &str,
+) -> Option<Response> {
+    let refusal = konklav?.check(headers, path).await.err()?;
+    Some(refused(&refusal))
+}
+
+/// Logs and counts a refusal, and answers with it.
+fn refused(refusal: &auth::Refusal) -> Response {
+    match refusal {
         auth::Refusal::InvalidToken(reason) => {
             tracing::debug!(reason, "refused an invalid token");
         }
         auth::Refusal::KeysUnavailable(reason) => {
             tracing::debug!(reason, "refused a token, without keys to check it with");
         }
+        auth::Refusal::DecisionUnavailable(reason) => {
+            tracing::debug!(reason, "refused a request Konklav couldn't decide");
+        }
         _ => {}
     }
     METRICS
         .auth_refusals
         .add(1, &[KeyValue::new("hylla.reason", refusal.reason())]);
-    let (status, headers) = auth::refusal_response(&refusal);
-    Some((status, headers).into_response())
+    let (status, headers) = auth::refusal_response(refusal);
+    (status, headers).into_response()
 }
 
 /// A request to a site.

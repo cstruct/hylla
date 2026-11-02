@@ -12,6 +12,7 @@ mod cache;
 mod cluster;
 mod control;
 mod health;
+mod konklav;
 mod limited;
 mod listen;
 mod logs;

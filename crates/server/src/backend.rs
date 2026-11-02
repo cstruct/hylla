@@ -109,6 +109,7 @@ mod tests {
             backends: HashMap::from([("b".into(), backend)]),
             cache: Default::default(),
             auth: HashMap::new(),
+            konklav: None,
             telemetry: Default::default(),
             cluster: None,
             control: None,

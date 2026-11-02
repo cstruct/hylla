@@ -229,6 +229,29 @@ A verifier with both a `public_key` and a `jwks_uri`, or with none of `public_ke
 `jwks_uri` and `issuer`, or whose `jwks_uri`, or `issuer` it reads its keys through, isn't
 an HTTPS URL, or an HTTP one to a loopback address, MUST be reported as invalid.
 
+## Konklav
+
+r[config.konklav.provider]
+Konklav MUST be configured in an optional top-level `konklav` section with the `relying_url`
+and `subject_url` of its relying and subject-facing surfaces, the `key_id` and secret
+`secret` of the service principal's secret key, the `issuer` and `audience` access tokens
+must have, and a `timeout` for decisions defaulting to `5s`.
+
+r[config.konklav.mappings]
+A mapping MAY have a `konklav` section with its `rules`, in order, and a `private` flag
+defaulting to true. Each rule MUST have a `path` pattern starting with `/`, its `actions`,
+and optionally a `scope` with the scope's `kind` and the name of the capture that is its
+`id`, such as `{path "/object/{object_id}/*", actions (object:read), scope {kind object, id
+object_id}}`.
+
+r[config.validate.konklav]
+A `konklav` section whose URLs aren't HTTPS URLs, or HTTP ones to a loopback address, or
+with an empty `key_id`, `secret`, `issuer` or `audience`, or a zero `timeout`, MUST be
+reported as invalid. So MUST a mapping's `konklav` without a top-level `konklav` section,
+without rules, or with a rule whose path doesn't parse, can't match paths under the mapping's
+prefix, or captures a name twice, whose actions are empty, or whose scope has an empty kind or
+names a capture its path doesn't have.
+
 ## Serving backends
 
 r[config.serve-backends]

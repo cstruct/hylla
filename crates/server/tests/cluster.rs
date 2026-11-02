@@ -115,6 +115,7 @@ async fn node_with(
                     writable: control.is_some(),
                     cache_control: None,
                     auth: None,
+                    konklav: None,
                     site: None,
                 }],
             },
@@ -148,6 +149,7 @@ async fn node_with(
             ..Cache::default()
         },
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         control,
         serve_backends: None,
