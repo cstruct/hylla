@@ -36,6 +36,7 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)]) -> Mapping {
         writable: false,
         cache_control: None,
         auth: None,
+        site: None,
     }
 }
 

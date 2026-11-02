@@ -15,6 +15,12 @@ pub enum ValidationError {
     NoMappings,
     /// A server has no server names.
     NoServerNames { server: String },
+    /// A server name is an invalid wildcard.
+    InvalidServerName {
+        server: String,
+        server_name: String,
+        reason: String,
+    },
     /// A mapping's path prefix doesn't start with `/`.
     RelativePath {
         server: String,
@@ -54,6 +60,12 @@ pub enum ValidationError {
     InvalidBackend { backend: String, reason: String },
     /// The settings of serving backends to other nodes are invalid.
     InvalidServeBackends { reason: String },
+    /// A mapping's site settings are invalid.
+    InvalidSite {
+        server: String,
+        mapping: usize,
+        reason: String,
+    },
     /// A mapping can't be writable.
     InvalidWritable {
         server: String,
@@ -94,6 +106,22 @@ impl fmt::Display for ValidationError {
                 "no server maps requests to a backend: configure a server with at least one mapping"
             ),
             Self::NoServerNames { server } => write!(f, "server `{server}` has no server names"),
+            Self::InvalidServerName {
+                server,
+                server_name,
+                reason,
+            } => write!(
+                f,
+                "server name `{server_name}` of server `{server}` is invalid: {reason}"
+            ),
+            Self::InvalidSite {
+                server,
+                mapping,
+                reason,
+            } => write!(
+                f,
+                "site of mapping {mapping} of server `{server}` is invalid: {reason}"
+            ),
             Self::RelativePath {
                 server,
                 mapping,
@@ -218,14 +246,104 @@ impl Config {
                     server: name.clone(),
                 });
             }
+            // r[impl config.validate.wildcards]
+            for server_name in &server.server_names {
+                let reason = match crate::wildcard_suffix(server_name) {
+                    Some(suffix) if suffix.contains('*') => {
+                        Some("`*` can only be its whole first label")
+                    }
+                    Some(suffix)
+                        if suffix.split('.').filter(|label| !label.is_empty()).count() < 2 =>
+                    {
+                        Some("a wildcard needs at least two labels after it, as in `*.example.com`")
+                    }
+                    Some(_) => None,
+                    None if server_name.contains('*') => {
+                        Some("`*` can only be its whole first label, as in `*.example.com`")
+                    }
+                    None => None,
+                };
+                if let Some(reason) = reason {
+                    errors.push(ValidationError::InvalidServerName {
+                        server: name.clone(),
+                        server_name: server_name.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+            }
             // r[impl config.validate.unique-hosts]
+            // Wildcards are compared like other names, so two servers can't share one either.
             for server_name in &server.server_names {
                 hosts
                     .entry((server.listen, server_name.to_lowercase()))
                     .or_default()
                     .push(name.clone());
             }
+            let has_wildcard = server
+                .server_names
+                .iter()
+                .any(|server_name| crate::wildcard_suffix(server_name).is_some());
             for (index, mapping) in server.mappings.iter().enumerate() {
+                // r[impl config.validate.site+2]
+                if let Some(site) = &mapping.site {
+                    let mut error = |reason: String| {
+                        errors.push(ValidationError::InvalidSite {
+                            server: name.clone(),
+                            mapping: index,
+                            reason,
+                        })
+                    };
+                    if !mapping.rewrites.is_empty() {
+                        error("a site can't have rewrites: it builds its keys itself".into());
+                    }
+                    if mapping.writable {
+                        error(
+                            "a site can't be writable: write its builds and aliases through \
+                             a mapping without a site"
+                                .into(),
+                        );
+                    }
+                    match &site.alias {
+                        Some(alias) if !crate::is_alias_name(alias) => error(format!(
+                            "`{alias}` isn't an alias name: 1 to 63 lowercase letters, digits \
+                             and `-`, not starting or ending with `-`, and not a SHA"
+                        )),
+                        Some(_) => {}
+                        None if !has_wildcard => error(
+                            "without `alias`, the build is chosen by the host, which needs a \
+                             wildcard server name such as `*.example.com`"
+                                .into(),
+                        ),
+                        None => {}
+                    }
+                    for (setting, prefix) in [("builds", &site.builds), ("aliases", &site.aliases)]
+                    {
+                        if prefix.is_empty() || prefix.starts_with('/') || !prefix.ends_with('/') {
+                            error(format!(
+                                "`{setting}` must be a key prefix such as `{setting}/`, not \
+                                 starting with `/` and ending with `/`"
+                            ));
+                        }
+                    }
+                    if site.builds.starts_with(&site.aliases)
+                        || site.aliases.starts_with(&site.builds)
+                    {
+                        error("`builds` and `aliases` can't overlap".into());
+                    }
+                    let documents = [
+                        ("index", Some(&site.index)),
+                        ("fallback", site.fallback.as_ref()),
+                    ];
+                    for (setting, key) in documents {
+                        if let Some(key) = key
+                            && (key.is_empty() || key.starts_with('/'))
+                        {
+                            error(format!(
+                                "`{setting}` must be a key within a build, such as `index.html`"
+                            ));
+                        }
+                    }
+                }
                 // r[impl config.validate.writable]
                 if mapping.writable {
                     let mut error = |reason: &str| {

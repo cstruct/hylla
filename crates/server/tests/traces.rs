@@ -127,6 +127,7 @@ fn config(cluster: Option<Cluster>) -> Config {
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    site: None,
                 }],
             },
         )]),

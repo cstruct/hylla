@@ -42,6 +42,7 @@ async fn node() -> Arc<App> {
         writable,
         cache_control: None,
         auth: None,
+        site: None,
     };
     let config = Config {
         servers: HashMap::from([(

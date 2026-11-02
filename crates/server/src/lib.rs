@@ -20,6 +20,7 @@ mod oidc;
 mod provider;
 mod range;
 mod refresh;
+mod site;
 mod spans;
 mod status;
 pub mod telemetry;

@@ -55,6 +55,7 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    site: None,
                 }],
             },
         )]),

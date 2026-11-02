@@ -30,6 +30,7 @@ fn mapping(path_prefix: &str, writable: bool) -> Mapping {
         writable,
         cache_control: None,
         auth: None,
+        site: None,
     }
 }
 
@@ -507,6 +508,7 @@ fn writable_mappings_and_the_control_plane_are_validated() {
                     writable: true,
                     cache_control: None,
                     auth: None,
+                    site: None,
                 }],
             },
         )]),

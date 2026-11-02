@@ -169,6 +169,7 @@ fn loads_servers_and_backends() {
                 writable: false,
                 cache_control: None,
                 auth: None,
+                site: None,
             },
             Mapping {
                 path_prefix: "/".into(),
@@ -177,6 +178,7 @@ fn loads_servers_and_backends() {
                 writable: false,
                 cache_control: None,
                 auth: None,
+                site: None,
             },
         ]
     );
@@ -1641,4 +1643,41 @@ http {
             "invalid health config: `listen` is 0.0.0.0:8080, which server `public` listens on too",
         )
     }));
+}
+
+// r[verify config.site]
+// r[verify config.site.prefixes]
+// r[verify config.site.index]
+// r[verify config.site.redirect]
+// r[verify config.site.alias-cache-control]
+#[test]
+fn sites_have_defaults() {
+    let config = "servers {
+  previews {
+    listen 0.0.0.0:8080
+    server_names (*.preview.example.com)
+    mappings ({path_prefix /, backend assets, site {}})
+  }
+  live {
+    listen 0.0.0.0:8080
+    server_names (www.example.com)
+    mappings ({path_prefix /, backend assets, site {alias live, builds web/, fallback index.html}})
+  }
+}
+backends {assets {type s3, bucket assets, region eu-north-1}}
+";
+    let files = Files::new("sites", config, MINIMAL_SECRETS);
+    let config = files.load(&[]).unwrap().into_config();
+    let site = config.servers["previews"].mappings[0].site.clone().unwrap();
+    assert_eq!(site.builds, "builds/");
+    assert_eq!(site.aliases, "aliases/");
+    assert_eq!(site.alias, None);
+    assert_eq!(site.index, "index.html");
+    assert_eq!(site.fallback, None);
+    assert!(site.redirect);
+    assert_eq!(site.alias_cache_control, "no-cache");
+    let live = config.servers["live"].mappings[0].site.clone().unwrap();
+    assert_eq!(live.alias.as_deref(), Some("live"));
+    assert_eq!(live.builds, "web/");
+    assert_eq!(live.fallback.as_deref(), Some("index.html"));
 }

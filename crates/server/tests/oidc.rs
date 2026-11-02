@@ -256,6 +256,7 @@ async fn node_with_issuer(issuer: &str) -> Arc<App> {
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    site: None,
                 }],
             },
         )]),

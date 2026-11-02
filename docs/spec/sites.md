@@ -78,11 +78,11 @@ r[config.site.alias-cache-control]
 `alias_cache_control` MUST set the `Cache-Control` of responses served through an alias
 without redirecting, defaulting to `no-cache`.
 
-r[config.validate.site]
-A site mapping with rewrites, that is writable, or whose backend is a `hylla` backend MUST
-be reported as invalid, and so MUST a site without `alias` on a server without a wildcard
-name, an `alias` that isn't a valid alias name, prefixes that are empty, start with `/`,
-don't end with `/` or overlap, and an `index` or `fallback` that's empty or starts with `/`.
+r[config.validate.site+2]
+A site mapping with rewrites, or that is writable, MUST be reported as invalid, and so MUST
+a site without `alias` on a server without a wildcard name, an `alias` that isn't a valid
+alias name, prefixes that are empty, start with `/`, don't end with `/` or overlap, and an
+`index` or `fallback` that's empty or starts with `/`.
 
 ## Choosing a build
 

@@ -181,6 +181,7 @@ async fn metrics_are_exported_over_otlp() {
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    site: None,
                 }],
             },
         )]),

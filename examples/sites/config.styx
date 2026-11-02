@@ -1,0 +1,30 @@
+// Frontend builds per commit: previews on a wildcard host, the live site through an alias,
+// and a private writable mapping for CI to upload builds and move aliases.
+servers {
+  previews {
+    listen 0.0.0.0:8080
+    // pr1873.preview.example.com redirects to <sha>.preview.example.com.
+    server_names (*.preview.example.com)
+    mappings ({path_prefix /, backend frontend, site {fallback index.html}})
+  }
+  live {
+    listen 0.0.0.0:8080
+    server_names (www.example.com example.com)
+    mappings ({path_prefix /, backend frontend, site {alias live, fallback index.html}})
+  }
+  ci {
+    listen 127.0.0.1:8090
+    server_names (hylla-ci.internal)
+    mappings ({path_prefix /, backend frontend, writable true})
+  }
+}
+backends {
+  frontend {
+    type s3
+    bucket frontend
+    region eu-north-1
+  }
+}
+control {
+  listen 127.0.0.1:9090
+}

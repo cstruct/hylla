@@ -55,6 +55,7 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)], auth: Option<MappingAut
         writable: false,
         cache_control: None,
         auth,
+        site: None,
     }
 }
 
