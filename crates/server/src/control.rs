@@ -210,6 +210,8 @@ pub struct MappingEntry {
     pub backend: String,
     pub writable: bool,
     pub rewrites: bool,
+    /// Whether it serves a site, whose keys don't map back to its paths either.
+    pub site: bool,
 }
 
 impl MappingEntry {
@@ -261,6 +263,8 @@ enum ControlError {
     NotWritable,
     /// Mappings with rewrites can't be listed: their keys don't map back to their paths.
     Rewrites,
+    /// Sites can't be listed: their keys depend on the build each request chooses.
+    Site,
     InvalidPath(String),
     NotFound,
     Backend(object_store::Error),
@@ -279,6 +283,10 @@ impl std::fmt::Display for ControlError {
                 f,
                 "the mapping has rewrites, so its backend keys don't map back to its paths"
             ),
+            Self::Site => write!(
+                f,
+                "the mapping serves a site, so its backend keys don't map back to its paths"
+            ),
             Self::InvalidPath(path) => write!(f, "`{path}` isn't a path within the mapping"),
             Self::NotFound => write!(f, "no such object"),
             Self::Backend(error) => write!(f, "the backend failed: {error}"),
@@ -293,7 +301,7 @@ impl ControlError {
         match self {
             Self::UnknownMapping | Self::NotFound => StatusCode::NOT_FOUND,
             Self::NotWritable => StatusCode::FORBIDDEN,
-            Self::Rewrites => StatusCode::CONFLICT,
+            Self::Rewrites | Self::Site => StatusCode::CONFLICT,
             Self::InvalidPath(_) => StatusCode::BAD_REQUEST,
             Self::Backend(_) => StatusCode::BAD_GATEWAY,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -421,6 +429,10 @@ impl Plane {
         let mapping = self.mapping(server, index)?;
         if mapping.rewrites {
             return Err(ControlError::Rewrites);
+        }
+        // r[impl site.browse]
+        if mapping.site {
+            return Err(ControlError::Site);
         }
         if !(prefix.is_empty() || prefix.ends_with('/')) {
             return Err(ControlError::InvalidPath(prefix.to_string()));

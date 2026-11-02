@@ -61,6 +61,7 @@ impl Node {
                         cache_control: None,
                         auth: None,
                         konklav: None,
+                        site: None,
                     }],
                 },
             )]),

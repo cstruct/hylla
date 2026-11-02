@@ -123,6 +123,7 @@ async fn logs_are_exported_over_otlp_with_trace_ids() {
                     cache_control: None,
                     auth: None,
                     konklav: None,
+                    site: None,
                 }],
             },
         )]),

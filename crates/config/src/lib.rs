@@ -33,6 +33,7 @@ mod load;
 mod pattern;
 mod router;
 mod show;
+mod site;
 mod template;
 mod validate;
 
@@ -48,6 +49,7 @@ pub use load::{
 pub use pattern::{InvalidPattern, PathPattern};
 pub use router::{Route, Router};
 pub use show::{ExplainError, explain, render};
+pub use site::{is_alias_name, is_sha, wildcard_suffix};
 pub use template::{InvalidTemplate, PathTemplate, under_prefix};
 pub use validate::{ValidationError, is_secure_url};
 
@@ -131,6 +133,42 @@ config_tree! {
                     /// caches in front of hylla don't serve them to others.
                     #[facet(default = true)]
                     pub private: bool,
+                }>,
+                // r[impl config.site]
+                /// Serves frontend builds, one per commit, chosen by SHA or by alias, rather
+                /// than mapping paths to keys.
+                pub site: Option<pub struct Site {
+                    // r[impl config.site.prefixes]
+                    /// The backend key prefix builds are stored under, each in a directory
+                    /// named by its commit's SHA.
+                    #[facet(default = String::from("builds/"))]
+                    pub builds: String,
+                    /// The backend key prefix aliases are stored under, each an object whose
+                    /// body is the SHA it points at.
+                    #[facet(default = String::from("aliases/"))]
+                    pub aliases: String,
+                    // r[impl config.site.alias]
+                    /// The alias always served, such as `live`. Without it, the build is chosen
+                    /// by the label a wildcard server name matched.
+                    pub alias: Option<String>,
+                    // r[impl config.site.index]
+                    /// The object served for paths ending with `/`.
+                    #[facet(default = String::from("index.html"))]
+                    pub index: String,
+                    // r[impl config.site.fallback]
+                    /// The object served for page loads of paths the build doesn't have, such as
+                    /// `index.html` for single page apps.
+                    pub fallback: Option<String>,
+                    // r[impl config.site.redirect]
+                    /// Whether requests choosing an alias by their host are redirected to the
+                    /// build's SHA host, so a browser stays on one build while the alias moves.
+                    #[facet(default = true)]
+                    pub redirect: bool,
+                    // r[impl config.site.alias-cache-control]
+                    /// The `Cache-Control` of responses served through an alias without
+                    /// redirecting, since the same URL serves another build once it moves.
+                    #[facet(default = String::from("no-cache"))]
+                    pub alias_cache_control: String,
                 }>,
             }>,
         }>,
@@ -760,7 +798,7 @@ pub struct Refresh {
     pub rules: Vec<RefreshRule>,
 }
 
-// r[impl config.refresh.rules]
+// r[impl config.refresh.rules+2]
 /// Refreshes the objects under a key prefix, or a single key, of a backend.
 #[config]
 #[derive(Debug, Clone, PartialEq)]
@@ -770,6 +808,8 @@ pub struct RefreshRule {
     pub prefix: Option<String>,
     /// A single backend key, such as `css/app.css`.
     pub key: Option<String>,
+    /// The build an alias points at, read again on every run, such as the live site's.
+    pub alias: Option<RefreshAlias>,
     /// How often to refresh, such as `15m`. The first refresh runs at startup.
     pub every: Interval,
     #[facet(default)]
@@ -778,6 +818,21 @@ pub struct RefreshRule {
     pub max_objects: Option<u64>,
     /// The most data one preload fetches, in MiB.
     pub max_mib: Option<u64>,
+}
+
+// r[impl config.refresh.alias]
+/// The alias a refresh rule follows, covering the build it points at.
+#[config]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshAlias {
+    /// The alias, such as `live`.
+    pub name: String,
+    /// The backend key prefix builds are stored under, as the site's `builds`.
+    #[facet(default = String::from("builds/"))]
+    pub builds: String,
+    /// The backend key prefix aliases are stored under, as the site's `aliases`.
+    #[facet(default = String::from("aliases/"))]
+    pub aliases: String,
 }
 
 // r[impl config.refresh.modes]

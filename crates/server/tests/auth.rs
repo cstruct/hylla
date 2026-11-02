@@ -56,6 +56,7 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)], auth: Option<MappingAut
         cache_control: None,
         auth,
         konklav: None,
+        site: None,
     }
 }
 

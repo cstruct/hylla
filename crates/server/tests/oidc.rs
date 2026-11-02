@@ -257,6 +257,7 @@ async fn node_with_issuer(issuer: &str) -> Arc<App> {
                     cache_control: None,
                     auth: None,
                     konklav: None,
+                    site: None,
                 }],
             },
         )]),

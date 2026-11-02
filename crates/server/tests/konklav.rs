@@ -18,7 +18,7 @@ use axum::{
 use http::{HeaderMap, Request, StatusCode, header};
 use hylla_config::{
     Backend, Cache, Config, Interval, JwtAlgorithm, Konklav, KonklavRule, KonklavScope, Mapping,
-    MappingAuth, MappingKonklav, Server, Verifier,
+    MappingAuth, MappingKonklav, Server, Site, Verifier,
 };
 use hylla_server::App;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -131,6 +131,7 @@ fn mapping(path_prefix: &str, konklav: Option<MappingKonklav>) -> Mapping {
         cache_control: None,
         auth: None,
         konklav,
+        site: None,
     }
 }
 
@@ -180,12 +181,21 @@ async fn app(
     verifiers: HashMap<String, Verifier>,
 ) -> Arc<App> {
     let store = Arc::new(InMemory::new());
+    let build = "1111111111111111111111111111111111111111";
+    store
+        .put(
+            &Path::from("aliases/live"),
+            build.as_bytes().to_vec().into(),
+        )
+        .await
+        .unwrap();
     for key in [
         "object/o-1/report.pdf",
         "object/o-2/report.pdf",
         "reports/q1.pdf",
         "reports/secret",
         "public/app.css",
+        "builds/1111111111111111111111111111111111111111/index.html",
     ] {
         store
             .put(&Path::from(key), key.as_bytes().to_vec().into())
@@ -507,7 +517,7 @@ fn jwt() -> String {
     .unwrap()
 }
 
-// r[verify konklav.with-auth]
+// r[verify konklav.with-auth+2]
 #[tokio::test]
 async fn auth_is_checked_before_konklav_is_asked() {
     let fake = FakeKonklav::start().await;
@@ -560,4 +570,49 @@ async fn auth_is_checked_before_konklav_is_asked() {
     assert_eq!(response.status, StatusCode::OK);
     // Private, since `auth` asks for it, though `konklav` doesn't.
     assert_eq!(response.header(header::CACHE_CONTROL), Some("private"));
+}
+
+// r[verify konklav.sites]
+#[tokio::test]
+async fn sites_ask_konklav_before_choosing_a_build() {
+    let fake = FakeKonklav::start().await;
+    let mut site = mapping("/", rules(vec![rule("/*", &["site:read"], None)]));
+    site.site = Some(Site {
+        builds: "builds/".into(),
+        aliases: "aliases/".into(),
+        alias: Some("live".into()),
+        index: "index.html".into(),
+        fallback: None,
+        redirect: true,
+        alias_cache_control: "no-cache".into(),
+    });
+    let app = app(vec![site], Some(fake.config()), HashMap::new()).await;
+
+    fake.answer(Answer::Decision(
+        json!({"decision": "deny", "reason": "token_kind"}),
+    ));
+    let response = get(&app, "/", Some("caller-token")).await;
+    assert_eq!(response.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        fake.checks(),
+        vec![json!({
+            "token": "caller-token",
+            "requirements": {"tenant": ["site:read"]},
+        })]
+    );
+
+    fake.answer(Answer::Decision(json!({"decision": "allow"})));
+    let response = get(&app, "/", Some("caller-token")).await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        response.body,
+        b"builds/1111111111111111111111111111111111111111/index.html"
+    );
+    assert_eq!(
+        response.header(header::CACHE_CONTROL),
+        Some("private, no-cache")
+    );
+
+    let response = get(&app, "/", None).await;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
 }

@@ -91,7 +91,12 @@ Responses of a mapping with `konklav` MUST be marked `Cache-Control: private`, u
 
 ## With auth
 
-r[konklav.with-auth]
-A mapping with both `auth` and `konklav` MUST check `auth` first, and only ask Konklav about
-requests `auth` allows, both reading the same bearer token. Its responses MUST be private
-when either asks for it.
+r[konklav.with-auth+2]
+A mapping with both `auth` and `konklav`, other than a site, MUST check `auth` first, and only
+ask Konklav about requests `auth` allows, both reading the same bearer token. Its responses
+MUST be private when either asks for it.
+
+r[konklav.sites]
+A site mapping with `konklav` MUST ask Konklav about the request path before choosing a
+build, so nothing is read for a request Konklav refuses; its `auth`, if any, then checks the
+keys of the chosen build, as for any site.

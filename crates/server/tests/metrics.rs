@@ -182,6 +182,7 @@ async fn metrics_are_exported_over_otlp() {
                     cache_control: None,
                     auth: None,
                     konklav: None,
+                    site: None,
                 }],
             },
         )]),
@@ -199,6 +200,7 @@ async fn metrics_are_exported_over_otlp() {
                     rules: vec![RefreshRule {
                         prefix: Some(String::new()),
                         key: None,
+                        alias: None,
                         every: Interval::from_secs(3600),
                         mode: RefreshMode::Both,
                         max_objects: Some(10),

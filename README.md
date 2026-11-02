@@ -17,6 +17,8 @@ fetch each one from the bucket rarely, and keep serving while the bucket is down
   stale. Refresh rules check and preload objects in the background, so requests rarely wait
   on the bucket.
 - **Routing** by host and path prefix, with regex rewrites from paths to bucket keys.
+- **Sites**: frontend builds served per commit, with aliases such as `live` or `pr1873`
+  that CI moves without a reload.
 - **JWT auth** per mapping, with keys from your OpenID provider, optionally limiting each
   token to keys built from its claims, or **authorization by
   [Konklav](https://github.com/cstruct/konklav)**, down to the object a path names.
@@ -133,6 +135,7 @@ with, and where each value comes from, run `hylla config show` with the same fla
 | [control-plane](examples/control-plane) | The web UI and JSON API, with sign-in through Konklav |
 | [cluster-kubernetes](examples/cluster-kubernetes) | Three nodes sharing their work in Kubernetes |
 | [origin-shield](examples/origin-shield) | Edge nodes reading a bucket through a shield next to it |
+| [sites](examples/sites) | Frontend builds per commit, with preview hosts and aliases CI moves |
 | [reference](examples/reference) | Most settings in one annotated config |
 
 The [guides](docs/guide) explain hylla in depth:
