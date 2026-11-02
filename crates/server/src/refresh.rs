@@ -6,6 +6,7 @@ use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 
 use crate::{
     cache::{CachedState, ObjectCache, ObjectMeta, ReadError},
+    site::Failure,
     spans,
 };
 
@@ -44,7 +45,7 @@ enum Action {
 // r[impl refresh.run]
 /// Runs `rule` of a backend once.
 pub async fn run(
-    cache: &ObjectCache,
+    cache: &Arc<ObjectCache>,
     backend: &str,
     store: Arc<dyn ObjectStore>,
     refresh: &Refresh,
@@ -57,10 +58,30 @@ pub async fn run(
     }
     let concurrency = refresh.concurrency.max(1) as usize;
 
+    // r[impl refresh.alias]
+    // r[impl refresh.alias.invalid]
+    // A rule following an alias covers the build it points at now, as a prefix rule.
+    let followed = match &rule.alias {
+        Some(alias) => {
+            let key = format!("{}{}", alias.aliases, alias.name);
+            let (sha, _) = crate::site::read_alias(cache, backend, &store, &key, |_| None)
+                .await
+                .map_err(|failure| match failure {
+                    Failure::NotFound => anyhow::anyhow!("alias `{}` doesn't exist", alias.name),
+                    Failure::BadGateway => {
+                        anyhow::anyhow!("alias `{}` couldn't be read as a SHA", alias.name)
+                    }
+                })?;
+            Some(format!("{}{sha}/", alias.builds))
+        }
+        None => None,
+    };
+    let prefix = followed.as_ref().or(rule.prefix.as_ref());
+
     // r[impl refresh.list]
     // r[impl refresh.list-batches]
     // Listed and handled a batch at a time, so a large bucket isn't held in memory at once.
-    let mut listing = match (&rule.prefix, &rule.key) {
+    let mut listing = match (prefix, &rule.key) {
         (Some(prefix), _) => {
             let prefix = (!prefix.is_empty()).then(|| ObjectPath::from(prefix.as_str()));
             Listing::Prefix(store.list(prefix.as_ref()), prefix)

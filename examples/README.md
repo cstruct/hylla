@@ -11,4 +11,5 @@ README. Every one is loaded and validated by the tests, so they stay current.
 | [control-plane](control-plane) | The web UI and JSON API, with Basic auth and sign-in through Konklav |
 | [cluster-kubernetes](cluster-kubernetes) | Three nodes sharing their work in Kubernetes, with manifests |
 | [origin-shield](origin-shield) | Edge nodes reading a bucket through a shield node next to it |
+| [sites](sites) | Frontend builds per commit, with preview hosts and aliases CI moves |
 | [reference](reference) | Most settings in one annotated config |

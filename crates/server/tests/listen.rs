@@ -60,6 +60,7 @@ impl Node {
                         writable: false,
                         cache_control: None,
                         auth: None,
+                        site: None,
                     }],
                 },
             )]),

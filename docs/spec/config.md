@@ -140,9 +140,10 @@ r[config.refresh]
 A backend MAY have a `refresh` section with `rules` and a `concurrency`, defaulting to 4,
 limiting how many objects are refreshed at the same time.
 
-r[config.refresh.rules]
-A refresh rule MUST cover either a backend key `prefix` (directory-like, empty for the
-whole backend) or a single backend `key`, and run `every` interval.
+r[config.refresh.rules+2]
+A refresh rule MUST cover one of a backend key `prefix` (directory-like, empty for the
+whole backend), a single backend `key`, or the build an `alias` points at (see
+`config.refresh.alias`), and run `every` interval.
 
 r[config.refresh.modes]
 A refresh rule's `mode` MUST be `disabled`, `revalidate` (the default), `preload` or
@@ -152,10 +153,10 @@ r[config.durations]
 Durations, such as `every`, `metadata_ttl` and `stale_if_error`, MUST be written like
 `90s`, `15m` or `1h 30m`.
 
-r[config.validate.refresh]
-A refresh with a `concurrency` of zero, and rules setting both or neither of `prefix` and
-`key`, a key or prefix starting with `/`, an empty key, a zero interval, or preloading
-without `max_objects` or `max_mib`, MUST be reported as invalid.
+r[config.validate.refresh+2]
+A refresh with a `concurrency` of zero, and rules setting more or fewer than one of
+`prefix`, `key` and `alias`, a key or prefix starting with `/`, an empty key, a zero
+interval, or preloading without `max_objects` or `max_mib`, MUST be reported as invalid.
 
 r[config.backends.secrets]
 Backend credentials MUST be secret, so they can only be set by the secrets file.
