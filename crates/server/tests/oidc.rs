@@ -235,12 +235,9 @@ async fn node(provider: &Provider) -> Arc<App> {
 }
 
 async fn node_with_issuer(issuer: &str) -> Arc<App> {
-    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    use argon2::{Argon2, PasswordHasher};
     let hash = Argon2::default()
-        .hash_password(
-            PASSWORD.as_bytes(),
-            &SaltString::encode_b64(b"a salt for tests").unwrap(),
-        )
+        .hash_password_with_salt(PASSWORD.as_bytes(), b"a salt for tests")
         .unwrap()
         .to_string();
     let config = Config {

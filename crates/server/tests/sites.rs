@@ -126,10 +126,9 @@ fn config(metadata_ttl: u64) -> Config {
 }
 
 fn hash(password: &str) -> String {
-    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-    let salt = SaltString::encode_b64(b"a salt for tests").unwrap();
+    use argon2::{Argon2, PasswordHasher};
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), b"a salt for tests")
         .unwrap()
         .to_string()
 }

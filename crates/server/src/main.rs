@@ -159,16 +159,14 @@ async fn main() -> anyhow::Result<()> {
 
 /// An argon2 hash of `password`, with a random salt, as a PHC string.
 fn hash_password(password: &str) -> anyhow::Result<String> {
-    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    use argon2::{Argon2, PasswordHasher};
     if password.is_empty() {
         anyhow::bail!("the password is empty");
     }
     let mut salt = [0u8; 16];
     aws_lc_rs::rand::fill(&mut salt).map_err(|_| anyhow::anyhow!("generating a salt"))?;
-    let salt = SaltString::encode_b64(&salt)
-        .map_err(|error| anyhow::anyhow!("encoding the salt: {error}"))?;
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt)
         .map(|hash| hash.to_string())
         .map_err(|error| anyhow::anyhow!("hashing the password: {error}"))
 }
