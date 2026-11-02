@@ -29,10 +29,9 @@ impl std::io::Write for Captured {
 }
 
 async fn node() -> Arc<App> {
-    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-    let salt = SaltString::encode_b64(b"a salt for tests").unwrap();
+    use argon2::{Argon2, PasswordHasher};
     let hash = Argon2::default()
-        .hash_password(PASSWORD.as_bytes(), &salt)
+        .hash_password_with_salt(PASSWORD.as_bytes(), b"a salt for tests")
         .unwrap()
         .to_string();
     let mapping = |path_prefix: &str, writable| Mapping {
