@@ -72,6 +72,7 @@ Each mapping:
 | `cache_control` | none | The `Cache-Control` of objects stored without one, such as `public, max-age=300`. Objects keep their own `Cache-Control`, `Content-Encoding`, `Content-Disposition` and `Content-Language` |
 | `writable` | `false` | Whether the [control plane](control-plane.md) may change its objects. Writable mappings can't have rewrites |
 | `auth` | none | Requires a JWT, see below |
+| `konklav` | none | Leaves authorization to Konklav, see [`konklav`](#konklav) |
 
 The path is percent-decoded before it's matched, rewritten and checked. The backend key is
 the rewritten path without its leading `/`: without rewrites, `/assets/app.css` is the key
@@ -117,6 +118,88 @@ Keys from a provider are read when the first token needs them, and read again af
 hour, or when a token names a key they don't have, as after the provider rotated its keys,
 but not more than once every 30 seconds. While the provider can't be reached, the keys it
 had are still used. Until they've been read once, requests are answered with 503.
+
+### `konklav`
+
+[Konklav](https://github.com/cstruct/konklav) decides requests for mappings with `konklav`,
+by the actions its roles grant the caller of their access token. hylla asks through
+Konklav's relying SDK, which decides locally from entitlements it keeps fresh from Konklav's
+change feed.
+
+| Setting | Default | |
+|---|---|---|
+| `relying_url` | required | Konklav's relying surface, such as `https://konklav:8081` |
+| `subject_url` | required | Konklav's subject-facing surface, where hylla logs in, such as `https://konklav:8080` |
+| `key_id` | required | The id of a secret key credential of hylla's service principal |
+| `secret` | required, **secret** | That credential's secret |
+| `issuer` | required | The `iss` access tokens must have |
+| `audience` | required | The `aud` access tokens must have |
+| `timeout` | `5s` | How long a decision may take before the request gets 503 |
+
+The URLs must be HTTPS ones, or HTTP ones to this host. hylla starts without waiting for
+Konklav; until it's reached, requests for its mappings get 503.
+
+A mapping's `konklav`:
+
+| Setting | Default | |
+|---|---|---|
+| `rules` | required | Which actions each path needs, in order: the first rule whose `path` matches decides. Requests no rule matches get 403 |
+| `private` | `true` | Whether responses are marked `Cache-Control: private` |
+
+Each rule:
+
+| Setting | Default | |
+|---|---|---|
+| `path` | required | A pattern for the request path, such as `"/object/{object_id}/*"`. `{name}` matches one segment and captures it, and a final `*` the rest of the path, including nothing. Quote patterns with `{` |
+| `actions` | required | The actions needed, such as `(object:read)` |
+| `scope` | none | The scope the actions are needed at: `{kind object, id object_id}` needs them at the scope `object` whose id is the capture `object_id`. Without it, they're needed tenant-wide |
+
+```styx
+konklav {
+  relying_url https://konklav.internal:8081
+  subject_url https://konklav.internal:8080
+  key_id 0193a2f0-0000-7000-8000-0000000000aa
+  issuer https://id.example.com
+  audience files.example.com
+}
+servers {
+  files {
+    // ...
+    mappings (
+      {
+        path_prefix /object
+        backend files
+        konklav {
+          rules (
+            {
+              path "/object/{object_id}/*"
+              actions (object:read)
+              scope {kind object, id object_id}
+            }
+          )
+        }
+      }
+    )
+  }
+}
+```
+
+Patterns match the request path, percent-decoded, before rewrites. A request for
+`/object/o-1/report.pdf` needs `object:read` at the object `o-1`. Konklav decides who owns
+a scope: the token's tenant, or, for a scope kind registered in Konklav's catalog, the
+tenant the object is recorded in, so a caller can't read another tenant's object by its id.
+An allow that relies on a share with attributes, such as a date range, is refused, since
+hylla can't narrow what it serves to them.
+
+Decisions aren't cached by hylla. Konklav's relying SDK caches what it decides from, and
+Konklav's change feed tells it of changes, so a revoked grant stops working within about a
+second. While the feed is down or lagging, every request is asked of Konklav's check API.
+Requests are decided even when their object is cached, and when Konklav can't decide, they
+get 503: nothing is served without a decision.
+
+A mapping can have both `auth` and `konklav`. `auth` checks the bearer token first, and
+only the requests it allows are asked of Konklav, with the same token. Responses are private
+when either asks for it.
 
 ### `backends`
 

@@ -55,6 +55,7 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    konklav: None,
                 }],
             },
         )]),
@@ -65,6 +66,7 @@ fn config(backends: HashMap<String, Backend>, serve: Option<ServeBackends>) -> C
             ..Cache::default()
         },
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         cluster: None,
         control: None,

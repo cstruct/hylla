@@ -36,6 +36,7 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)]) -> Mapping {
         writable: false,
         cache_control: None,
         auth: None,
+        konklav: None,
     }
 }
 
@@ -79,6 +80,7 @@ fn config_with_refresh(cache: Cache, refresh: Option<Refresh>) -> Config {
         )]),
         cache,
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         control: None,
         serve_backends: None,

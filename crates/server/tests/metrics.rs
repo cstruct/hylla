@@ -181,6 +181,7 @@ async fn metrics_are_exported_over_otlp() {
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    konklav: None,
                 }],
             },
         )]),
@@ -212,6 +213,7 @@ async fn metrics_are_exported_over_otlp() {
             ..Cache::default()
         },
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Default::default(),
         // A cluster that isn't started, of only this node.
         control: None,

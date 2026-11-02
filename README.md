@@ -18,7 +18,8 @@ fetch each one from the bucket rarely, and keep serving while the bucket is down
   on the bucket.
 - **Routing** by host and path prefix, with regex rewrites from paths to bucket keys.
 - **JWT auth** per mapping, with keys from your OpenID provider, optionally limiting each
-  token to keys built from its claims.
+  token to keys built from its claims, or **authorization by
+  [Konklav](https://github.com/cstruct/konklav)**, down to the object a path names.
 - **Clusters** that share their work, so the bucket serves each object once per cluster,
   and **origin shields** for nodes far from the bucket.
 - **A control plane** to see how backends are doing and change objects, with sign-in through
@@ -128,6 +129,7 @@ with, and where each value comes from, run `hylla config show` with the same fla
 |---|---|
 | [cdn](examples/cdn) | A website's assets: rewrites, refresh rules, a disk cache, stale content while S3 is down, health checks and metrics |
 | [jwt-tenants](examples/jwt-tenants) | Files per tenant behind JWTs |
+| [konklav](examples/konklav) | Objects behind Konklav, deciding who may read each one |
 | [control-plane](examples/control-plane) | The web UI and JSON API, with sign-in through Konklav |
 | [cluster-kubernetes](examples/cluster-kubernetes) | Three nodes sharing their work in Kubernetes |
 | [origin-shield](examples/origin-shield) | Edge nodes reading a bucket through a shield next to it |

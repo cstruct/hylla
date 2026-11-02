@@ -127,6 +127,7 @@ fn config(cluster: Option<Cluster>) -> Config {
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    konklav: None,
                 }],
             },
         )]),
@@ -158,6 +159,7 @@ fn config(cluster: Option<Cluster>) -> Config {
             ..Cache::default()
         },
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Telemetry {
             traces: TracesExport {
                 follow_callers: true,

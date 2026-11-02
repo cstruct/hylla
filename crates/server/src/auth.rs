@@ -211,6 +211,12 @@ pub enum Refusal {
     KeysUnavailable(String),
     /// A path with `.` or `..` segments.
     DotSegments,
+    /// No Konklav rule of the mapping matches the path.
+    NoRule,
+    /// Konklav asks the caller to authenticate again, at most `max_age` seconds before.
+    StepUp { max_age: Option<i64> },
+    /// Konklav couldn't be asked, or didn't decide in time.
+    DecisionUnavailable(String),
 }
 
 impl CompiledAuth {
@@ -255,7 +261,7 @@ impl CompiledAuth {
     }
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
     (scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty()).then(|| token.trim())
@@ -270,32 +276,47 @@ impl Refusal {
             Refusal::Forbidden => "forbidden",
             Refusal::KeysUnavailable(_) => "keys_unavailable",
             Refusal::DotSegments => "dot_segments",
+            Refusal::NoRule => "no_rule",
+            Refusal::StepUp { .. } => "step_up",
+            Refusal::DecisionUnavailable(_) => "decision_unavailable",
         }
     }
 }
 
 // r[impl auth.responses]
+// r[impl konklav.responses]
 /// The status and headers to refuse a request with.
 pub fn refusal_response(refusal: &Refusal) -> (StatusCode, HeaderMap) {
     let mut headers = HeaderMap::new();
     let (status, challenge) = match refusal {
-        Refusal::MissingToken => (StatusCode::UNAUTHORIZED, Some("Bearer")),
+        Refusal::MissingToken => (StatusCode::UNAUTHORIZED, Some(Cow::Borrowed("Bearer"))),
         Refusal::InvalidToken(_) => (
             StatusCode::UNAUTHORIZED,
-            Some(r#"Bearer error="invalid_token""#),
+            Some(Cow::Borrowed(r#"Bearer error="invalid_token""#)),
         ),
-        Refusal::Forbidden => (
+        Refusal::Forbidden | Refusal::NoRule => (
             StatusCode::FORBIDDEN,
-            Some(r#"Bearer error="insufficient_scope""#),
+            Some(Cow::Borrowed(r#"Bearer error="insufficient_scope""#)),
         ),
+        // As RFC 9470 asks for it.
+        Refusal::StepUp { max_age } => {
+            let challenge = r#"Bearer error="insufficient_user_authentication""#;
+            (
+                StatusCode::UNAUTHORIZED,
+                Some(match max_age {
+                    Some(max_age) => Cow::Owned(format!("{challenge}, max_age={max_age}")),
+                    None => Cow::Borrowed(challenge),
+                }),
+            )
+        }
         Refusal::DotSegments => (StatusCode::BAD_REQUEST, None),
-        Refusal::KeysUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, None),
+        Refusal::KeysUnavailable(_) | Refusal::DecisionUnavailable(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, None)
+        }
     };
-    if let Some(challenge) = challenge {
-        headers.insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static(challenge),
-        );
+    if let Some(challenge) = challenge.and_then(|challenge| HeaderValue::from_str(&challenge).ok())
+    {
+        headers.insert(header::WWW_AUTHENTICATE, challenge);
     }
     (status, headers)
 }

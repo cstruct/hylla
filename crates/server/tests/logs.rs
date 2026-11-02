@@ -122,6 +122,7 @@ async fn logs_are_exported_over_otlp_with_trace_ids() {
                     writable: false,
                     cache_control: None,
                     auth: None,
+                    konklav: None,
                 }],
             },
         )]),
@@ -143,6 +144,7 @@ async fn logs_are_exported_over_otlp_with_trace_ids() {
             ..Cache::default()
         },
         auth: HashMap::new(),
+        konklav: None,
         telemetry: Telemetry {
             traces: TracesExport {
                 follow_callers: true,

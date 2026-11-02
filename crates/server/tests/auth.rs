@@ -55,6 +55,7 @@ fn mapping(path_prefix: &str, rewrites: &[(&str, &str)], auth: Option<MappingAut
         writable: false,
         cache_control: None,
         auth,
+        konklav: None,
     }
 }
 
@@ -104,6 +105,7 @@ async fn app(mappings: Vec<Mapping>, verifiers: HashMap<String, Verifier>) -> Ar
         )]),
         cache: Cache::default(),
         auth: verifiers,
+        konklav: None,
         telemetry: Default::default(),
         control: None,
         serve_backends: None,
@@ -474,6 +476,7 @@ async fn invalid_public_keys_fail_at_startup() {
         backends: HashMap::new(),
         cache: Cache::default(),
         auth: verifiers(broken),
+        konklav: None,
         telemetry: Default::default(),
         control: None,
         serve_backends: None,
