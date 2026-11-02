@@ -1689,7 +1689,7 @@ dependencies = [
 
 [[package]]
 name = "hylla-config"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "facet",
  "facet-styx",
@@ -1704,7 +1704,7 @@ dependencies = [
 
 [[package]]
 name = "hylla-control"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -1719,7 +1719,7 @@ dependencies = [
 
 [[package]]
 name = "hylla-server"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "argon2",
