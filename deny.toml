@@ -47,8 +47,6 @@ wildcards = "deny"
 allow-wildcard-paths = true
 
 [sources]
-# Only crates.io, and Konklav's relying SDK, whose crates aren't published: no other git
-# dependencies or registries.
+# Only crates.io: no git dependencies or other registries.
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = ["https://github.com/cstruct/konklav"]
