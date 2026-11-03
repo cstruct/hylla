@@ -100,7 +100,9 @@ mise run release:bump 0.2.0
 
 This pulls `main`, sets the version in `Cargo.toml` and `Cargo.lock`, commits "Release
 0.2.0" on a new `release/v0.2.0` branch, pushes it, opens a pull request for it and
-switches back to `main`. Once the pull request is merged:
+switches back to `main`. On any other branch it commits "Release 0.2.0" there instead
+and pushes nothing, so the bump goes out with that branch's pull request. Once the pull
+request with the bump is merged:
 
 ```bash
 mise run release:tag
