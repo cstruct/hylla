@@ -91,13 +91,23 @@ packages, so remove the link before committing changes to it.
 
 ## Releasing
 
-hylla is versioned as one, by `version` in the workspace's [Cargo.toml](Cargo.toml). Bump
-it, then tag the commit with the version:
+hylla is versioned as one, by `version` in the workspace's [Cargo.toml](Cargo.toml). From a
+clean checkout of `main`:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+mise run release:bump 0.2.0
 ```
+
+This pulls `main`, sets the version in `Cargo.toml` and `Cargo.lock`, commits "Release
+0.2.0" on a new `release/v0.2.0` branch, pushes it, opens a pull request for it and
+switches back to `main`. Once the pull request is merged:
+
+```bash
+mise run release:tag
+```
+
+This pulls `main`, tags it `v0.2.0`, the version in `Cargo.toml`, and pushes the tag. It
+refuses if that version is already tagged, as it is until the pull request is merged.
 
 The [release workflow](.github/workflows/release.yml) checks the tag against the version
 and runs CI. It then builds the binaries, pushes the Docker image, and creates a GitHub
