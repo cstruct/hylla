@@ -46,11 +46,9 @@ test "$(git branch --show-current)" = main || { echo "Not on main" >&2; exit 1; 
 git pull -q --ff-only
 test "$(grep -c '^version = ' Cargo.toml)" = 1
 perl -pi -e "s/^version = \\"[^\\"]*\\"/version = \\"$version\\"/" Cargo.toml
-# The published crates' requirements on each other.
-perl -pi -e "s/^(konklav-[a-z-]+ = \\{ version = \\")=[^\\"]*/\\1=$version/" Cargo.toml
 cargo update -q --workspace
 git commit -q -am "Release $version"
 git push origin HEAD
-git tag -a "v$version" -m "Konklav $version"
+git tag -a "v$version" -m "Hylla $version"
 git push origin "v$version"
 """
