@@ -107,7 +107,7 @@ jobs:
         run: |
           archive="hylla-$TAG_NAME-$TARGET"
           mkdir -p "dist/$archive"
-          cp "target/$TARGET/release/hylla" README.md "dist/$archive/"
+          cp "target/$TARGET/release/hylla" README.md LICENSE "dist/$archive/"
           tar -czf "dist/$archive.tar.gz" -C dist "$archive"
 
       - name: Upload release archive

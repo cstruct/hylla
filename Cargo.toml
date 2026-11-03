@@ -7,6 +7,7 @@ resolver = "2"
 version = "1.1.0"
 edition = "2024"
 rust-version = "1.90"
+license = "MIT"
 
 # The control plane UI's WASM bundle, built small, as `mise run ui` does.
 [profile.ui]
