@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
   workflow_call:
@@ -32,12 +30,15 @@ jobs:
         with:
           persist-credentials: false
 
-      # Rust, tracey and the end-to-end tests' VersityGW and Azurite, as pinned in mise.toml.
+      # Rust, tracey, cargo-deny, actionlint and the end-to-end tests' VersityGW and Azurite,
+      # as pinned in mise.toml.
       - name: Install tools
         uses: jdx/mise-action@6be3c7ed4c21d4f76b208d351d95aac273ebb76d # v5.2.4
 
-      - name: Cache Cargo dependencies and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Saved at the end of the job, see below.
+      - name: Restore the Cargo cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -47,22 +48,11 @@ jobs:
           restore-keys: |
             ci-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Check formatting
-        if: runner.os == 'Linux'
-        run: cargo fmt --all -- --check
-
-      # Security advisories, licenses and sources of the dependencies, by deny.toml.
-      - name: Check dependencies
-        if: runner.os == 'Linux'
-        run: cargo deny --locked check
-
+      # Formatting, dependencies, clippy (native and the UI's WASM build), the
+      # workflows and spec references.
       - name: Lint
         if: runner.os == 'Linux'
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-
-      - name: Lint the UI's WASM build
-        if: runner.os == 'Linux'
-        run: cargo clippy --locked -p hylla-control --lib --target wasm32-unknown-unknown --features hydrate -- -D warnings
+        run: mise run lint
 
       # So the tests run with the UI's hydration bundle embedded, as releases do.
       - name: Build the UI's hydration bundle
@@ -70,12 +60,20 @@ jobs:
         run: mise run ui
 
       - name: Run tests
-        run: cargo test --locked --workspace --all-features
+        run: mise run test
 
       - name: Run end-to-end tests
         if: runner.os == 'Linux'
         run: mise run e2e
 
-      - name: Validate spec references
-        if: runner.os == 'Linux'
-        run: tracey query validate
+      # Not from tags: a tag's caches are only visible to that tag's runs, so they would
+      # only evict the ones pull requests use.
+      - name: Save the Cargo cache
+        if: github.ref_type != 'tag' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}

@@ -3,6 +3,7 @@ name = "hylla-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 # Built into the binary, not published on its own.
 publish = false
 

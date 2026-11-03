@@ -82,8 +82,9 @@ jobs:
         with:
           install_args: rust github:wasm-bindgen/wasm-bindgen
 
-      - name: Cache Cargo dependencies and build artifacts
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Restored only: caches saved on a tag are visible to that tag's runs alone.
+      - name: Restore the Cargo cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -107,7 +108,7 @@ jobs:
         run: |
           archive="hylla-$TAG_NAME-$TARGET"
           mkdir -p "dist/$archive"
-          cp "target/$TARGET/release/hylla" README.md "dist/$archive/"
+          cp "target/$TARGET/release/hylla" README.md LICENSE "dist/$archive/"
           tar -czf "dist/$archive.tar.gz" -C dist "$archive"
 
       - name: Upload release archive
