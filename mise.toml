@@ -8,6 +8,8 @@ rust = { version = "1.99.0", components = "rustfmt,clippy", targets = "wasm32-un
 "github:wasm-bindgen/wasm-bindgen" = "0.2.128"
 # Checks the dependencies for security advisories, licenses and sources, see deny.toml.
 "github:EmbarkStudios/cargo-deny" = "0.19.9"
+# Lints the GitHub Actions workflows.
+"github:rhysd/actionlint" = "1.7.7"
 
 # Tools for the end-to-end tests, see `mise run e2e`.
 # An S3 compatible gateway serving a local directory, from its GitHub releases.
@@ -20,6 +22,21 @@ node = "24"
 [tasks.deny]
 description = "Check the dependencies for security advisories, licenses and sources"
 run = "cargo deny --locked check"
+
+[tasks.lint]
+description = "Check formatting, dependencies, lints, the CI workflows and spec references"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo deny --locked check",
+  "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+  "cargo clippy --locked -p hylla-control --lib --target wasm32-unknown-unknown --features hydrate -- -D warnings",
+  "actionlint",
+  "tracey query validate",
+]
+
+[tasks.test]
+description = "Run the tests, without the end-to-end tests"
+run = "cargo test --locked --workspace --all-features"
 
 [tasks.e2e]
 description = "Run the end-to-end tests against VersityGW and Azurite"

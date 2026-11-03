@@ -131,6 +131,8 @@ jobs:
           while read -r tag; do
             [[ -n "$tag" ]] && args+=(--tag "$tag")
           done <<< "$TAGS"
+          # One argument per digest.
+          # shellcheck disable=SC2046
           docker buildx imagetools create "${args[@]}" $(printf "$IMAGE@sha256:%s " *)
 
       - name: Inspect the image
