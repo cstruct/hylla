@@ -33,15 +33,9 @@ fetch each one from the bucket rarely, and keep serving while the bucket is down
 
 ## How it works
 
-```text
-client ──GET /assets/app.css, Host: cdn.example.com──▶ hylla
-                                                         │
-             server: the one whose server_names contain the Host
-             mapping: the first whose path_prefix matches, rewriting the path to a key
-             backend: the mapping's bucket
-                                                         │
-             cache hit ◀── memory, then disk ──▶ miss: fetch the chunks from the bucket
-```
+<p align="center">
+  <img src="assets/how-it-works.svg" alt="A client sends GET /assets/app.css with Host: cdn.example.com to hylla. hylla picks the server whose server_names contain the Host, the first mapping whose path_prefix matches, rewriting the path to a key, and that mapping's bucket as backend. It serves a hit from memory or disk, and on a miss fetches the chunks from the bucket.">
+</p>
 
 hylla answers `GET` and `HEAD`, with single byte ranges, `If-None-Match` and `If-Match`. It
 trusts an object's size and ETag for `metadata_ttl` (30 seconds by default), and checks them
