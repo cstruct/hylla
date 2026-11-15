@@ -78,7 +78,7 @@ jobs:
 
       # Only Rust and wasm-bindgen, as pinned in mise.toml, not the end-to-end tests' tools.
       - name: Install Rust
-        uses: jdx/mise-action@6612f0ef07ed2a736cd1e00a94a065522dd41195 # v5.2.5
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
           install_args: rust github:wasm-bindgen/wasm-bindgen
 
