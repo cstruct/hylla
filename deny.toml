@@ -15,6 +15,10 @@ ignore = [
   { id = "RUSTSEC-2026-0391", reason = "zstd is unused: foyer's compression is off" },
   { id = "RUSTSEC-2026-0398", reason = "zstd is unused: foyer's compression is off" },
   { id = "RUSTSEC-2026-0403", reason = "zstd is unused: foyer's compression is off" },
+  # Unmaintained, not vulnerable. object_store 0.14, the latest, depends on both, so
+  # dropping hylla's own use wouldn't remove them.
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained but object_store, the latest, still requires it" },
+  { id = "RUSTSEC-2026-0542", reason = "humantime is unmaintained but object_store, the latest, still requires it" },
 ]
 
 [licenses]
