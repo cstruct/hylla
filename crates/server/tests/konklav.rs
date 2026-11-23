@@ -300,6 +300,7 @@ async fn captures_become_scopes_konklav_decides() {
         fake.checks(),
         vec![json!({
             "token": "caller-token",
+            "audiences": ["files.example.com"],
             "requirements": {
                 "scopes": [{"kind": "object", "id": "o-1", "actions": ["object:read"]}],
             },
@@ -597,6 +598,7 @@ async fn sites_ask_konklav_before_choosing_a_build() {
         fake.checks(),
         vec![json!({
             "token": "caller-token",
+            "audiences": ["files.example.com"],
             "requirements": {"tenant": ["site:read"]},
         })]
     );
