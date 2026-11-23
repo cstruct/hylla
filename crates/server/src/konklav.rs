@@ -35,7 +35,7 @@ impl Konklav {
             secret: config.secret.clone(),
             core: konklav_relying::Config {
                 issuer: config.issuer.clone(),
-                audience: config.audience.clone(),
+                audiences: vec![config.audience.clone()],
                 ..Default::default()
             },
         });
